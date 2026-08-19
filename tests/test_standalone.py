@@ -5,7 +5,9 @@ import contextlib
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import shutil
+import tomllib
 import unittest
 from uuid import uuid4
 
@@ -177,28 +179,81 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertEqual(protocol_package.OUTPUT_PROTOCOL_VERSION, 2)
         self.assertIs(legacy_storage.ArtifactStore, storage_package.ArtifactStore)
 
+    def test_public_distribution_metadata_and_cli_are_stable(self) -> None:
+        package_root = Path(__file__).resolve().parents[1]
+        metadata = tomllib.loads(
+            (package_root / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+        self.assertEqual(metadata["name"], "autonomous-math-ai")
+        self.assertEqual(metadata["scripts"]["amr"], "autonomous_math_research.cli:main")
+        self.assertEqual(metadata["license"], "MIT")
+        self.assertEqual(metadata["requires-python"], ">=3.11")
+        self.assertEqual(
+            metadata["urls"]["Repository"],
+            "https://github.com/wizardpc-com/autonomous-math-ai",
+        )
+
+    def test_mechanical_runner_has_no_source_checkout_import_fallback(self) -> None:
+        with policy_resource("scripts/run_worker.py") as runner:
+            text = runner.read_text(encoding="utf-8")
+        self.assertNotIn("tools" + ".autonomous_math_research", text)
+        self.assertNotIn("sys.path.insert(0, str(REPO_ROOT))", text)
+
+    def test_public_markdown_relative_links_resolve(self) -> None:
+        package_root = Path(__file__).resolve().parents[1]
+        documents = [
+            package_root / "README.md",
+            package_root / "README.zh-CN.md",
+            package_root / "CONTRIBUTING.md",
+            package_root / "SECURITY.md",
+            *(package_root / "docs").glob("*.md"),
+        ]
+        for document in documents:
+            text = document.read_text(encoding="utf-8")
+            for target in re.findall(r"\[[^]]+\]\(([^)]+)\)", text):
+                if target.startswith(("http://", "https://", "mailto:", "#")):
+                    continue
+                path_text = target.split("#", 1)[0]
+                resolved = (document.parent / path_text).resolve()
+                self.assertTrue(
+                    resolved.exists(),
+                    f"broken relative link in {document.name}: {target}",
+                )
+
     def test_standalone_source_contains_no_conjecture_fixture(self) -> None:
         package_root = Path(__file__).resolve().parents[1]
         roots = [
             package_root / "src",
             package_root / "docs",
             package_root / "templates",
+            package_root / ".github",
+            package_root / "scripts",
+            package_root / "tests",
         ]
         standalone_files = [
             package_root / "README.md",
+            package_root / "README.zh-CN.md",
             package_root / "pyproject.toml",
             package_root / "MANIFEST.in",
             package_root / "LICENSE",
+            package_root / ".gitignore",
+            package_root / "CHANGELOG.md",
+            package_root / "CONTRIBUTING.md",
+            package_root / "CODE_OF_CONDUCT.md",
+            package_root / "SECURITY.md",
+            package_root / "CITATION.cff",
+        ]
+        release_paths = [
+            *standalone_files,
+            *(item for root in roots for item in root.rglob("*")),
         ]
         text = "\n".join(
             path.read_text(encoding="utf-8", errors="ignore")
-            for path in [
-                *standalone_files,
-                *(item for root in roots for item in root.rglob("*")),
-            ]
+            for path in release_paths
             if (
                 path.is_file()
                 and "__pycache__" not in path.parts
+                and "_runtime" not in path.parts
                 and path.suffix not in {".pyc", ".whl", ".gz"}
             )
         )
@@ -213,9 +268,14 @@ class StandalonePackageTests(unittest.TestCase):
             "S" + "7",
             "E:" + "\\math-ai-research",
             "projects" + "/",
+            "tools" + ".autonomous_math_research",
+            "." + "agents",
         )
         for marker in forbidden:
             self.assertNotIn(marker, text)
+        path_text = "\n".join(path.as_posix() for path in release_paths)
+        for marker in forbidden[:-3]:
+            self.assertNotIn(marker, path_text)
 
 
 if __name__ == "__main__":

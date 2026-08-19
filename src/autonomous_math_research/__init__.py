@@ -1,4 +1,4 @@
-"""Installable autonomous mathematical research harness."""
+"""Autonomous Math AI: an auditable mathematical research harness."""
 
 from .models import CandidateEvent, Claim, DirectorPlan, ResearchTask
 

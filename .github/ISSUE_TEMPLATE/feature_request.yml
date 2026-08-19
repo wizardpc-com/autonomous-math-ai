@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a focused improvement that preserves the trust model.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete research or operational problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest compatible interface or behavior change.
+    validations:
+      required: true
+  - type: textarea
+    id: trust
+    attributes:
+      label: Trust-boundary impact
+      description: Explain effects on audit, evidence, recovery, canonical state, and isolation.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Mechanically checkable acceptance criteria
+    validations:
+      required: true

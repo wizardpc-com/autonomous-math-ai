@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+.venv/
 .validation/
+tests/_runtime/
 build/
 dist/
 *.egg-info/

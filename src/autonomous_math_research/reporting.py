@@ -184,7 +184,7 @@ def render_nightly_report(
             )
         return f"- {role}: 0 个 useful outcome / {tokens} tokens"
     lines = [
-        f"# Autonomous Math Research Nightly Report — {run_id}",
+        f"# Autonomous Math AI Nightly Report — {run_id}",
         "",
         f"执行模式：{execution_mode}",
         f"运行结果：{run_outcome}",

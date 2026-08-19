@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use Autonomous Math AI in research, please cite this software."
+type: software
+title: "Autonomous Math AI"
+abstract: >-
+  Auditable, falsification-first AI orchestration for long-horizon mathematical
+  research, with independent verification and reproducible evidence.
+authors:
+  - family-names: "Contributors"
+    given-names: "Autonomous Math AI"
+version: 0.2.0
+date-released: 2026-08-19
+license: MIT
+repository-code: "https://github.com/wizardpc-com/autonomous-math-ai"
+url: "https://github.com/wizardpc-com/autonomous-math-ai"
+keywords:
+  - artificial intelligence
+  - mathematical research
+  - automated reasoning
+  - reproducible research

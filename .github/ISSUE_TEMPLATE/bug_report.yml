@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible defect or trust-boundary failure.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include credentials, private research data, or full campaign
+        archives. Use a neutral minimal fixture whenever possible.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Package version or commit SHA.
+      placeholder: 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Execution mode
+      options:
+        - validate or dry-run
+        - mock
+        - live
+        - packaging or installation
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include sanitized commands, fixture data, and exact bounds.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant evidence
+      description: Sanitized event kinds, error classification, and telemetry status.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, tokens, cookies, and private data.
+          required: true
+        - label: I did not attach an entire run or evidence archive.
+          required: true

@@ -1,0 +1,110 @@
+# Quickstart
+
+This guide starts with zero-model validation. It does not require a live model
+turn, an API key, or access to a research repository.
+
+## 1. Install
+
+Autonomous Math AI requires Python 3.11 or later:
+
+```console
+python -m pip install autonomous-math-ai
+amr --help
+```
+
+From a source checkout, use `python -m pip install .` instead.
+
+## 2. Create a neutral research target
+
+```console
+amr init ./research-target
+```
+
+The generated directory contains:
+
+```text
+research-target/
+├── autonomous/
+│   ├── project.json
+│   ├── config.json
+│   ├── prompts/
+│   └── state/
+├── claims/
+└── state/
+```
+
+Replace the neutral claim and prompts with your exact mathematical statement,
+domain, quantifiers, assumptions, and evidence boundaries. Keep generated wire
+schemas and controller policy in the installed package; a target may narrow
+policy but must not relax the trust protocol.
+
+## 3. Validate without a model
+
+```console
+amr validate --project ./research-target
+amr run --project ./research-target --dry-run
+```
+
+Validation checks the project manifest, paths, configuration, claim graph,
+canonical guard, model routes, no-fast policy, bundled schemas, and protocol
+compatibility. The result includes `model_turns_started: 0`.
+
+## 4. Run the deterministic mock lifecycle
+
+```console
+amr run --project ./research-target --mock --hours 0.01
+```
+
+The mock exercises Director, research, candidate, audit, reporting, and
+finalization paths with synthetic responses and synthetic telemetry. A mock
+verdict is never mathematical evidence and does not authorize changes to a
+shared canonical state outside its isolated run.
+
+Inspect the result:
+
+```console
+amr status --project ./research-target --run latest
+amr catalog --project ./research-target
+```
+
+## 5. Configure a live campaign
+
+Before any live run:
+
+1. pin the exact final claim and protected canonical inputs;
+2. review model names, reasoning effort, and null service tiers;
+3. set campaign duration, epoch duration, global token budget, and independent
+   Director/research/audit/mechanical concurrency caps;
+4. verify worker tool allowlists, filesystem permissions, and network policy;
+5. run `amr validate` again;
+6. obtain explicit operator approval for model usage and cost.
+
+The current backend integrates with Codex App Server and reuses the operator's
+existing local login. Do not copy credentials into configuration, prompts,
+events, or artifacts.
+
+A live campaign is started by omitting `--mock` and `--dry-run`:
+
+```console
+amr run --project ./research-target --hours 12 --epoch-hours 2
+```
+
+This command is intentionally shown but should not be run until the preceding
+checks are complete.
+
+## Recovery and continuation
+
+- `--resume` is only for the same crashed epoch.
+- `amr campaign continue` creates a new epoch from a sealed checkpoint.
+- Budget or epoch drain stops new dispatch and waits for healthy in-flight work.
+- Failed runs remain immutable evidence; recovery imports into a new append-only
+  context rather than rewriting the old run.
+
+## Human steering and assets
+
+Use `amr steer` for bounded append-only notes, priorities, route pauses/resumes,
+audit requests, or stop-after-epoch instructions. Use `amr ingest` to copy one
+explicit local file into content-addressed campaign storage.
+
+Neither command can set claim trust, declare representation compatibility, or
+bypass independent audit.

@@ -1064,8 +1064,8 @@ def _colorize_human(text: str) -> str:
         rendered,
     )
     rendered = rendered.replace(
-        "┏━ 固定状态面板｜AUTONOMOUS MATH RESEARCH ━",
-        "\x1b[96m┏━ 固定状态面板｜AUTONOMOUS MATH RESEARCH ━\x1b[0m",
+        "┏━ 固定状态面板｜AUTONOMOUS MATH AI ━",
+        "\x1b[96m┏━ 固定状态面板｜AUTONOMOUS MATH AI ━\x1b[0m",
     )
     rendered = re.sub(
         r"状态 (运行中|额度排空中|生成报告中|已停止)",
@@ -2090,7 +2090,7 @@ class _MonitorDashboardState:
         )
         active = len(self.active_jobs)
         occupancy = self._slot_occupancy()
-        first = "┏━ 固定状态面板｜AUTONOMOUS MATH RESEARCH ━"
+        first = "┏━ 固定状态面板｜AUTONOMOUS MATH AI ━"
         second = (
             f"状态 {status}｜Run {self.run_id}｜运行 {elapsed}｜"
             f"Token {_token_text(self.total_tokens)}/{budget}{rate}"

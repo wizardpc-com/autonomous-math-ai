@@ -23,7 +23,7 @@ from typing import Any
 
 
 # A resumed autonomous run executes this file from its immutable policy
-# snapshot. The controller supplies the original repository root only for
+# snapshot. The controller supplies the target workspace root only for
 # validated inputs/output placement; route configuration cannot be overridden.
 _REPOSITORY_ROOT_OVERRIDE = os.environ.get("MATH_WORKER_REPOSITORY_ROOT", "").strip()
 REPO_ROOT = (
@@ -34,9 +34,6 @@ REPO_ROOT = (
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 RESULT_SCHEMA_SOURCE = SKILL_ROOT / "references" / "worker-result.schema.json"
 TASK_SCHEMA_SOURCE = SKILL_ROOT / "references" / "worker-task.schema.json"
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 _SCHEMA_VALIDATOR_OVERRIDE = os.environ.get(
     "MATH_WORKER_SCHEMA_VALIDATOR_PATH", "",
 ).strip()
@@ -91,21 +88,21 @@ if _SCHEMA_VALIDATOR_OVERRIDE:
         Path(_SCHEMA_VALIDATOR_OVERRIDE), Path(_CONTRACT_DEFINITIONS_OVERRIDE),
     )
 else:
-    try:
-        from autonomous_math_research.schema import (  # noqa: E402
-            validate,
-            validate_output_schema_compatibility,
+    _BUNDLED_PACKAGE_ROOT = Path(__file__).resolve().parents[4]
+    _BUNDLED_SCHEMA = _BUNDLED_PACKAGE_ROOT / "schema.py"
+    _BUNDLED_CONTRACTS = _BUNDLED_PACKAGE_ROOT / "contracts.py"
+    if _BUNDLED_SCHEMA.is_file() and _BUNDLED_CONTRACTS.is_file():
+        validate, validate_output_schema_compatibility = _load_pinned_schema_validator(
+            _BUNDLED_SCHEMA, _BUNDLED_CONTRACTS,
         )
-    except ModuleNotFoundError as exc:
-        # Repository compatibility tests can load a policy snapshot directly
-        # without installing the standalone distribution.  The legacy tools
-        # namespace is only a forwarding shim to the same package source.
-        if exc.name != "autonomous_math_research":
-            raise
-        from tools.autonomous_math_research.schema import (  # type: ignore[no-redef]  # noqa: E402
-            validate,
-            validate_output_schema_compatibility,
-        )
+    else:
+        def _validator_snapshot_required(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(
+                "controller-pinned mechanical validator snapshot is required"
+            )
+
+        validate = _validator_snapshot_required
+        validate_output_schema_compatibility = _validator_snapshot_required
 DEFAULT_WORKER_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_WORKER_REASONING_EFFORT = "high"
 FALLBACK_WORKER_MODEL = "gpt-5.6-luna"

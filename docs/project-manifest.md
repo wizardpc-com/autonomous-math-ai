@@ -22,9 +22,9 @@ All paths are normalized POSIX paths relative to the project root.
 }
 ```
 
-The CLI accepts any project directory with `--project`. `--workspace-root` may
-pin a containing workspace; otherwise the target project's nearest Git root is
-used. No package code assumes a monorepo or a fixed project-collection directory.
+The CLI accepts any target directory with `--project`. `--workspace-root` may
+pin a containing workspace; otherwise the target's nearest Git root is used.
+No package code assumes a source checkout or fixed collection layout.
 
 `amr init <directory>` creates a neutral example. `amr validate --project
 <directory>` validates the manifest, paths, configuration, policy, all bundled

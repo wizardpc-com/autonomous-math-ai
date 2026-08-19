@@ -318,7 +318,7 @@ class AppServerClient:
             self.initialize_result = await self.request("initialize", {
                 "clientInfo": {
                     "name": "autonomous_math_research",
-                    "title": "Autonomous Math Research Harness",
+                    "title": "Autonomous Math AI",
                     "version": "0.1.0",
                 },
                 "capabilities": {"experimentalApi": True},

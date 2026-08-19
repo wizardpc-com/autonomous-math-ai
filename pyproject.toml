@@ -3,19 +3,42 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "autonomous-math-research"
+name = "autonomous-math-ai"
 version = "0.2.0"
-description = "A fail-closed, append-only harness for autonomous mathematical research"
+description = "Auditable, falsification-first AI orchestration for long-horizon mathematical research"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-authors = [{name = "Autonomous Math Research contributors"}]
+license-files = ["LICENSE"]
+authors = [{name = "Autonomous Math AI contributors"}]
+keywords = [
+  "artificial intelligence",
+  "autonomous agents",
+  "automated reasoning",
+  "mathematical research",
+  "reproducible research",
+  "theorem proving",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/wizardpc-com/autonomous-math-ai"
+Documentation = "https://github.com/wizardpc-com/autonomous-math-ai/tree/main/docs"
+Repository = "https://github.com/wizardpc-com/autonomous-math-ai"
+Issues = "https://github.com/wizardpc-com/autonomous-math-ai/issues"
+Changelog = "https://github.com/wizardpc-com/autonomous-math-ai/blob/main/CHANGELOG.md"
 
 [project.scripts]
 amr = "autonomous_math_research.cli:main"
