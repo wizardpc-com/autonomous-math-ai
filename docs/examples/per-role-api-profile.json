@@ -1,0 +1,34 @@
+{
+  "profile_schema_version": 1,
+  "name": "api-prover-example",
+  "extends": "codex-app-server-default",
+  "overrides": {
+    "providers": {
+      "openai-compatible": {
+        "endpoint": "https://api.openai.com/v1",
+        "credential": {
+          "kind": "environment",
+          "reference": "OPENAI_API_KEY"
+        }
+      }
+    },
+    "models": {
+      "prover": {
+        "provider": "openai-compatible",
+        "model": "example-reasoning-model",
+        "effort": "high",
+        "unsupported_effort": "error",
+        "service_tier": "flex",
+        "timeout_seconds": 3600,
+        "retries": {
+          "transport": 2,
+          "model_protocol": 1
+        },
+        "max_concurrency": 4,
+        "token_limit": 160000,
+        "cost_limit_usd": 100.0,
+        "estimated_cost_usd": 1.0
+      }
+    }
+  }
+}

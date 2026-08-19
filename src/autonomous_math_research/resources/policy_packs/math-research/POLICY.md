@@ -17,5 +17,8 @@ ephemeral and cannot directly modify canonical trust state.
 - Research roles may request only the packaged one-shot mechanical broker.
   Mechanical workers never select strategy, recurse, use a network, or change
   canonical state.
-- Every route uses a null service tier. Fast and priority service tiers are
-  forbidden.
+- Roles should prefer the broker for finite enumeration, data normalization,
+  formula expansion, code preparation, deterministic reproduction, and artifact
+  checking when acceptance is mechanical.
+- Service tiers require provider capability preflight. Fast, priority, and auto
+  tiers are forbidden; bundled mechanical routes remain null-tier.

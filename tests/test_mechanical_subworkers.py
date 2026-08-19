@@ -1066,10 +1066,11 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(metrics.active_subtasks, ())
         self.assertEqual(metrics.duplicate_terminal_subtasks, ())
         self.assertEqual(metrics.orphan_terminal_subtasks, ())
-        self.assertEqual(controller.governor.by_role["mechanical_subworker"], 36)
+        self.assertEqual(controller.mechanical_governor.by_role["mechanical_subworker"], 36)
         status = build_status(controller.run_dir)
         self.assertEqual(status["mechanical_subtasks"]["terminal"], 3)
-        self.assertEqual(status["token_usage"]["totalTokens"], 36)
+        self.assertEqual(status["token_usage"]["totalTokens"], 0)
+        self.assertEqual(status["mechanical_token_usage"]["totalTokens"], 36)
         self.assertEqual(status["token_telemetry"]["mechanical_unknown"], 0)
         report = render_nightly_report(
             run_id=controller.run_id,
@@ -1082,7 +1083,7 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             run_outcome="mock run",
         )
         self.assertIn("requested=3", report)
-        self.assertIn("Spark/high/null", report)
+        self.assertIn("gpt-5.3-codex-spark", report)
         self.assertIn("mechanical actual-model attestation", report)
         self.assertIn("不自动构成证明", report)
 
@@ -1355,7 +1356,7 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(len(runner.calls), 1)
         self.assertEqual(len(controller.completed_mechanical_jobs), 2)
         self.assertTrue(controller.completed_mechanical_jobs[-1]["cache_reused"])
-        self.assertEqual(controller.governor.by_role["mechanical_subworker"], 9)
+        self.assertEqual(controller.mechanical_governor.by_role["mechanical_subworker"], 9)
 
     async def test_recovery_restores_attempt_watermark_tokens_and_does_not_over_retry(self) -> None:
         runner = SequenceMechanicalRunner([])
@@ -1436,7 +1437,7 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(terminal["token_usage"]["total_tokens"], 10)
         self.assertEqual(terminal["actual_model"], PRIMARY_MECHANICAL_ROUTE["model"])
         self.assertEqual(terminal["model_route_attestation"], "matched")
-        self.assertEqual(resumed.governor.by_role["mechanical_subworker"], 10)
+        self.assertEqual(resumed.mechanical_governor.by_role["mechanical_subworker"], 10)
         self.assertTrue(Path(terminal["runner_directory"]).is_dir() if terminal["runner_directory"] else True)
 
     async def test_recovery_reattaches_live_lease_without_duplicate_dispatch(self) -> None:
@@ -1512,7 +1513,7 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(kinds.count("MECHANICAL_SUBTASK_STARTED"), 1)
         self.assertEqual(kinds.count("MECHANICAL_SUBTASK_LEASE_REATTACHED"), 1)
         self.assertEqual(kinds.count("MECHANICAL_SUBTASK_ATTEMPT_FINISHED"), 1)
-        self.assertEqual(resumed.governor.by_role["mechanical_subworker"], 7)
+        self.assertEqual(resumed.mechanical_governor.by_role["mechanical_subworker"], 7)
         self.assertEqual(resumed.recent_changes[-1]["kind"], "MECHANICAL_SUBTASK_COMPLETED")
         self.assertTrue(resumed.recent_changes[-1]["mechanical_evidence_only"])
 
@@ -1776,15 +1777,16 @@ class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
             self.assertEqual(route["model"], "gpt-5.6-sol")
             self.assertIsNone(route["service_tier"])
 
-    def test_enabled_policy_requires_explicit_independent_cap(self) -> None:
+    def test_enabled_policy_accepts_unbounded_cap_after_v7_migration(self) -> None:
         raw = json.loads(self.config.config_path.read_text(encoding="utf-8"))
         raw["schema_version"] = 7
         raw["scheduler"].pop("max_mechanical_subworkers")
         raw["policy"]["one_shot_compute_worker"]["enabled"] = True
         bad = self.project / "autonomous/missing-mechanical-cap.json"
         bad.write_text(json.dumps(raw), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "explicit max_mechanical_subworkers"):
-            load_config(self.project, bad)
+        migrated = load_config(self.project, bad)
+        self.assertIsNone(migrated.max_mechanical_subworkers)
+        self.assertEqual(migrated.migrations_applied, ("7->8",))
 
     def test_subprocess_runner_executes_run_local_pinned_sources(self) -> None:
         manifest_path = self.project / "autonomous/runs/pin-test/policy/MANIFEST.json"

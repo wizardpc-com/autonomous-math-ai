@@ -17,20 +17,31 @@ From a source checkout, use `python -m pip install .` instead.
 ## 2. Create a neutral research target
 
 ```console
-amr init ./research-target
+amr init ./research-target --project-id research-target --final-claim-id C_ROOT
 ```
 
 The generated directory contains:
 
 ```text
 research-target/
+├── README.md
+├── AGENTS.md
+├── INITIALIZATION_CHECKLIST.md
 ├── autonomous/
 │   ├── project.json
 │   ├── config.json
 │   ├── prompts/
 │   └── state/
 ├── claims/
-└── state/
+├── state/
+├── proofs/
+├── tasks/
+├── experiments/
+├── certificates/
+├── audit/
+├── sources/
+├── conversations/
+└── artifacts/
 ```
 
 Replace the neutral claim and prompts with your exact mathematical statement,
@@ -42,12 +53,23 @@ policy but must not relax the trust protocol.
 
 ```console
 amr validate --project ./research-target
+amr config validate --project ./research-target
+amr config explain --project ./research-target
 amr run --project ./research-target --dry-run
 ```
 
 Validation checks the project manifest, paths, configuration, claim graph,
-canonical guard, model routes, no-fast policy, bundled schemas, and protocol
+canonical guard, provider/model routes, effort capabilities, secret references,
+no-fast/no-priority policy, bundled schemas, and protocol
 compatibility. The result includes `model_turns_started: 0`.
+
+The new scaffold intentionally fails strict validation until the exact
+mathematical placeholders are replaced consistently in `claims/CLAIMS.md` and
+the claim graph:
+
+```console
+amr validate --project ./research-target --strict
+```
 
 ## 4. Run the deterministic mock lifecycle
 
@@ -79,9 +101,11 @@ Before any live run:
 5. run `amr validate` again;
 6. obtain explicit operator approval for model usage and cost.
 
-The current backend integrates with Codex App Server and reuses the operator's
-existing local login. Do not copy credentials into configuration, prompts,
-events, or artifacts.
+Codex App Server is the default provider and reuses the operator's existing
+local login. An API is optional; it is used only when a role/profile explicitly
+selects an OpenAI-compatible or plugin provider. Do not copy credentials into
+configuration, prompts, events, or artifacts—store only an environment variable
+name, system-credential name, or provider-profile name.
 
 A live campaign is started by omitting `--mock` and `--dry-run`:
 

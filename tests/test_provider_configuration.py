@@ -1,0 +1,401 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import shutil
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from uuid import uuid4
+
+from autonomous_math_research.cli import main as cli_main
+from autonomous_math_research.config import load_config
+from autonomous_math_research.controller import AutonomousController
+from autonomous_math_research.initializer import initialize_project
+from autonomous_math_research.models import ResearchTask, TokenUsage
+from autonomous_math_research.provider_backend import (
+    OpenAICompatibleBackend, ProviderRouterBackend,
+)
+from autonomous_math_research.provider_config import redact_config
+from autonomous_math_research.resources import schema_resource
+from autonomous_math_research.schema import load_schema
+from autonomous_math_research.validation import validate_project
+from autonomous_math_research.token_governor import TokenGovernor
+
+
+RUNTIME = Path(__file__).resolve().parent / "_runtime"
+REPO = Path(__file__).resolve().parents[1]
+
+
+class ProviderConfigurationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        self.root = RUNTIME / f"provider-config-{uuid4().hex}"
+        self.project = self.root / "neutral-project"
+        initialize_project(
+            self.project, project_id="neutral-project", final_claim_id="C_FINAL",
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root)
+
+    def _profile(self, value: dict, name: str = "profile.json") -> Path:
+        path = self.root / name
+        path.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _cli(self, args: list[str]) -> tuple[int, dict]:
+        output = StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli_main(args)
+        return code, json.loads(output.getvalue())
+
+    def test_default_profile_is_codex_and_new_budgets_are_separate(self) -> None:
+        config = load_config(self.project)
+        self.assertEqual(config.raw["schema_version"], 8)
+        self.assertEqual(config.profile_name, "codex-app-server-default")
+        self.assertTrue(all(
+            route["provider"] == "codex" for route in config.raw["models"].values()
+        ))
+        self.assertEqual(config.raw["budgets"]["global_tokens"], 500_000_000)
+        self.assertEqual(config.raw["budgets"]["mechanical_tokens"], 1_500_000_000)
+        self.assertIsNone(config.max_mechanical_subworkers)
+        self.assertFalse(
+            config.raw["policy"]["one_shot_compute_worker"]["recursive_spawn_allowed"]
+        )
+
+    def test_init_cli_accepts_explicit_ids_and_strict_cli_stays_zero_model(self) -> None:
+        explicit = self.root / "explicit-project"
+        code, payload = self._cli([
+            "init", str(explicit), "--project-id", "declared-project",
+            "--final-claim-id", "FINAL.CLAIM",
+        ])
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["project_id"], "declared-project")
+        self.assertEqual(payload["final_claim_id"], "FINAL.CLAIM")
+        code, payload = self._cli([
+            "validate", "--project", str(explicit), "--strict",
+        ])
+        self.assertEqual(code, 2, payload)
+        self.assertEqual(payload["model_turns_started"], 0)
+        self.assertIn("placeholder", payload["error"])
+
+    def test_custom_compatible_provider_and_explicit_effort_mapping_validate(self) -> None:
+        profile = REPO / "docs" / "examples" / "custom-provider-profile.json"
+        config = load_config(self.project, profile_path=profile)
+        route = config.route_for("explorer")
+        self.assertEqual(route["provider"], "research-gateway")
+        self.assertEqual(route["mapped_effort"], "high")
+        self.assertEqual(route["service_tier"], "default")
+        self.assertEqual(
+            config.raw["providers"]["research-gateway"]["credential"]["reference"],
+            "RESEARCH_GATEWAY_API_KEY",
+        )
+
+    def test_unsupported_effort_cannot_silently_downgrade(self) -> None:
+        raw = json.loads(
+            (REPO / "docs" / "examples" / "custom-provider-profile.json")
+            .read_text(encoding="utf-8")
+        )
+        route = raw["overrides"]["models"]["explorer"]
+        route["unsupported_effort"] = "error"
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            load_config(self.project, profile_path=self._profile(raw))
+
+    def test_plaintext_secret_is_rejected_and_explanation_is_redacted(self) -> None:
+        secret_profile = {
+            "profile_schema_version": 1,
+            "name": "bad-secret",
+            "extends": "codex-app-server-default",
+            "overrides": {
+                "providers": {
+                    "openai-compatible": {"api_key": "plaintext-test-credential"}
+                }
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "secret"):
+            load_config(self.project, profile_path=self._profile(secret_profile))
+        rendered = json.dumps(
+            redact_config({"api_key": "plaintext-test-credential"}),
+            sort_keys=True,
+        )
+        self.assertIn("[REDACTED]", rendered)
+        self.assertNotIn("plaintext-test-credential", rendered)
+
+    def test_config_cli_does_not_resolve_environment_secret_or_start_model(self) -> None:
+        profile = REPO / "docs" / "examples" / "per-role-api-profile.json"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-secret-never-read"}):
+            code, payload = self._cli([
+                "config", "explain", "--project", str(self.project),
+                "--profile", str(profile),
+            ])
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["model_turns_started"], 0)
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("test-secret-never-read", serialized)
+        self.assertIn("OPENAI_API_KEY", serialized)
+
+    def test_provider_capabilities_reject_unsupported_structured_mode(self) -> None:
+        raw = json.loads(
+            (REPO / "docs" / "examples" / "custom-provider-profile.json")
+            .read_text(encoding="utf-8")
+        )
+        provider = raw["overrides"]["providers"]["research-gateway"]
+        provider["capabilities"]["structured_outputs"] = []
+        with self.assertRaisesRegex(ValueError, "structured_outputs"):
+            load_config(self.project, profile_path=self._profile(raw))
+
+    def test_fast_service_tier_is_rejected_during_preflight(self) -> None:
+        raw = json.loads(
+            (REPO / "docs" / "examples" / "custom-provider-profile.json")
+            .read_text(encoding="utf-8")
+        )
+        raw["overrides"]["models"]["explorer"]["service_tier"] = "fast"
+        raw["overrides"]["providers"]["research-gateway"]["capabilities"][
+            "service_tiers"
+        ].append("fast")
+        with self.assertRaisesRegex(ValueError, "forbidden service tier"):
+            load_config(self.project, profile_path=self._profile(raw))
+
+    def test_deep_config_schema_rejects_unknown_nested_fields(self) -> None:
+        profile = {
+            "profile_schema_version": 1,
+            "name": "unknown-field",
+            "extends": "codex-app-server-default",
+            "overrides": {"engine": {"undeclared_switch": True}},
+        }
+        with self.assertRaisesRegex(ValueError, "unknown fields"):
+            load_config(self.project, profile_path=self._profile(profile))
+
+    def test_installed_external_mechanical_runner_can_be_selected(self) -> None:
+        raw = json.loads(
+            (REPO / "docs" / "examples" / "custom-provider-profile.json")
+            .read_text(encoding="utf-8")
+        )
+        provider = raw["overrides"]["providers"]["research-gateway"]
+        provider["adapter"] = "test_external_adapter"
+        provider["capabilities"]["mechanical_one_shot"] = True
+        mechanical = raw["overrides"].setdefault("policy", {}).setdefault(
+            "one_shot_compute_worker", {}
+        )
+        route = {
+            "provider": "research-gateway", "model": "mechanical-model",
+            "endpoint": None, "profile": None, "effort": "high",
+            "unsupported_effort": "error", "service_tier": None,
+        }
+        mechanical["primary_route"] = dict(route)
+        mechanical["fallback_route"] = {**route, "model": "mechanical-fallback"}
+
+        def provider_entries(*, group):  # type: ignore[no-untyped-def]
+            return (
+                [SimpleNamespace(name="test_external_adapter")]
+                if group == "autonomous_math_research.providers" else []
+            )
+
+        def runner_entries(*, group):  # type: ignore[no-untyped-def]
+            return (
+                [SimpleNamespace(name="test_external_adapter")]
+                if group == "autonomous_math_research.mechanical_runners" else []
+            )
+
+        with (
+            patch("autonomous_math_research.provider_config.entry_points", provider_entries),
+            patch("autonomous_math_research.mechanical.entry_points", runner_entries),
+        ):
+            config = load_config(self.project, profile_path=self._profile(raw))
+        configured = config.raw["policy"]["one_shot_compute_worker"]
+        self.assertEqual(configured["primary_route"]["provider"], "research-gateway")
+
+    def test_legacy_run_limits_receive_new_budget_defaults(self) -> None:
+        normalized = AutonomousController._normalized_manifest_limits({
+            "schema_version": 7,
+            "execution": {"limits": {
+                "global_tokens": 1000, "max_director": 1,
+                "max_research_workers": 2, "max_audit": 2,
+                "max_total_model_concurrency": 5,
+                "duration_seconds": 60, "deadline_epoch": 100,
+            }},
+        })
+        self.assertIsNone(normalized["mechanical_tokens"])
+        self.assertIsNone(normalized["global_cost_usd"])
+        self.assertIsNone(normalized["mechanical_cost_usd"])
+        self.assertEqual(normalized["max_mechanical_subworkers"], 0)
+
+    def test_cost_accounting_preserves_observation_across_unknown_update(self) -> None:
+        governor = TokenGovernor(global_budget=1000, configured_max_research=1)
+        governor.record("job", "explorer", TokenUsage(total_tokens=10), cost_usd=0.25)
+        governor.record("job", "explorer", TokenUsage(total_tokens=12), cost_usd=None)
+        governor.record("job", "explorer", TokenUsage(total_tokens=12), cost_usd=0.30)
+        self.assertAlmostEqual(governor.total_cost_usd, 0.30)
+
+    def test_strict_init_detects_placeholders_then_accepts_consistent_ids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "placeholder"):
+            validate_project(self.project, strict=True)
+        graph_path = self.project / "autonomous" / "state" / "claim_graph.json"
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        graph["claims"][0]["statement"] = "For every object in the declared domain, property P holds."
+        graph["claims"][0]["current_gaps"] = ["A proof or counterexample is still required."]
+        graph_path.write_text(
+            json.dumps(graph, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        (self.project / "claims" / "CLAIMS.md").write_text(
+            "# Claims\n\n- `C_FINAL`: For every object in the declared domain, property P holds.\n",
+            encoding="utf-8",
+        )
+        result = validate_project(self.project, strict=True)
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["strict"])
+        self.assertEqual(result["model_turns_started"], 0)
+
+    def test_strict_init_rejects_claim_id_mismatch(self) -> None:
+        (self.project / "claims" / "CLAIMS.md").write_text(
+            "# Claims\n\n- `C_OTHER`: Exact neutral test statement.\n", encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "final_claim_id|Claim IDs|claim IDs"):
+            validate_project(self.project, strict=True)
+
+    def test_project_or_profile_cannot_remove_core_protected_paths(self) -> None:
+        profile = {
+            "profile_schema_version": 1,
+            "name": "unsafe-boundary",
+            "extends": "codex-app-server-default",
+            "overrides": {"workspace": {"protected_paths": ["claims"]}},
+        }
+        with self.assertRaisesRegex(ValueError, "protected paths"):
+            load_config(self.project, profile_path=self._profile(profile))
+
+    def test_unbounded_mechanical_cap_still_has_resource_and_budget_backpressure(self) -> None:
+        controller = AutonomousController(load_config(self.project), mock=True)
+        self.assertIsNone(controller.max_mechanical_subworkers)
+        self.assertGreaterEqual(controller._mechanical_resource_capacity(), 1)
+        self.assertLessEqual(controller._mechanical_resource_capacity(), os.cpu_count() or 1)
+        self.assertEqual(controller.mechanical_governor.global_budget, 1_500_000_000)
+        self.assertEqual(
+            controller.config.raw["policy"]["one_shot_compute_worker"]
+            ["backpressure"]["max_queue_depth"],
+            256,
+        )
+
+
+class OpenAICompatibleAdapterTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        self.root = RUNTIME / f"provider-adapter-{uuid4().hex}"
+        self.project = self.root / "neutral-project"
+        initialize_project(self.project)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root)
+
+    async def test_transport_normalizes_schema_usage_cost_and_tier_without_network(self) -> None:
+        profile = self.root / "api-profile.json"
+        profile.write_text(json.dumps({
+            "profile_schema_version": 1,
+            "name": "mock-transport",
+            "extends": "codex-app-server-default",
+            "overrides": {
+                "providers": {
+                    "openai-compatible": {
+                        "credential": {"kind": "none", "reference": None},
+                        "capabilities": {"cost_path": "billing.cost_usd"},
+                    }
+                },
+                "models": {
+                    "explorer": {
+                        "provider": "openai-compatible",
+                        "model": "test-model",
+                        "effort": "high",
+                        "service_tier": "default",
+                    }
+                },
+            },
+        }, indent=2) + "\n", encoding="utf-8")
+        config = load_config(self.project, profile_path=profile)
+        captured: dict = {}
+
+        async def transport(endpoint, headers, payload, timeout):  # type: ignore[no-untyped-def]
+            captured.update({
+                "endpoint": endpoint, "headers": headers,
+                "payload": payload, "timeout": timeout,
+            })
+            result = {
+                "result_type": "NO_PROGRESS",
+                "main_finding": "Deterministic adapter test.",
+                "status": "COMPLETED",
+                "artifact_paths": [],
+                "next_suggested_question": "None.",
+                "evidence_level": "E0_SPECULATIVE",
+            }
+            return {
+                "id": "response-test", "model": "test-model",
+                "service_tier": "default", "output_text": json.dumps(result),
+                "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+                "billing": {"cost_usd": 0.25},
+            }
+
+        backend = OpenAICompatibleBackend(
+            config, "openai-compatible", transport=transport,
+        )
+        task = ResearchTask(
+            task_id="adapter-test", role="explorer", target_claim="C_ROOT",
+            exact_objective="Return a schema-valid deterministic test result.",
+            why_now="adapter test", dependencies=[], expected_information_gain="LOW",
+            mathematical_impact="LOW", estimated_cost_tier="LOW", required_files=[],
+            stop_conditions=["return"], output_contract="worker_result.schema.json",
+        )
+        with schema_resource("worker_result.schema.json") as path:
+            schema = load_schema(path)
+        outcome = await backend.run_job(
+            job_id="job-adapter", task=task, prompt="test", output_schema=schema,
+            workspace=self.project, writable_roots=[self.project], timeout=3,
+            token_budget=100, candidate_sink=lambda _event: asyncio.sleep(0),
+        )
+        self.assertTrue(outcome.succeeded, outcome.error)
+        self.assertEqual(outcome.provider, "openai-compatible")
+        self.assertEqual(outcome.requested_service_tier, "default")
+        self.assertEqual(outcome.observed_service_tier, "default")
+        self.assertEqual(outcome.token_usage.total_tokens, 18)
+        self.assertEqual(outcome.cost_usd, 0.25)
+        self.assertTrue(captured["endpoint"].endswith("/responses"))
+        self.assertNotIn("Authorization", captured["headers"])
+        self.assertEqual(captured["payload"]["reasoning"]["effort"], "high")
+        self.assertEqual(captured["payload"]["service_tier"], "default")
+        self.assertEqual(captured["payload"]["text"]["format"]["type"], "json_schema")
+
+    async def test_router_preserves_bindings_and_aggregates_provider_rate_limits(self) -> None:
+        config = load_config(
+            self.project,
+            profile_path=REPO / "docs" / "examples" / "per-role-api-profile.json",
+        )
+
+        class Adapter:
+            def __init__(self, active, rates):  # type: ignore[no-untyped-def]
+                self.active = active
+                self.rates = rates
+
+            async def rate_limits(self):  # type: ignore[no-untyped-def]
+                return self.rates
+
+        codex = Adapter({"job-codex": ("thread-1", "turn-1")}, {"used": 15})
+        api = Adapter(set(), {"used": 72})
+        router = ProviderRouterBackend(config, adapter_overrides={
+            "codex": codex,  # type: ignore[dict-item]
+            "openai-compatible": api,  # type: ignore[dict-item]
+        })
+        self.assertEqual(router.active["job-codex"], ("thread-1", "turn-1"))
+        rates = await router.rate_limits()
+        self.assertEqual(rates["providers"]["codex"]["used"], 15)  # type: ignore[index]
+        self.assertEqual(
+            rates["providers"]["openai-compatible"]["used"], 72,  # type: ignore[index]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

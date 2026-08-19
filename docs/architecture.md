@@ -15,6 +15,10 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 - `storage/` owns atomic persistence, portable artifact references, steering,
   and local asset ingest.
 - `mechanical/` owns the controller-brokered one-shot worker boundary.
+- `provider_backend.py` routes roles to transport adapters; provider transport
+  never owns mathematical role semantics or canonical-state authority.
+- `provider_config.py` normalizes capability, effort, tier, usage, cost, and
+  credential-reference declarations before any model turn.
 - `cli/` owns the `amr` command surface.
 - `resources/` contains immutable wire schemas and the bundled policy pack.
 
@@ -80,8 +84,11 @@ policy, and local-schema failures drain the epoch as internal failures.
 
 ## Scheduling
 
-Default hard caps are independent: one Director, eight research jobs, eight
-audits, and eight mechanical workers. They share one global token budget.
+Default hard caps are independent: one Director, eight research jobs, and eight
+audits. Mechanical scheduling has no static seat cap by default, but the broker
+derives a resource cap and enforces token/cost budget, queue, batch, rate-limit,
+timeout, and stop backpressure. Main roles and mechanical workers use separate
+governors (500 million and 1.5 billion default tokens respectively).
 Dynamic admission adjusts only new dispatch based on information gain, route
 novelty, estimated cost, and audit backlog. It never cancels healthy work merely
 because the target concurrency changed.

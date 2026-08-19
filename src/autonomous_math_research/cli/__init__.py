@@ -49,10 +49,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init", help="create a neutral standalone math project")
     init.add_argument("directory", type=Path)
+    init.add_argument("--project-id")
+    init.add_argument("--final-claim-id", default="C_ROOT")
 
     check = sub.add_parser("validate", help="validate a project without starting a model")
     check.add_argument("--project", type=Path, required=True)
     check.add_argument("--workspace-root", type=Path)
+    check.add_argument("--profile", type=Path)
+    check.add_argument("--strict", action="store_true")
+
+    config = sub.add_parser("config", help="validate or explain effective configuration")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    for name in ("validate", "explain"):
+        command = config_sub.add_parser(name)
+        command.add_argument("--project", type=Path, required=True)
+        command.add_argument("--profile", type=Path)
+        command.add_argument("--workspace-root", type=Path)
 
     run = sub.add_parser("run", help="run or validate the autonomous controller")
     run.add_argument("--project", type=Path, required=True)
@@ -85,10 +97,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
-        "--max-mechanical-subworkers", type=int,
+        "--max-mechanical-subworkers", type=str,
         help=(
-            "independent cap for controller-brokered one-shot mechanical workers; "
-            "the project config must set an explicit default"
+            "positive static cap or 'unbounded'; unbounded still obeys broker "
+            "budget, resource, rate-limit, queue, timeout, and stop backpressure"
         ),
     )
     run.add_argument(
@@ -96,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="global token budget for this run (overrides config)",
     )
     run.add_argument("--config", type=Path)
+    run.add_argument("--profile", type=Path)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--mock", action="store_true")
     run.add_argument("--resume", nargs="?", const="latest")
@@ -138,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_continue.add_argument("--project", type=Path, required=True)
     campaign_continue.add_argument("--campaign", required=True)
     campaign_continue.add_argument("--workspace-root", type=Path)
+    campaign_continue.add_argument("--profile", type=Path)
     campaign_continue.add_argument("--mock", action="store_true")
     campaign_continue.add_argument("--dry-run", action="store_true")
     campaign_continue.add_argument("--epoch-hours", type=float)
@@ -163,9 +177,12 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--project", type=Path, required=True)
     probe.add_argument("--out", type=Path)
 
-    smoke = sub.add_parser("smoke", help="run the minimal real no-fast App Server lifecycle")
+    smoke = sub.add_parser(
+        "smoke", help="run the configured minimal real no-fast provider lifecycle"
+    )
     smoke.add_argument("--project", type=Path, required=True)
     smoke.add_argument("--config", type=Path)
+    smoke.add_argument("--profile", type=Path)
     smoke.add_argument(
         "--budget", type=int,
         help=(
@@ -272,6 +289,21 @@ def _resolve_max_audit_override(
     return default_max_audit(max_research_workers)
 
 
+def _mechanical_cap_override(value: str | int | None) -> int | str | None:
+    if value is None:
+        return None
+    rendered = str(value).strip().casefold()
+    if rendered in {"unbounded", "null", "none"}:
+        return "unbounded"
+    try:
+        parsed = int(rendered)
+    except ValueError as exc:
+        raise ValueError("--max-mechanical-subworkers must be positive or unbounded") from exc
+    if parsed < 1:
+        raise ValueError("--max-mechanical-subworkers must be positive or unbounded")
+    return parsed
+
+
 async def _run_command(args: argparse.Namespace) -> int:
     project = _resolve_run_project(args)
     run_id = None
@@ -284,6 +316,8 @@ async def _run_command(args: argparse.Namespace) -> int:
     if resume and run_id:
         if args.dry_run:
             raise ValueError("--resume --dry-run is forbidden; resume must reconcile stale turns and state")
+        if args.profile is not None:
+            raise ValueError("--resume uses the pinned effective config and forbids --profile")
         run_root = ProjectLayout(project).run_dir(run_id)
         pinned = run_root / "config" / "config.yaml"
         if pinned.exists():
@@ -300,7 +334,7 @@ async def _run_command(args: argparse.Namespace) -> int:
         args.mock = pinned_mock
     config = load_config(
         project, config_path, workspace_root=args.workspace_root,
-        require_manifest=True,
+        require_manifest=True, profile_path=args.profile,
     )
     max_audit_override = _resolve_max_audit_override(
         args.max_research_workers, args.max_audit,
@@ -339,7 +373,7 @@ async def _run_command(args: argparse.Namespace) -> int:
         max_director=args.max_director,
         max_research_workers=args.max_research_workers,
         max_audit=max_audit_override,
-        max_mechanical_subworkers=args.max_mechanical_subworkers,
+        max_mechanical_subworkers=_mechanical_cap_override(args.max_mechanical_subworkers),
         mock=args.mock, resume=resume,
         recover_candidates_from=args.recover_candidates_from,
         campaign_id=args.campaign_id,
@@ -390,7 +424,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         workspace_root=args.workspace_root, hours=checkpoint.campaign_hours,
         epoch_hours=epoch_hours, max_director=None, max_research_workers=None,
         max_audit=None, max_mechanical_subworkers=None, budget=None, config=None,
-        dry_run=args.dry_run, mock=args.mock, resume=None,
+        profile=args.profile, dry_run=args.dry_run, mock=args.mock, resume=None,
         recover_candidates_from=None, campaign_id=args.campaign,
         previous_epoch_id=(checkpoint.epochs[-1] if checkpoint.epochs else None),
     )
@@ -422,7 +456,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "init":
         try:
-            root = initialize_project(args.directory)
+            root = initialize_project(
+                args.directory,
+                project_id=args.project_id,
+                final_claim_id=args.final_claim_id,
+            )
             result = validate_project(root)
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             print(json.dumps({
@@ -436,6 +474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             result = validate_project(
                 args.project, workspace_root=args.workspace_root,
+                strict=args.strict, profile_path=args.profile,
             )
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             print(json.dumps({
@@ -444,6 +483,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             }, ensure_ascii=False, indent=2))
             return 2
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "config":
+        try:
+            config = load_config(
+                args.project.resolve(), workspace_root=args.workspace_root,
+                require_manifest=True, profile_path=args.profile,
+            )
+            explanation = config.explained()
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                "valid": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "model_turns_started": 0,
+            }, ensure_ascii=False, indent=2))
+            return 2
+        payload = explanation if args.config_command == "explain" else {
+            "valid": True,
+            "config_schema_version": explanation["config_schema_version"],
+            "profile": explanation["profile"],
+            "project_config": explanation["project_config"],
+            "user_profile": explanation["user_profile"],
+            "migrations_applied": explanation["migrations_applied"],
+            "providers": sorted(config.raw["providers"]),
+            "roles": sorted(config.raw["models"]),
+            "effective_config": explanation["effective_config"],
+            "model_turns_started": 0,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "emit-event":
         data = json.loads(args.file.read_text(encoding="utf-8"))
@@ -582,7 +650,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "probe":
         return asyncio.run(_probe_command(args))
     if args.command == "smoke":
-        config = load_config(args.project.resolve(), args.config)
+        config = load_config(
+            args.project.resolve(), args.config, profile_path=args.profile,
+        )
         smoke_budget = args.budget
         if smoke_budget is None:
             smoke_budget = (

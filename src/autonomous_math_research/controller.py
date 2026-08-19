@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -36,14 +37,13 @@ from .lifecycle.campaign import (
     CampaignStore, DEFAULT_CAMPAIGN_HOURS, DEFAULT_EPOCH_HOURS,
 )
 from .mechanical import (
-    FALLBACK_MECHANICAL_ROUTE,
     MECHANICAL_PARENT_ROLES,
     MECHANICAL_ROLE,
-    PRIMARY_MECHANICAL_ROUTE,
     MechanicalExecution,
     MechanicalRunner,
     MechanicalTaskRejected,
     SubprocessMechanicalRunner,
+    build_mechanical_runner,
     validate_mechanical_request,
     validate_mechanical_response,
 )
@@ -61,6 +61,8 @@ from .prompts import (
     worker_prompt,
 )
 from .policy import pin_policy_manifest, policy_view_for_role
+from .provider_backend import ProviderRouterBackend
+from .provider_config import mapped_reasoning_effort, validate_service_tier
 from .reporting import write_report
 from .representation import RepresentationContract, require_compatible_representations
 from .resources import schema_resource
@@ -304,6 +306,9 @@ class ActiveJob:
     workspace_metadata: dict[str, Any] | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+    provider: str | None = None
+    provider_profile: str | None = None
+    requested_service_tier: str | None = None
     broker_client_sha256: str | None = None
     broker_config_sha256: str | None = None
 
@@ -323,6 +328,9 @@ class MechanicalRequestState:
     accumulated_usage: TokenUsage = field(default_factory=TokenUsage)
     telemetry_observed: int = 0
     telemetry_unknown: int = 0
+    accumulated_cost_usd: float = 0.0
+    cost_telemetry_observed: int = 0
+    cost_telemetry_unknown: int = 0
     fallback_emitted: bool = False
     retry_counts: dict[str, int] = field(default_factory=dict)
 
@@ -370,7 +378,7 @@ class AutonomousController:
         max_research_workers: int | None = None,
         max_research: int | None = None,
         max_audit: int | None = None,
-        max_mechanical_subworkers: int | None = None,
+        max_mechanical_subworkers: int | str | None = None,
         mechanical_runner: MechanicalRunner | None = None,
         mock: bool = False,
         resume: bool = False,
@@ -494,22 +502,34 @@ class AutonomousController:
         self.route_dispatch_counts: dict[str, int] = {}
         self._last_dynamic_scheduler_signature: tuple[Any, ...] | None = None
         worker_policy = config.raw["policy"].get("one_shot_compute_worker", {})
-        self.mechanical_worker_enabled = bool(worker_policy.get("enabled", False))
+        selection_mode = str(
+            (worker_policy.get("selection_policy") or {}).get("mode") or "preferred"
+        )
+        self.mechanical_worker_enabled = bool(
+            worker_policy.get("enabled", False) and selection_mode != "disabled"
+        )
         configured_mechanical = config.raw["scheduler"].get("max_mechanical_subworkers")
         selected_mechanical = (
             max_mechanical_subworkers
             if max_mechanical_subworkers is not None else configured_mechanical
         )
-        if self.mechanical_worker_enabled and selected_mechanical is None:
-            raise ValueError(
-                "enabled mechanical worker requires an explicit max_mechanical_subworkers; "
-                "there is deliberately no implicit default"
-            )
         self.max_mechanical_subworkers = (
-            int(selected_mechanical) if selected_mechanical is not None else 0
+            None
+            if selected_mechanical is None or str(selected_mechanical).casefold() == "unbounded"
+            else int(selected_mechanical)
         )
-        if self.mechanical_worker_enabled and self.max_mechanical_subworkers < 1:
+        if (
+            self.mechanical_worker_enabled
+            and self.max_mechanical_subworkers is not None
+            and self.max_mechanical_subworkers < 1
+        ):
             raise ValueError("max_mechanical_subworkers must be positive when enabled")
+        self.mechanical_primary_route = self._mechanical_route(
+            worker_policy["primary_route"]
+        )
+        self.mechanical_fallback_route = self._mechanical_route(
+            worker_policy["fallback_route"]
+        )
         self._validate_concurrency_limits(enforce_audit_ratio=not resume)
         budget = global_budget if global_budget is not None else config.raw["budgets"].get("global_tokens")
         if budget is not None and int(budget) <= 0:
@@ -517,9 +537,40 @@ class AutonomousController:
         self.governor = TokenGovernor(
             global_budget=int(budget) if budget is not None else None,
             configured_max_research=self.max_research_workers,
+            global_cost_budget=(
+                float(config.raw["budgets"]["global_cost_usd"])
+                if config.raw["budgets"].get("global_cost_usd") is not None else None
+            ),
             soft_fraction=float(config.raw["budgets"].get("soft_fraction", 0.75)),
             hard_fraction=float(config.raw["budgets"].get("hard_fraction", 0.95)),
             role_budgets={k: int(v) for k, v in config.raw["budgets"].get("per_role", {}).items()},
+            role_cost_budgets={
+                role: float(limit)
+                for role, route in config.raw["models"].items()
+                for limit in [
+                    route.get("cost_limit_usd")
+                    if route.get("cost_limit_usd") is not None
+                    else config.raw["budgets"].get("per_role_cost_usd", {}).get(role)
+                ]
+                if limit is not None
+            },
+            rate_reduce_percent=float(config.raw["rate_limits"].get("reduce_exploration_percent", 75)),
+            rate_drain_percent=float(config.raw["rate_limits"].get("drain_percent", 90)),
+            rate_stop_percent=float(config.raw["rate_limits"].get("stop_percent", 98)),
+        )
+        mechanical_budget = config.raw["budgets"].get("mechanical_tokens")
+        mechanical_cost_budget = config.raw["budgets"].get("mechanical_cost_usd")
+        self.mechanical_governor = TokenGovernor(
+            global_budget=(int(mechanical_budget) if mechanical_budget is not None else None),
+            configured_max_research=max(1, os.cpu_count() or 1),
+            global_cost_budget=(
+                float(mechanical_cost_budget)
+                if mechanical_cost_budget is not None else None
+            ),
+            soft_fraction=float(config.raw["budgets"].get("soft_fraction", 0.75)),
+            hard_fraction=float(config.raw["budgets"].get("hard_fraction", 0.95)),
+            role_budgets={},
+            role_cost_budgets={},
             rate_reduce_percent=float(config.raw["rate_limits"].get("reduce_exploration_percent", 75)),
             rate_drain_percent=float(config.raw["rate_limits"].get("drain_percent", 90)),
             rate_stop_percent=float(config.raw["rate_limits"].get("stop_percent", 98)),
@@ -530,7 +581,11 @@ class AutonomousController:
         )
         self._mechanical_broker_client_source: Path | None = None
         self._mechanical_broker_client_sha256: str | None = None
-        self.backend = backend or (MockCodexBackend() if mock else AppServerBackend(config, self._trace_notification))
+        self.backend = backend or (
+            MockCodexBackend()
+            if mock
+            else ProviderRouterBackend(config, self._trace_notification)
+        )
         self.mock = mock
         self.resume = resume
         if resume and recover_candidates_from:
@@ -551,8 +606,12 @@ class AutonomousController:
         self._mechanical_request_keys: set[tuple[str, str]] = set()
         self._mechanical_result_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._mechanical_unavailable_routes: set[tuple[str, str | None, None]] = set()
-        self.mechanical_runner = mechanical_runner or SubprocessMechanicalRunner(
+        self._last_mechanical_dispatch = 0.0
+        self.mechanical_runner = mechanical_runner or build_mechanical_runner(
+            config,
             config.project_root,
+            primary_route=self.mechanical_primary_route,
+            fallback_route=self.mechanical_fallback_route,
         )
         self.completed_jobs: list[dict[str, Any]] = []
         self.seen_task_fingerprints: set[str] = set()
@@ -632,9 +691,13 @@ class AutonomousController:
             raise ValueError(
                 "max_director must be 1; the controller has one authoritative Director"
             )
-        if self.max_mechanical_subworkers < 0:
+        if self.max_mechanical_subworkers is not None and self.max_mechanical_subworkers < 0:
             raise ValueError("max_mechanical_subworkers must not be negative")
-        if self.mechanical_worker_enabled and self.max_mechanical_subworkers < 1:
+        if (
+            self.mechanical_worker_enabled
+            and self.max_mechanical_subworkers is not None
+            and self.max_mechanical_subworkers < 1
+        ):
             raise ValueError("enabled mechanical worker requires a positive independent cap")
         audit_ceiling = default_max_audit(self.max_research_workers)
         if enforce_audit_ratio and self.max_audit > audit_ceiling:
@@ -643,6 +706,73 @@ class AutonomousController:
                 f"got max_audit={self.max_audit}, ceiling={audit_ceiling}; "
                 "lower --max-audit together with --max-research-workers"
             )
+
+    def _mechanical_route(self, raw: dict[str, Any]) -> dict[str, Any]:
+        provider_name = str(raw["provider"])
+        provider = self.config.raw["providers"][provider_name]
+        return {
+            "provider": provider_name,
+            "model": str(raw["model"]),
+            "reasoning_effort": mapped_reasoning_effort(provider, raw),
+            "service_tier": None,
+            "endpoint": raw.get("endpoint") or provider.get("endpoint"),
+            "profile": raw.get("profile") or provider.get("profile"),
+        }
+
+    def _allowed_mechanical_routes(self) -> set[tuple[str | None, str | None, None]]:
+        return {
+            (
+                str(self.mechanical_primary_route["model"]),
+                str(self.mechanical_primary_route["reasoning_effort"]),
+                None,
+            ),
+            (
+                str(self.mechanical_fallback_route["model"]),
+                str(self.mechanical_fallback_route["reasoning_effort"]),
+                None,
+            ),
+            (None, None, None),
+        }
+
+    def _mechanical_resource_capacity(self) -> int:
+        worker = self.config.raw["policy"]["one_shot_compute_worker"]
+        factor = float(worker["backpressure"]["max_active_per_cpu"])
+        resource_capacity = max(1, int((os.cpu_count() or 1) * factor))
+        if self.max_mechanical_subworkers is None:
+            return resource_capacity
+        return min(resource_capacity, self.max_mechanical_subworkers)
+
+    def _mechanical_policy_rejection(self, packet: dict[str, Any]) -> str | None:
+        selection = self.config.raw["policy"]["one_shot_compute_worker"]["selection_policy"]
+        mode = str(selection["mode"])
+        if mode == "disabled":
+            return "mechanical delegation is disabled by selection policy"
+        if mode == "preferred":
+            return None
+        kind = str(packet.get("task_kind") or "")
+        if mode == "balanced" and kind in {"code_modification", "mechanical_analysis"}:
+            return f"balanced policy reserves {kind} for the parent role"
+        conservative = {
+            "finite_enumeration", "finite_exact_computation", "data_normalization",
+            "deterministic_reproduction", "artifact_verification", "specified_formal_check",
+        }
+        if mode == "conservative" and kind not in conservative:
+            return f"conservative policy does not admit task kind {kind}"
+        if mode != "custom":
+            return None
+        thresholds = selection["custom_thresholds"]
+        allowed = thresholds.get("allowed_task_kinds")
+        if isinstance(allowed, list) and kind not in allowed:
+            return f"custom policy does not admit task kind {kind}"
+        scalar_limits = {
+            "max_timeout_seconds": int(packet.get("timeout_seconds") or 0),
+            "max_expected_artifacts": len(packet.get("expected_artifacts") or []),
+            "max_input_files": len(packet.get("input_files") or []),
+        }
+        for key, observed in scalar_limits.items():
+            if key in thresholds and observed > int(thresholds[key]):
+                return f"custom policy threshold {key}={thresholds[key]} was exceeded"
+        return None
 
     @staticmethod
     def _retry_class(failure_kind: str | None) -> str:
@@ -657,6 +787,8 @@ class AutonomousController:
 
     def _retry_limit(self, failure_kind: str | None, role: str) -> int:
         retry_class = self._retry_class(failure_kind)
+        if retry_class in {"transport", "model_protocol"} and role in self.config.raw["models"]:
+            return self.config.retry_limit(role, retry_class)
         engine = self.config.raw["engine"]
         if retry_class == "transport":
             if role == Role.DIRECTOR:
@@ -964,7 +1096,9 @@ class AutonomousController:
             "turn_id": None,
             "model": active.model,
             "reasoning_effort": active.reasoning_effort,
-            "requested_service_tier": None,
+            "provider": active.provider,
+            "provider_profile": active.provider_profile,
+            "requested_service_tier": active.requested_service_tier,
             "observed_service_tier": "unobservable",
             "token_usage": {
                 key: int(usage.get(key, 0)) for key in TokenUsage().to_dict()
@@ -1004,21 +1138,37 @@ class AutonomousController:
     def _normalized_manifest_limits(existing: dict[str, Any]) -> dict[str, Any]:
         limits = dict(existing["execution"]["limits"])
         version = int(existing.get("schema_version", 0))
-        if version >= 9:
+        new_budget_defaults = {
+            "mechanical_tokens": None,
+            "global_cost_usd": None,
+            "mechanical_cost_usd": None,
+        }
+        if version >= 11:
             return limits
+        if version >= 9:
+            return {
+                **new_budget_defaults, **limits,
+            }
         if version >= 7:
-            return {**limits, "max_mechanical_subworkers": 0}
+            return {
+                **new_budget_defaults, **limits,
+                "max_mechanical_subworkers": 0,
+            }
         if version >= 5:
             # Manifest v5/v6 pinned a separate total cap. It is deliberately
             # ignored after the independent-role-cap migration.
             limits.pop("max_total_model_concurrency", None)
-            return limits
+            return {
+                **new_budget_defaults, **limits,
+                "max_mechanical_subworkers": 0,
+            }
         # Manifest v3/v4 used one research ceiling. Director already ran only
         # at a quiescent wave boundary, so that value is the compatible worker
         # ceiling.
         max_research = int(limits["max_research"])
         max_audit = int(limits["max_audit"])
         return {
+            **new_budget_defaults,
             "global_tokens": limits.get("global_tokens"),
             "max_director": 1,
             "max_research_workers": max_research,
@@ -1044,9 +1194,11 @@ class AutonomousController:
             top_level.add("output_protocol")
         if version >= 10:
             top_level.add("campaign")
+        if version >= 11:
+            top_level.add("requested_providers")
         if set(existing) != top_level:
             raise ValueError(f"RUN_MANIFEST fields are invalid: {sorted(set(existing) ^ top_level)}")
-        if version not in {3, 4, 5, 6, 7, 8, 9, 10}:
+        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11}:
             raise ValueError("unsupported or legacy RUN_MANIFEST schema")
         fingerprinted = dict(existing)
         reported = str(fingerprinted.pop("manifest_sha256", ""))
@@ -1093,6 +1245,8 @@ class AutonomousController:
                 or float(campaign.get("epoch_hours", 0)) <= 0
             ):
                 raise ValueError("RUN_MANIFEST campaign values are invalid")
+        if version >= 11 and not isinstance(existing.get("requested_providers"), dict):
+            raise ValueError("RUN_MANIFEST requested_providers is invalid")
         output_schemas = existing.get("output_schemas")
         if not isinstance(output_schemas, dict) or set(output_schemas) != {
             "director_plan.schema.json", "worker_result.schema.json", "audit_result.schema.json",
@@ -1108,6 +1262,13 @@ class AutonomousController:
             raise ValueError("RUN_MANIFEST has an invalid execution mode")
         limits = execution.get("limits")
         limit_keys = (
+            {
+                "global_tokens", "mechanical_tokens", "global_cost_usd",
+                "mechanical_cost_usd", "max_director", "max_research_workers",
+                "max_audit", "max_mechanical_subworkers", "duration_seconds",
+                "deadline_epoch",
+            }
+            if version >= 11 else
             {
                 "global_tokens", "max_director", "max_research_workers", "max_audit",
                 "max_mechanical_subworkers", "duration_seconds", "deadline_epoch",
@@ -1136,7 +1297,8 @@ class AutonomousController:
             raise ValueError("RUN_MANIFEST concurrency limits must be positive")
         if int(normalized_limits["max_director"]) != 1:
             raise ValueError("RUN_MANIFEST max_director must be 1")
-        if int(normalized_limits.get("max_mechanical_subworkers", 0)) < 0:
+        mechanical_cap = normalized_limits.get("max_mechanical_subworkers", 0)
+        if mechanical_cap is not None and int(mechanical_cap) < 0:
             raise ValueError("RUN_MANIFEST max_mechanical_subworkers must not be negative")
         audit_ceiling = default_max_audit(
             int(normalized_limits["max_research_workers"])
@@ -1149,11 +1311,24 @@ class AutonomousController:
             raise ValueError("RUN_MANIFEST duration must be positive")
         if limits["global_tokens"] is not None and int(limits["global_tokens"]) <= 0:
             raise ValueError("RUN_MANIFEST token budget must be positive")
+        if normalized_limits.get("mechanical_tokens") is not None and int(
+            normalized_limits["mechanical_tokens"]
+        ) <= 0:
+            raise ValueError("RUN_MANIFEST mechanical token budget must be positive")
         if existing["research_policy"].get("stable_core") != "persistent_filesystem_controller":
             raise ValueError("RUN_MANIFEST stable core is invalid")
-        for route in existing.get("requested_routes", {}).values():
-            if not isinstance(route, dict) or route.get("service_tier") not in {None, ""}:
-                raise ValueError("RUN_MANIFEST contains a forbidden model service tier")
+        providers = existing.get("requested_providers", {})
+        for role, route in existing.get("requested_routes", {}).items():
+            if not isinstance(route, dict):
+                raise ValueError("RUN_MANIFEST contains an invalid model route")
+            provider = providers.get(route.get("provider"), {})
+            capabilities = (
+                provider.get("capabilities", {}) if isinstance(provider, dict) else {}
+            )
+            validate_service_tier(
+                route.get("service_tier"), capabilities,
+                f"RUN_MANIFEST requested_routes.{role}.service_tier",
+            )
 
     def _pin_run_inputs(self, hours: float | None, dry_run: bool) -> float:
         self.policy_manifest, self.policy_status = pin_policy_manifest(
@@ -1182,12 +1357,12 @@ class AutonomousController:
         config_snapshot = self.run_dir / "config" / "config.yaml"
         config_snapshot.parent.mkdir(parents=True, exist_ok=True)
         if config_snapshot.exists():
-            if file_digest(config_snapshot) != file_digest(self.config.config_path):
+            if json.loads(config_snapshot.read_text(encoding="utf-8")) != self.config.raw:
                 raise ValueError("resume config does not match the pinned run config")
         else:
             if self.resume:
                 raise ValueError("cannot resume a legacy run without a pinned config snapshot")
-            shutil.copy2(self.config.config_path, config_snapshot)
+            atomic_write_json(config_snapshot, self.config.raw)
         schema_snapshot_root = self.run_dir / "config" / "output_schemas"
         schema_snapshot_root.mkdir(parents=True, exist_ok=True)
         output_schemas: dict[str, dict[str, str]] = {}
@@ -1212,7 +1387,7 @@ class AutonomousController:
             raise ValueError("hours must be positive")
         self._effective_run_hours = requested_hours
         payload = {
-            "schema_version": 10,
+            "schema_version": 11,
             "run_id": self.run_id,
             "campaign": {
                 "campaign_id": self.campaign_id,
@@ -1243,6 +1418,7 @@ class AutonomousController:
                 "stable_core": self.policy_manifest["stable_core"],
             },
             "requested_routes": self.config.raw["models"],
+            "requested_providers": self.config.raw["providers"],
             "requested_service_tier": None,
             "observed_service_tier": None,
             "execution": {
@@ -1252,6 +1428,9 @@ class AutonomousController:
                 "started_epoch": now_epoch,
                 "limits": {
                     "global_tokens": self.governor.global_budget,
+                    "mechanical_tokens": self.mechanical_governor.global_budget,
+                    "global_cost_usd": self.governor.global_cost_budget,
+                    "mechanical_cost_usd": self.mechanical_governor.global_cost_budget,
                     "max_director": self.max_director,
                     "max_research_workers": self.max_research_workers,
                     "max_audit": self.max_audit,
@@ -1281,6 +1460,7 @@ class AutonomousController:
                 "policy_sha256": payload["research_policy"]["manifest_sha256"],
                 "stable_core": payload["research_policy"]["stable_core"],
                 "requested_routes": payload["requested_routes"],
+                "requested_providers": payload["requested_providers"],
                 "requested_service_tier": None,
                 "canonical_claim_graph_path": payload["canonical_claim_graph"]["path"],
                 "candidate_recovery": payload["candidate_recovery"],
@@ -1297,6 +1477,7 @@ class AutonomousController:
                 "policy_sha256": existing.get("research_policy", {}).get("manifest_sha256"),
                 "stable_core": existing.get("research_policy", {}).get("stable_core"),
                 "requested_routes": existing.get("requested_routes"),
+                "requested_providers": existing.get("requested_providers"),
                 "requested_service_tier": existing.get("requested_service_tier"),
                 "canonical_claim_graph_path": existing.get("canonical_claim_graph", {}).get("path"),
                 "candidate_recovery": existing.get(
@@ -1326,6 +1507,9 @@ class AutonomousController:
             if int(existing.get("schema_version", 0)) < 10:
                 immutable_checks.pop("campaign", None)
                 observed.pop("campaign", None)
+            if int(existing.get("schema_version", 0)) < 11:
+                immutable_checks.pop("requested_providers", None)
+                observed.pop("requested_providers", None)
             if observed != immutable_checks:
                 raise ValueError("RUN_MANIFEST immutable inputs do not match the resumed controller")
             if bool(existing["execution"].get("dry_run")) or dry_run:
@@ -1352,6 +1536,19 @@ class AutonomousController:
                 int(self._budget_override) if self._budget_override is not None
                 else (int(original_budget) if original_budget is not None else None)
             )
+            original_mechanical_budget = original.get("mechanical_tokens")
+            self.mechanical_governor.global_budget = (
+                int(original_mechanical_budget)
+                if original_mechanical_budget is not None else None
+            )
+            self.governor.global_cost_budget = (
+                float(original["global_cost_usd"])
+                if original.get("global_cost_usd") is not None else None
+            )
+            self.mechanical_governor.global_cost_budget = (
+                float(original["mechanical_cost_usd"])
+                if original.get("mechanical_cost_usd") is not None else None
+            )
             for name, override, original_value in (
                 ("max_director", self._max_director_override, original["max_director"]),
                 (
@@ -1359,14 +1556,25 @@ class AutonomousController:
                     original["max_research_workers"],
                 ),
                 ("max_audit", self._max_audit_override, original["max_audit"]),
-                (
-                    "max_mechanical_subworkers",
-                    self._max_mechanical_subworkers_override,
-                    original.get("max_mechanical_subworkers", 0),
-                ),
             ):
                 if override is not None and int(override) > int(original_value):
                     raise ValueError(f"resume cannot increase pinned {name}")
+            original_mechanical_cap = original.get("max_mechanical_subworkers")
+            override_mechanical_cap = self._max_mechanical_subworkers_override
+            normalized_override_cap = (
+                None
+                if override_mechanical_cap is not None
+                and str(override_mechanical_cap).casefold() == "unbounded"
+                else (
+                    int(override_mechanical_cap)
+                    if override_mechanical_cap is not None else original_mechanical_cap
+                )
+            )
+            if original_mechanical_cap is not None and (
+                normalized_override_cap is None
+                or int(normalized_override_cap) > int(original_mechanical_cap)
+            ):
+                raise ValueError("resume cannot increase pinned max_mechanical_subworkers")
             self.max_director = int(
                 self._max_director_override
                 if self._max_director_override is not None else original["max_director"]
@@ -1381,10 +1589,9 @@ class AutonomousController:
                 self._max_audit_override
                 if self._max_audit_override is not None else original["max_audit"]
             )
-            self.max_mechanical_subworkers = int(
-                self._max_mechanical_subworkers_override
-                if self._max_mechanical_subworkers_override is not None
-                else original.get("max_mechanical_subworkers", 0)
+            self.max_mechanical_subworkers = (
+                int(normalized_override_cap)
+                if normalized_override_cap is not None else None
             )
             self._validate_concurrency_limits()
             self.governor.configured_max_research = self.max_research_workers
@@ -1924,13 +2131,10 @@ class AutonomousController:
         self.graph.save()
 
     def _task_timeout(self, role: str) -> float:
-        return float(self.config.raw["timeouts"].get(role, self.config.raw["timeouts"]["default_seconds"]))
+        return self.config.role_timeout(role)
 
     def _thread_budget(self, role: str) -> int | None:
-        value = self.config.raw["budgets"].get("per_thread", {}).get(role)
-        if value is None:
-            value = self.config.raw["budgets"].get("per_thread_default")
-        return int(value) if value is not None else None
+        return self.config.role_token_limit(role)
 
     def _server_thread_budget(self, role: str) -> int | None:
         # In observe mode the number is telemetry guidance only. Do not send it
@@ -2030,7 +2234,10 @@ class AutonomousController:
                 self.completed_jobs.append(payload)
                 usage = TokenUsage(**(payload.get("token_usage") or {}))
                 if payload.get("job_id") and payload.get("role"):
-                    self.governor.record(payload["job_id"], payload["role"], usage, payload.get("useful"))
+                    self.governor.record(
+                        payload["job_id"], payload["role"], usage,
+                        payload.get("useful"), payload.get("cost_usd"),
+                    )
                 if payload.get("claim_id") and payload.get("role") in {Role.PROVER, Role.FALSIFIER, Role.EXPLORER}:
                     self.stagnation.record(payload["claim_id"], str((payload.get("result") or {}).get("result_type", "NO_PROGRESS")))
             elif event["kind"] == "JOB_CANCELLED":
@@ -2043,6 +2250,7 @@ class AutonomousController:
                 if job_id and payload.get("role"):
                     self.governor.record(
                         job_id, str(payload["role"]), usage, False,
+                        payload.get("cost_usd"),
                     )
             elif event["kind"] in {
                 "MECHANICAL_SUBTASK_COMPLETED", "MECHANICAL_SUBTASK_FAILED",
@@ -2056,9 +2264,10 @@ class AutonomousController:
                         f"{payload.get('parent_job_id')}-{payload.get('subtask_id')}-"
                         f"{event.get('sequence')}"
                     )
-                    self.governor.record(
+                    self.mechanical_governor.record(
                         recovered_job_id, MECHANICAL_ROLE, usage,
                         payload.get("status") not in {"TOOL_ERROR", "REJECTED", "BLOCKED"},
+                        payload.get("cost_usd"),
                     )
                 packet_hash = str(payload.get("packet_sha256") or "")
                 parent_task_id = str(payload.get("parent_task_id") or "")
@@ -2076,7 +2285,9 @@ class AutonomousController:
                     try:
                         self._mechanical_result_cache[
                             (parent_task_id, subtask_id, packet_hash)
-                        ] = validate_mechanical_response(response)
+                        ] = validate_mechanical_response(
+                            response, allowed_routes=self._allowed_mechanical_routes(),
+                        )
                     except MechanicalTaskRejected:
                         self.store.append("MECHANICAL_RECOVERY_RECORD_INVALID", {
                             "sequence": event.get("sequence"),
@@ -2395,7 +2606,8 @@ class AutonomousController:
             if response_path.is_file():
                 try:
                     response = validate_mechanical_response(
-                        json.loads(response_path.read_text(encoding="utf-8"))
+                        json.loads(response_path.read_text(encoding="utf-8")),
+                        allowed_routes=self._allowed_mechanical_routes(),
                     )
                     latest_finished = (
                         finished_attempts[max(finished_attempts)]
@@ -2421,6 +2633,13 @@ class AutonomousController:
                             latest_finished.get("model_route_attestation")
                             or "unobservable"
                         ),
+                        cost_usd=(
+                            float(latest_finished["cost_usd"])
+                            if latest_finished.get("cost_usd") is not None else None
+                        ),
+                        cost_telemetry=str(
+                            latest_finished.get("cost_telemetry") or "unknown"
+                        ),
                     )
                     state.accumulated_usage = TokenUsage(**response["token_usage"])
                     state.telemetry_observed = int(
@@ -2429,14 +2648,29 @@ class AutonomousController:
                     state.telemetry_unknown = int(
                         response["token_telemetry"] in {"unknown", "partial"}
                     )
+                    recovered_costs = [
+                        float(item["cost_usd"])
+                        for item in finished_attempts.values()
+                        if item.get("cost_usd") is not None
+                    ]
+                    state.accumulated_cost_usd = sum(recovered_costs)
+                    state.cost_telemetry_observed = len(recovered_costs)
+                    state.cost_telemetry_unknown = sum(
+                        item.get("cost_usd") is None
+                        for item in finished_attempts.values()
+                    )
                     self._persist_mechanical_terminal(
                         state, response, execution=recovered_route_execution,
                     )
-                    self.governor.record(
+                    self.mechanical_governor.record(
                         f"mechanical-reconciled-{key[0]}-{key[1]}",
                         MECHANICAL_ROLE,
                         state.accumulated_usage,
                         response["status"] not in {"TOOL_ERROR", "REJECTED", "BLOCKED"},
+                        (
+                            state.accumulated_cost_usd
+                            if state.cost_telemetry_observed else None
+                        ),
                     )
                     continue
                 except (OSError, json.JSONDecodeError, MechanicalTaskRejected) as exc:
@@ -2456,12 +2690,18 @@ class AutonomousController:
                     state.telemetry_unknown += 1
                 else:
                     state.telemetry_unknown += 1
-                self.governor.record(
+                if attempt_payload.get("cost_usd") is not None:
+                    state.accumulated_cost_usd += float(attempt_payload["cost_usd"])
+                    state.cost_telemetry_observed += 1
+                else:
+                    state.cost_telemetry_unknown += 1
+                self.mechanical_governor.record(
                     f"mechanical-recovered-attempt-{key[0]}-{key[1]}-{attempt}",
                     MECHANICAL_ROLE,
                     usage,
                     attempt_payload.get("status")
                     not in {"TOOL_ERROR", "REJECTED", "BLOCKED"},
+                    attempt_payload.get("cost_usd"),
                 )
                 if bool(attempt_payload.get("retryable", False)):
                     failure_kind = str(attempt_payload.get("failure_kind") or "")
@@ -2509,14 +2749,17 @@ class AutonomousController:
                             "one_shot_compute_worker", {}
                         ).get("estimated_tokens", 60000)
                     )
+                    estimated_cost = self.config.raw["policy"].get(
+                        "one_shot_compute_worker", {}
+                    ).get("estimated_cost_usd")
                     future = running_loop.create_task(recover_runner(
                         packet_path=Path(str(packet_path)),
                         output_root=Path(str(output_root)),
                         receipt_path=Path(str(receipt_path)),
                         timeout_seconds=remaining,
                     ))
-                    self.governor.restore_reservation(
-                        logical_job_id, MECHANICAL_ROLE, estimated,
+                    self.mechanical_governor.restore_reservation(
+                        logical_job_id, MECHANICAL_ROLE, estimated, estimated_cost,
                     )
                     self.active_mechanical[logical_job_id] = ActiveMechanicalJob(
                         logical_job_id=logical_job_id,
@@ -2578,6 +2821,13 @@ class AutonomousController:
                     token_telemetry=str(
                         last_finished.get("token_telemetry") or "unknown"
                     ),
+                    cost_usd=(
+                        float(last_finished["cost_usd"])
+                        if last_finished.get("cost_usd") is not None else None
+                    ),
+                    cost_telemetry=str(
+                        last_finished.get("cost_telemetry") or "unknown"
+                    ),
                     artifacts=list(last_finished.get("artifacts") or []),
                     runner_directory=(
                         str(last_finished["runner_directory"])
@@ -2600,7 +2850,7 @@ class AutonomousController:
                 )
                 primary_fallback_continuation = (
                     last_execution.failure_kind == "model_unavailable"
-                    and last_execution.model == PRIMARY_MECHANICAL_ROUTE["model"]
+                    and last_execution.model == self.mechanical_primary_route["model"]
                     and isinstance(last_execution.fallback, dict)
                     and last_execution.fallback.get("continuation_required") is True
                     and not any(
@@ -2719,11 +2969,14 @@ class AutonomousController:
     async def _interrupt_recovered_stale(self) -> None:
         if not self.stale_remote_turns:
             return
-        if not isinstance(self.backend, AppServerBackend):
+        interrupt_remote = getattr(self.backend, "interrupt_remote", None)
+        if isinstance(self.backend, AppServerBackend):
+            interrupt_remote = self.backend.client.interrupt
+        if not callable(interrupt_remote):
             return
         for job_id, thread_id, turn_id in self.stale_remote_turns:
             try:
-                await self.backend.client.interrupt(thread_id, turn_id)
+                await interrupt_remote(thread_id, turn_id)
                 self.store.append("STALE_TURN_INTERRUPTED", {
                     "job_id": job_id, "thread_id": thread_id, "turn_id": turn_id,
                 })
@@ -3033,6 +3286,10 @@ class AutonomousController:
             "max_audit": self.max_audit,
             "max_mechanical_subworkers": self.max_mechanical_subworkers,
             "global_budget": self.governor.global_budget,
+            "global_cost_budget_usd": self.governor.global_cost_budget,
+            "mechanical_budget": self.mechanical_governor.global_budget,
+            "mechanical_cost_budget_usd": self.mechanical_governor.global_cost_budget,
+            "mechanical_effective_resource_cap": self._mechanical_resource_capacity(),
             "campaign_id": self.campaign_id,
             "epoch_id": self.epoch_id,
             "previous_epoch_id": self.previous_epoch_id,
@@ -3160,8 +3417,12 @@ class AutonomousController:
         try:
             await self.backend.start()
             await self._interrupt_recovered_stale()
+            probe = getattr(self.backend, "probe_capabilities", None)
             if isinstance(self.backend, AppServerBackend):
-                self.capability_snapshot = await self.backend.client.probe_capabilities(self.config.project_root)
+                probe = self.backend.client.probe_capabilities
+            if callable(probe):
+                self.capability_snapshot = await probe(self.config.project_root)
+            if self.capability_snapshot is not None:
                 atomic_write_json(self.run_dir / "app_server_capabilities.json", self.capability_snapshot)
                 self.store.append("APP_SERVER_PROBED", {
                     key: value.get("supported") for key, value in self.capability_snapshot.items() if isinstance(value, dict)
@@ -3380,6 +3641,7 @@ class AutonomousController:
     def _write_compact_snapshot(self) -> Path:
         active_tasks = [active.task.to_dict() for active in self.active.values()]
         snapshot = self.graph.compact_snapshot(active_tasks, self.governor.snapshot(), self.recent_changes)
+        snapshot["mechanical_token_governor"] = self.mechanical_governor.snapshot()
         snapshot["research_target"] = {
             "project_name": self.config.project_name,
             "final_conjecture_claim_id": self.final_conjecture_claim_id,
@@ -3624,16 +3886,31 @@ class AutonomousController:
         active_for_kind = sum(item.kind == kind for item in self.active.values())
         if active_for_kind >= kind_caps[kind]:
             raise RuntimeError(f"{kind} concurrency limit reached before model dispatch")
+        active_for_role = sum(
+            item.task.role == task.role for item in self.active.values()
+        )
+        if active_for_role >= self.config.role_concurrency(task.role):
+            raise RuntimeError(
+                f"{task.role} role concurrency limit reached before model dispatch"
+            )
         job_id = f"job-{uuid4().hex[:16]}"
         if self.mock:
             selected_model, selected_effort = "mock-no-fast", "mock"
+            selected_provider, selected_profile, selected_tier = "mock", None, None
         else:
             route_selector = getattr(self.backend, "_model_for", None)
             selected_model, selected_effort = (
                 route_selector(task.role) if callable(route_selector)
                 else self.config.model_for(task.role)
             )
-        if not self.governor.reserve(job_id, task.role, estimated_tokens):
+            route = self.config.route_for(task.role)
+            selected_provider = str(route["provider"])
+            selected_profile = route.get("profile")
+            selected_tier = route.get("service_tier")
+        estimated_cost = self.config.raw["models"][task.role].get("estimated_cost_usd")
+        if not self.governor.reserve(
+            job_id, task.role, estimated_tokens, estimated_cost,
+        ):
             raise RuntimeError(
                 f"token reservation rejected after scheduler admission: {task.role} {estimated_tokens}"
             )
@@ -3684,6 +3961,8 @@ class AutonomousController:
             job_id, task, future, time.monotonic(), timeout, kind,
             str(workspace), started_at, workspace_metadata,
             selected_model, selected_effort,
+            selected_provider, selected_profile,
+            selected_tier,
             broker_client_sha256, broker_config_sha256,
         )
         self.store.append("JOB_STARTED", {
@@ -3692,6 +3971,9 @@ class AutonomousController:
             "start_time": started_at, "workspace_metadata": workspace_metadata,
             "estimated_token_reservation": estimated_tokens,
             "model": selected_model, "reasoning_effort": selected_effort,
+            "provider": selected_provider, "provider_profile": selected_profile,
+            "requested_service_tier": selected_tier,
+            "estimated_cost_reservation_usd": estimated_cost,
             "mechanical_broker_enabled": bool(
                 self.mechanical_worker_enabled and task.role in MECHANICAL_PARENT_ROLES
             ),
@@ -3702,6 +3984,8 @@ class AutonomousController:
             "job_id": job_id, "role": task.role, "task_id": task.task_id,
             "claim_id": task.target_claim, "timeout_seconds": timeout,
             "model": selected_model, "reasoning_effort": selected_effort,
+            "provider": selected_provider, "provider_profile": selected_profile,
+            "requested_service_tier": selected_tier,
             "start_time": started_at,
         })
         return job_id
@@ -3753,7 +4037,9 @@ class AutonomousController:
             ),
             "retryable": bool(retryable),
         }
-        return validate_mechanical_response(response)
+        return validate_mechanical_response(
+            response, allowed_routes=self._allowed_mechanical_routes(),
+        )
 
     def _persist_mechanical_terminal(
         self,
@@ -3803,7 +4089,9 @@ class AutonomousController:
                 "failure_kind": "artifact_validation",
                 "retryable": False,
             })
-            response = validate_mechanical_response(response)
+            response = validate_mechanical_response(
+                response, allowed_routes=self._allowed_mechanical_routes(),
+            )
 
         response_path = Path(state.response_path)
         atomic_write_json(response_path, response)
@@ -3815,6 +4103,10 @@ class AutonomousController:
         record = {
             **response,
             "role": MECHANICAL_ROLE,
+            "provider": execution.provider if execution is not None else None,
+            "provider_profile": (
+                execution.provider_profile if execution is not None else None
+            ),
             "requested_model": response.get("model"),
             "requested_reasoning_effort": response.get("reasoning_effort"),
             "actual_model": (
@@ -3834,6 +4126,18 @@ class AutonomousController:
             "cache_reused": bool(cache_reused),
             "artifact_hashes": artifact_hashes,
             "artifact_validation_errors": artifact_errors,
+            "cost_usd": (
+                state.accumulated_cost_usd
+                if state.cost_telemetry_observed else None
+            ),
+            "cost_telemetry": (
+                "partial"
+                if state.cost_telemetry_observed and state.cost_telemetry_unknown
+                else "observed" if state.cost_telemetry_observed else "unknown"
+            ),
+            "recovery_state": (
+                "recovered" if state.recovered else "fresh"
+            ),
             "completed_at": utc_now(),
         }
         self.completed_mechanical_jobs.append(record)
@@ -3859,10 +4163,13 @@ class AutonomousController:
             "parent_role": state.parent_role,
             "subtask_id": state.packet["task_id"],
             "status": response["status"],
+            "provider": record["provider"],
             "model": response["model"],
             "reasoning_effort": response["reasoning_effort"],
             "token_usage": response["token_usage"],
             "token_telemetry": response["token_telemetry"],
+            "cost_usd": record["cost_usd"],
+            "cost_telemetry": record["cost_telemetry"],
             "cache_reused": bool(cache_reused),
             "error": response["error"],
         })
@@ -4035,6 +4342,14 @@ class AutonomousController:
                     "task_packet": state.packet,
                     "valid": True,
                 })
+                policy_rejection = self._mechanical_policy_rejection(state.packet)
+                if policy_rejection is not None:
+                    self._reject_mechanical_request(
+                        state,
+                        error=policy_rejection,
+                        failure_kind="mechanical_selection_policy",
+                    )
+                    continue
                 cache_key = (
                     state.parent_task_id,
                     str(state.packet["task_id"]),
@@ -4049,10 +4364,25 @@ class AutonomousController:
                         "parent_role": state.parent_role,
                     }
                     self._persist_mechanical_terminal(
-                        state, validate_mechanical_response(reused), cache_reused=True,
+                        state,
+                        validate_mechanical_response(
+                            reused, allowed_routes=self._allowed_mechanical_routes(),
+                        ),
+                        cache_reused=True,
                     )
                 else:
-                    self.pending_mechanical.append(state)
+                    backpressure = self.config.raw["policy"][
+                        "one_shot_compute_worker"
+                    ]["backpressure"]
+                    queued = len(self.pending_mechanical) + len(self.active_mechanical)
+                    if queued >= int(backpressure["max_queue_depth"]):
+                        self._reject_mechanical_request(
+                            state,
+                            error="mechanical broker queue backpressure limit reached",
+                            failure_kind="broker_backpressure",
+                        )
+                    else:
+                        self.pending_mechanical.append(state)
         await self._launch_mechanical_subtasks()
 
     async def _launch_mechanical_subtasks(self) -> None:
@@ -4060,9 +4390,19 @@ class AutonomousController:
             return
         worker_policy = self.config.raw["policy"].get("one_shot_compute_worker", {})
         estimated = int(worker_policy.get("estimated_tokens", 60000))
+        backpressure = worker_policy["backpressure"]
+        minimum_interval = float(backpressure["minimum_dispatch_interval_seconds"])
+        if time.monotonic() - self._last_mechanical_dispatch < minimum_interval:
+            return
+        rate_decision = self.mechanical_governor.decide(self._latest_rate_limits)
+        if rate_decision.action in {"STOP", "DRAIN", "DRAIN_TO_STOP"}:
+            return
+        capacity = self._mechanical_resource_capacity()
+        launched = 0
         while (
             self.pending_mechanical
-            and len(self.active_mechanical) < self.max_mechanical_subworkers
+            and len(self.active_mechanical) < capacity
+            and launched < int(backpressure["dispatch_batch_size"])
         ):
             state = self.pending_mechanical.pop(0)
             if self.scheduler_stop_reason:
@@ -4086,10 +4426,13 @@ class AutonomousController:
             logical_job_id = (
                 f"mechanical-{state.parent_job_id}-{state.packet['task_id']}-a{attempt}"
             )
-            if not self.governor.reserve(logical_job_id, MECHANICAL_ROLE, estimated):
+            estimated_cost = worker_policy.get("estimated_cost_usd")
+            if not self.mechanical_governor.reserve(
+                logical_job_id, MECHANICAL_ROLE, estimated, estimated_cost,
+            ):
                 self._reject_mechanical_request(
                     state,
-                    error="global/role token budget does not permit a new mechanical subtask",
+                    error="mechanical token/cost budget does not permit a new subtask",
                     failure_kind="budget_exhausted",
                 )
                 continue
@@ -4126,10 +4469,13 @@ class AutonomousController:
                 "subtask_id": state.packet["task_id"],
                 "task_kind": state.packet["task_kind"],
                 "attempt": attempt,
-                "model": PRIMARY_MECHANICAL_ROUTE["model"],
-                "reasoning_effort": PRIMARY_MECHANICAL_ROUTE["reasoning_effort"],
+                "provider": self.mechanical_primary_route["provider"],
+                "model": self.mechanical_primary_route["model"],
+                "reasoning_effort": self.mechanical_primary_route["reasoning_effort"],
+                "provider_profile": self.mechanical_primary_route["profile"],
                 "service_tier": None,
                 "estimated_token_reservation": estimated,
+                "estimated_cost_reservation_usd": estimated_cost,
                 "packet_path": str(packet_path),
                 "output_root": str(output_root),
                 "receipt_path": str(receipt_path),
@@ -4139,6 +4485,8 @@ class AutonomousController:
             }
             self.store.append("MECHANICAL_SUBTASK_STARTED", payload)
             self.live_store.append("MECHANICAL_SUBTASK_STARTED", payload)
+            launched += 1
+            self._last_mechanical_dispatch = time.monotonic()
 
     async def _collect_mechanical_completed(self) -> None:
         worker_policy = self.config.raw["policy"].get("one_shot_compute_worker", {})
@@ -4164,21 +4512,26 @@ class AutonomousController:
                     failure_kind="runner_internal", retryable=False,
                 )
             route = (execution.model, execution.reasoning_effort, execution.service_tier)
-            allowed_routes = {
-                (
-                    PRIMARY_MECHANICAL_ROUTE["model"],
-                    PRIMARY_MECHANICAL_ROUTE["reasoning_effort"],
-                    None,
-                ),
-                (
-                    FALLBACK_MECHANICAL_ROUTE["model"],
-                    FALLBACK_MECHANICAL_ROUTE["reasoning_effort"],
-                    None,
-                ),
-                (None, None, None),
-            }
+            allowed_routes = self._allowed_mechanical_routes()
+            expected_provider = None
+            expected_profile = None
+            if execution.model == self.mechanical_primary_route["model"]:
+                expected_provider = self.mechanical_primary_route["provider"]
+                expected_profile = self.mechanical_primary_route["profile"]
+            elif execution.model == self.mechanical_fallback_route["model"]:
+                expected_provider = self.mechanical_fallback_route["provider"]
+                expected_profile = self.mechanical_fallback_route["profile"]
+            if execution.provider is None:
+                execution.provider = expected_provider
+            if execution.provider_profile is None:
+                execution.provider_profile = expected_profile
             actual_route_mismatch = bool(
                 execution.model_route_attestation == "violation"
+                or (
+                    expected_provider is not None
+                    and execution.provider is not None
+                    and execution.provider != expected_provider
+                )
                 or (
                     execution.actual_model is not None
                     and execution.actual_model != execution.model
@@ -4193,11 +4546,15 @@ class AutonomousController:
                 execution = MechanicalExecution(
                     status="TOOL_ERROR", result={}, model=execution.model,
                     reasoning_effort=execution.reasoning_effort,
+                    provider=execution.provider,
+                    provider_profile=execution.provider_profile,
                     actual_model=execution.actual_model,
                     actual_reasoning_effort=execution.actual_reasoning_effort,
                     model_route_attestation=execution.model_route_attestation,
                     token_usage=execution.token_usage,
                     token_telemetry=execution.token_telemetry,
+                    cost_usd=execution.cost_usd,
+                    cost_telemetry=execution.cost_telemetry,
                     error=(
                         "mechanical runner used or observed an unapproved "
                         "model/effort/tier route"
@@ -4205,11 +4562,12 @@ class AutonomousController:
                     failure_kind="model_route_policy", retryable=False,
                     unavailable_routes=list(execution.unavailable_routes),
                 )
-            self.governor.record(
+            self.mechanical_governor.record(
                 job_id, MECHANICAL_ROLE, execution.token_usage,
                 execution.status not in {"TOOL_ERROR", "BLOCKED"},
+                execution.cost_usd,
             )
-            self.governor.release(job_id)
+            self.mechanical_governor.release(job_id)
             self._add_token_usage(state.accumulated_usage, execution.token_usage)
             if execution.token_telemetry in {"observed", "synthetic"}:
                 state.telemetry_observed += 1
@@ -4218,6 +4576,11 @@ class AutonomousController:
                 state.telemetry_unknown += 1
             else:
                 state.telemetry_unknown += 1
+            if execution.cost_usd is not None:
+                state.accumulated_cost_usd += float(execution.cost_usd)
+                state.cost_telemetry_observed += 1
+            else:
+                state.cost_telemetry_unknown += 1
             attempt_record = {
                 "mechanical_job_id": job_id,
                 "parent_job_id": state.parent_job_id,
@@ -4226,6 +4589,8 @@ class AutonomousController:
                 "subtask_id": state.packet["task_id"],
                 "attempt": state.attempts_started,
                 "status": execution.status,
+                "provider": execution.provider,
+                "provider_profile": execution.provider_profile,
                 "model": execution.model,
                 "reasoning_effort": execution.reasoning_effort,
                 "actual_model": execution.actual_model,
@@ -4234,6 +4599,8 @@ class AutonomousController:
                 "service_tier": None,
                 "token_usage": execution.token_usage.to_dict(),
                 "token_telemetry": execution.token_telemetry,
+                "cost_usd": execution.cost_usd,
+                "cost_telemetry": execution.cost_telemetry,
                 "result": execution.result,
                 "artifacts": list(execution.artifacts),
                 "runner_directory": execution.runner_directory,
@@ -4254,10 +4621,12 @@ class AutonomousController:
                 for key in (
                     "mechanical_job_id", "parent_job_id", "parent_role",
                     "subtask_id", "attempt", "status", "model",
+                    "provider", "provider_profile",
                     "reasoning_effort", "actual_model",
                     "actual_reasoning_effort", "model_route_attestation",
                     "service_tier", "token_usage",
-                    "token_telemetry", "error", "failure_kind", "retryable",
+                    "token_telemetry", "cost_usd", "cost_telemetry",
+                    "error", "failure_kind", "retryable",
                 )
             })
             for unavailable in execution.unavailable_routes:
@@ -4327,16 +4696,18 @@ class AutonomousController:
                     "parent_role": state.parent_role,
                     "subtask_id": state.packet["task_id"],
                     "attempt": state.attempts_started,
-                    "from_model": PRIMARY_MECHANICAL_ROUTE["model"],
-                    "to_model": FALLBACK_MECHANICAL_ROUTE["model"],
-                    "to_reasoning_effort": FALLBACK_MECHANICAL_ROUTE["reasoning_effort"],
+                    "from_provider": self.mechanical_primary_route["provider"],
+                    "from_model": self.mechanical_primary_route["model"],
+                    "to_provider": self.mechanical_fallback_route["provider"],
+                    "to_model": self.mechanical_fallback_route["model"],
+                    "to_reasoning_effort": self.mechanical_fallback_route["reasoning_effort"],
                     "service_tier": None,
                     "reason": execution.fallback.get("reason"),
                 })
                 state.fallback_emitted = True
             if (
                 execution.failure_kind == "model_unavailable"
-                and execution.model == PRIMARY_MECHANICAL_ROUTE["model"]
+                and execution.model == self.mechanical_primary_route["model"]
                 and isinstance(execution.fallback, dict)
                 and execution.fallback.get("continuation_required") is True
                 and not fallback_was_already_emitted
@@ -4345,8 +4716,9 @@ class AutonomousController:
                     "mechanical_job_id": job_id,
                     "parent_job_id": state.parent_job_id,
                     "subtask_id": state.packet["task_id"],
-                    "next_model": FALLBACK_MECHANICAL_ROUTE["model"],
-                    "next_reasoning_effort": FALLBACK_MECHANICAL_ROUTE["reasoning_effort"],
+                    "next_provider": self.mechanical_fallback_route["provider"],
+                    "next_model": self.mechanical_fallback_route["model"],
+                    "next_reasoning_effort": self.mechanical_fallback_route["reasoning_effort"],
                     "service_tier": None,
                     "action": "exact cached-primary continuation; does not consume transient retry budget",
                 })
@@ -4701,6 +5073,11 @@ class AutonomousController:
             and active_count < self.max_audit
         ):
             task = self.pending_audits.pop(0)
+            if sum(
+                item.task.role == task.role for item in self.active.values()
+            ) >= self.config.role_concurrency(task.role):
+                deferred.append(task)
+                continue
             estimated = self._estimated_tokens(task.role, task.estimated_cost_tier)
             if not self.governor.may_start(task.role, estimated):
                 budget_blocked += 1
@@ -4817,6 +5194,9 @@ class AutonomousController:
             eligible = [
                 task for task in self.pending_research
                 if (allow_exploration or task.role != Role.EXPLORER)
+                and sum(
+                    item.task.role == task.role for item in self.active.values()
+                ) < self.config.role_concurrency(task.role)
                 and self.dynamic_scheduler.eligible_under_pressure(
                     task,
                     pressure=scheduling.audit_backlog_pressure,
@@ -4953,13 +5333,20 @@ class AutonomousController:
                     error=f"backend job exception: {exc}", failure_kind="backend_internal",
                 )
             # Defense in depth for custom/mock backends: normalize a forbidden
-            # tier into the failure envelope before useful/telemetry accounting
+            # or rerouted tier into the failure envelope before useful/telemetry accounting
             # and before JOB_COMPLETED is persisted.  A later mutation would
             # leave the append-only event looking successful.
             observed_tier = str(outcome.observed_service_tier or "unobservable")
-            if observed_tier not in {"none", "unobservable"}:
+            requested_tier = self.config.route_for(active.task.role).get("service_tier")
+            allowed_observed = (
+                {"none", "unobservable"}
+                if requested_tier in {None, ""}
+                else {str(requested_tier)}
+            )
+            if observed_tier not in allowed_observed:
                 self.stop_for_review = (
-                    f"no-fast/no-priority service tier policy violation: {observed_tier}"
+                    "service tier policy violation: "
+                    f"requested={requested_tier!r}, observed={observed_tier!r}"
                 )
                 self._internal_failure = True
                 outcome.error = self.stop_for_review
@@ -4978,6 +5365,14 @@ class AutonomousController:
                     and active.reasoning_effort
                     and outcome.reasoning_effort != active.reasoning_effort
                 )
+                or (
+                    outcome.provider and active.provider
+                    and outcome.provider != active.provider
+                )
+                or (
+                    outcome.requested_service_tier is not None
+                    and outcome.requested_service_tier != requested_tier
+                )
             )
             if route_mismatch:
                 original_failure = None if outcome.succeeded else {
@@ -4988,9 +5383,11 @@ class AutonomousController:
                     "server_error": outcome.server_error,
                 }
                 reason = (
-                    "model route policy violation: controller expected "
-                    f"{expected_route[0]!r}/{expected_route[1]!r}, backend reported "
-                    f"{observed_route[0]!r}/{observed_route[1]!r}"
+                    "provider/model route policy violation: controller expected "
+                    f"{active.provider!r}:{expected_route[0]!r}/{expected_route[1]!r} "
+                    f"tier={requested_tier!r}, backend reported "
+                    f"{outcome.provider!r}:{observed_route[0]!r}/{observed_route[1]!r} "
+                    f"tier={outcome.requested_service_tier!r}"
                 )
                 self.stop_for_review = reason
                 self._internal_failure = True
@@ -4999,8 +5396,11 @@ class AutonomousController:
                     "role": outcome.role,
                     "requested_model": active.model,
                     "requested_reasoning_effort": active.reasoning_effort,
+                    "requested_provider": active.provider,
+                    "requested_service_tier": requested_tier,
                     "observed_model": outcome.model,
                     "observed_reasoning_effort": outcome.reasoning_effort,
+                    "observed_provider": outcome.provider,
                     "original_failure": original_failure,
                     "action": (
                         "fail successful envelope closed; preserve an existing failure "
@@ -5012,7 +5412,9 @@ class AutonomousController:
                     outcome.failure_kind = "model_route_policy"
                     outcome.retryable = False
             useful = self._is_useful(outcome)
-            self.governor.record(job_id, outcome.role, outcome.token_usage, useful)
+            self.governor.record(
+                job_id, outcome.role, outcome.token_usage, useful, outcome.cost_usd,
+            )
             self.governor.release(job_id)
             record = outcome.to_dict()
             record["useful"] = useful
@@ -6058,6 +6460,8 @@ class AutonomousController:
             "lifecycle_phase": self.lifecycle.phase,
             "campaign_id": self.campaign_id, "epoch_id": self.epoch_id,
             "campaign_status": campaign_status,
+            "token_governor": self.governor.snapshot(),
+            "mechanical_token_governor": self.mechanical_governor.snapshot(),
             **lifecycle.to_dict(),
         }
         outcome_dir = self.layout.outcomes_root / self.run_id
@@ -6107,7 +6511,9 @@ class AutonomousController:
             "events": len(events), "jobs": lifecycle.jobs_terminal,
             **lifecycle.to_dict(),
             "mechanical_subtasks": mechanical_lifecycle.to_dict(),
-            "token_governor": self.governor.snapshot(), "canonical_changed": changed,
+            "token_governor": self.governor.snapshot(),
+            "mechanical_token_governor": self.mechanical_governor.snapshot(),
+            "canonical_changed": changed,
             "policy_manifest": self._run_manifest.get("research_policy", {}).get("manifest"),
             "policy_manifest_sha256": (
                 self.policy_manifest["manifest_sha256"] if self.policy_manifest else None
@@ -6165,7 +6571,7 @@ class AutonomousController:
 def build_mock_full_cycle_backend(
     *,
     claim_id: str = "C_ROOT",
-    statement: str = "Replace this neutral example with the exact conjecture statement.",
+    statement: str = "AMR_PLACEHOLDER: replace with the exact final claim statement.",
     assumptions: list[str] | None = None,
     dependencies: list[str] | None = None,
 ) -> MockCodexBackend:

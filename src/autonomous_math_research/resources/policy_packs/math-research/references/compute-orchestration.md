@@ -13,7 +13,11 @@ Keep the problem, notation, known results, failed routes, artifacts, and strateg
 | Local compute | installed CAS/compiler/solver on the user's machine | First route for a known deterministic command; batch or shard, verify, persist |
 | Compute agent | primary `gpt-5.3-codex-spark` / `high` / null; permanent-unavailable fallback `gpt-5.6-luna` / `medium` / null | Prepare/adapt one bounded mechanical packet through the controller broker; verify, return, stop; never recurse |
 
-All settings are requested. A Skill cannot change an active main thread; select XHigh at thread start. Any non-worker capability check and every worker route must explicitly use `service_tier=null`; they must never select or inherit fast/priority. The mechanical broker never launches a separate paid probe turn: its first real Spark task is the availability check. Re-check broader client/service capabilities after changes; unavailable Max becomes a recorded XHigh fallback, never a claimed Max run.
+All settings are requested and capability-preflighted. A role route may use only
+a provider-declared safe tier; fast, priority, and auto are forbidden. Every
+bundled mechanical route explicitly uses `service_tier=null`. The broker never
+launches a separate paid probe turn: its first real primary task is the
+availability check.
 
 ```text
 unknown route     -> differentiated High breadth + falsification/computation
@@ -34,7 +38,11 @@ Before any nontrivial spawn, record short answers:
 5. No equivalent attempted or assigned workstream?
 6. Separation adds diversity, independence, or execution isolation?
 
-If localization, completeness, novelty, or net value fails, do not spawn. Keep unified-context work in main. Run known deterministic calculations directly on local backends; use the brokered Spark→Luna route only when mechanical agent work remains.
+If localization, completeness, novelty, or net value fails, do not spawn a
+research role. Keep unified-context strategy in the parent. Prefer the
+controller broker for finite enumeration, data normalization, formula
+expansion, code preparation, deterministic reproduction, and artifact checks
+whenever the packet and acceptance conditions are mechanical.
 
 ## Explorer
 
@@ -86,6 +94,6 @@ worker metadata, and leave unavailable usage/cost/latency/actual fields `null`.
 | C: one critical lemma | Check localization and the Max signals; send one self-contained Max task if the gate passes |
 | D: Max fails | Integrate a failure certificate; without new mathematics, prohibit immediate Max retry |
 | E: complete candidate proof | Fresh independent auditor, then exact/formal verification where valuable |
-| F: simple enumeration or script | Run a known command directly on the local backend. Use the controlled one-shot mechanical broker only if code preparation/adaptation still needs an agent; verify locally, return compactly, stop |
+| F: simple enumeration or script | Prefer the controlled one-shot mechanical broker for a finite packet; verify the returned artifacts, interpret in the parent, and stop |
 | G: four independent directions | Multi-agent or Ultra may be justified; assign distinct methods, targets, and stop conditions |
 | H: large inseparable lemma | No Ultra; preserve one context and use local Max only if its evidence gate passes |

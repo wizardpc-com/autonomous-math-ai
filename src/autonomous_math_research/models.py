@@ -525,10 +525,14 @@ class JobOutcome:
     turn_id: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+    provider: str | None = None
+    provider_profile: str | None = None
     requested_service_tier: str | None = None
     observed_service_tier: str | None = None
     token_usage: TokenUsage = field(default_factory=TokenUsage)
     token_telemetry: str = "unknown"
+    cost_usd: float | None = None
+    cost_telemetry: str = "unknown"
     artifact_paths: list[str] = field(default_factory=list)
     error: str | None = None
     failure_kind: str | None = None

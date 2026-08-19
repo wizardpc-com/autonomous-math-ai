@@ -17,6 +17,7 @@ mechanical delegation without treating model output as mathematical truth.
 > fresh audit, and the canonical gate.
 
 [简体中文](README.zh-CN.md) · [Quickstart](docs/quickstart.md) ·
+[Configuration](docs/configuration.md) · [Providers](docs/providers.md) ·
 [Architecture](docs/architecture.md) · [Trust model](docs/trust-model.md)
 
 ## Core guarantees
@@ -73,10 +74,16 @@ carry a second engine or any research-project state.
 Create and validate a neutral project without starting a model:
 
 ```console
-amr init ./research-target
+amr init ./research-target --project-id research-target --final-claim-id C_ROOT
 amr validate --project ./research-target
+amr config validate --project ./research-target
+amr config explain --project ./research-target
 amr run --project ./research-target --dry-run
 ```
+
+Initialization deliberately leaves marked mathematical placeholders. Replace
+them and complete the checklist before `amr validate --strict` can pass. These
+validation/config commands never start a provider.
 
 Exercise the full controller lifecycle with deterministic mock agents:
 
@@ -85,8 +92,9 @@ amr run --project ./research-target --mock --hours 0.01
 amr detect-tools --project-root ./research-target
 ```
 
-These commands are zero-model checks. A live run requires a separately
-configured Codex App Server environment and an explicit non-mock invocation.
+These commands are zero-model checks. Codex App Server is the built-in default
+provider and reuses the operator's Codex login. APIs are optional and require an
+explicit OpenAI-compatible or plugin provider selection.
 See [the quickstart](docs/quickstart.md) before enabling live execution.
 
 ## Project contract
@@ -132,6 +140,12 @@ Mechanical output is execution evidence only. The parent research role must
 interpret it, and a strong independent auditor remains responsible for any
 verdict.
 
+The default static mechanical seat cap is unbounded. This removes only a fixed
+seat count: dispatch still obeys a separate 1.5-billion-token default budget,
+cost limits, CPU/resource capacity, provider rate limits, a bounded queue,
+dispatch batches, timeouts, and operator stop. The main-role default is 500
+million tokens; the monitor displays both budgets separately.
+
 ## Safety and scope
 
 - No command reads or stores authentication secrets as research artifacts.
@@ -147,6 +161,8 @@ verdict.
 ## Documentation
 
 - [Quickstart](docs/quickstart.md)
+- [Configuration and profiles](docs/configuration.md)
+- [Provider adapters](docs/providers.md)
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
 - [Project manifest](docs/project-manifest.md)

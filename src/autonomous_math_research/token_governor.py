@@ -19,14 +19,18 @@ class GovernorDecision:
 class TokenGovernor:
     global_budget: int | None
     configured_max_research: int
+    global_cost_budget: float | None = None
     soft_fraction: float = 0.75
     hard_fraction: float = 0.95
     rate_reduce_percent: float = 75.0
     rate_drain_percent: float = 90.0
     rate_stop_percent: float = 98.0
     role_budgets: dict[str, int] = field(default_factory=dict)
+    role_cost_budgets: dict[str, float] = field(default_factory=dict)
     total: TokenUsage = field(default_factory=TokenUsage)
+    total_cost_usd: float = 0.0
     by_role: dict[str, int] = field(default_factory=dict)
+    cost_by_role: dict[str, float] = field(default_factory=dict)
     by_job: dict[str, dict[str, Any]] = field(default_factory=dict)
     reservations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -48,17 +52,42 @@ class TokenGovernor:
             if reservation.get("role") == role
         )
 
-    def reserve(self, job_id: str, role: str, estimated_tokens: int) -> bool:
+    @property
+    def reserved_cost_usd(self) -> float:
+        return sum(float(item.get("estimated_cost_usd") or 0.0) for item in self.reservations.values())
+
+    def reserved_cost_for_role(self, role: str) -> float:
+        return sum(
+            float(item.get("estimated_cost_usd") or 0.0)
+            for item in self.reservations.values()
+            if item.get("role") == role
+        )
+
+    def reserve(
+        self,
+        job_id: str,
+        role: str,
+        estimated_tokens: int,
+        estimated_cost_usd: float | None = None,
+    ) -> bool:
         if job_id in self.reservations:
             raise ValueError(f"duplicate token reservation: {job_id}")
-        if not self.may_start(role, estimated_tokens):
+        if not self.may_start(role, estimated_tokens, estimated_cost_usd):
             return False
         self.reservations[job_id] = {
-            "role": role, "estimated_tokens": max(0, int(estimated_tokens)),
+            "role": role,
+            "estimated_tokens": max(0, int(estimated_tokens)),
+            "estimated_cost_usd": max(0.0, float(estimated_cost_usd or 0.0)),
         }
         return True
 
-    def restore_reservation(self, job_id: str, role: str, estimated_tokens: int) -> None:
+    def restore_reservation(
+        self,
+        job_id: str,
+        role: str,
+        estimated_tokens: int,
+        estimated_cost_usd: float | None = None,
+    ) -> None:
         """Restore an already-started job without treating it as new dispatch.
 
         Crash recovery must continue observing in-flight work even when the
@@ -71,12 +100,20 @@ class TokenGovernor:
         self.reservations[job_id] = {
             "role": role,
             "estimated_tokens": max(0, int(estimated_tokens)),
+            "estimated_cost_usd": max(0.0, float(estimated_cost_usd or 0.0)),
         }
 
     def release(self, job_id: str) -> None:
         self.reservations.pop(job_id, None)
 
-    def record(self, job_id: str, role: str, usage: TokenUsage, useful: bool | None = None) -> None:
+    def record(
+        self,
+        job_id: str,
+        role: str,
+        usage: TokenUsage,
+        useful: bool | None = None,
+        cost_usd: float | None = None,
+    ) -> None:
         previous = self.by_job.get(job_id, {}).get("total_tokens", 0)
         delta = max(0, usage.total_tokens - int(previous))
         self.total.total_tokens += delta
@@ -86,32 +123,74 @@ class TokenGovernor:
         self.total.output_tokens += max(0, usage.output_tokens - int(self.by_job.get(job_id, {}).get("output_tokens", 0)))
         self.total.reasoning_output_tokens += max(0, usage.reasoning_output_tokens - int(self.by_job.get(job_id, {}).get("reasoning_output_tokens", 0)))
         self.by_role[role] = self.by_role.get(role, 0) + delta
-        self.by_job[job_id] = {**usage.to_dict(), "role": role, "useful": useful}
+        previous_cost = float(self.by_job.get(job_id, {}).get("cost_usd") or 0.0)
+        observed_cost = (
+            previous_cost
+            if cost_usd is None else max(previous_cost, float(cost_usd))
+        )
+        cost_delta = max(0.0, observed_cost - previous_cost)
+        self.total_cost_usd += cost_delta
+        self.cost_by_role[role] = self.cost_by_role.get(role, 0.0) + cost_delta
+        self.by_job[job_id] = {
+            **usage.to_dict(), "role": role, "useful": useful,
+            "cost_usd": (
+                observed_cost
+                if cost_usd is not None or "cost_usd" in self.by_job.get(job_id, {})
+                else None
+            ),
+        }
 
-    def may_start(self, role: str, estimated_tokens: int = 0) -> bool:
+    def may_start(
+        self,
+        role: str,
+        estimated_tokens: int = 0,
+        estimated_cost_usd: float | None = None,
+    ) -> bool:
         estimated_tokens = max(0, int(estimated_tokens))
         committed_total = self.total.total_tokens + self.reserved_tokens
         if self.global_budget is not None and committed_total + estimated_tokens > self.global_budget:
             return False
+        estimated_cost = max(0.0, float(estimated_cost_usd or 0.0))
+        if (
+            self.global_cost_budget is not None
+            and self.total_cost_usd + self.reserved_cost_usd + estimated_cost
+            > self.global_cost_budget
+        ):
+            return False
         role_budget = self.role_budgets.get(role)
         committed_role = self.by_role.get(role, 0) + self.reserved_tokens_for_role(role)
-        return role_budget is None or committed_role + estimated_tokens <= role_budget
+        if role_budget is not None and committed_role + estimated_tokens > role_budget:
+            return False
+        role_cost_budget = self.role_cost_budgets.get(role)
+        committed_role_cost = self.cost_by_role.get(role, 0.0) + self.reserved_cost_for_role(role)
+        return (
+            role_cost_budget is None
+            or committed_role_cost + estimated_cost <= role_cost_budget
+        )
 
     def decide(self, rate_limits: dict[str, Any] | None = None) -> GovernorDecision:
-        used_fraction = 0.0 if not self.global_budget else self.total.total_tokens / self.global_budget
+        token_fraction = (
+            0.0 if not self.global_budget else self.total.total_tokens / self.global_budget
+        )
+        cost_fraction = (
+            0.0 if not self.global_cost_budget
+            else self.total_cost_usd / self.global_cost_budget
+        )
+        used_fraction = max(token_fraction, cost_fraction)
+        budget_kind = "token" if token_fraction >= cost_fraction else "cost"
         rate_percent = _highest_rate_percent(rate_limits)
         if rate_percent >= self.rate_stop_percent:
             return GovernorDecision("STOP", "hard rate limit reached", 0, False, False)
         if used_fraction >= 1:
             return GovernorDecision(
                 "DRAIN_TO_STOP",
-                "global token budget reached; waiting for active jobs to finish",
+                f"global {budget_kind} budget reached; waiting for active jobs to finish",
                 0,
                 False,
                 False,
             )
         if rate_percent >= self.rate_drain_percent or used_fraction >= self.hard_fraction:
-            return GovernorDecision("DRAIN", "near token or rate limit", 1, False, False)
+            return GovernorDecision("DRAIN", "near token, cost, or rate limit", 1, False, False)
         if rate_percent >= self.rate_reduce_percent or used_fraction >= self.soft_fraction:
             return GovernorDecision("DEGRADE", "soft budget threshold", max(1, self.configured_max_research // 2), False, False)
         return GovernorDecision("RUN", "within budget", self.configured_max_research, True, False)
@@ -119,8 +198,11 @@ class TokenGovernor:
     def snapshot(self) -> dict[str, Any]:
         return {
             "global_budget": self.global_budget,
+            "global_cost_budget_usd": self.global_cost_budget,
             "total": self.total.to_dict(),
+            "total_cost_usd": self.total_cost_usd,
             "by_role": dict(self.by_role),
+            "cost_by_role": dict(self.cost_by_role),
             "reservations": {
                 job_id: {
                     **reservation,
@@ -129,6 +211,7 @@ class TokenGovernor:
                 for job_id, reservation in self.reservations.items()
             },
             "reserved_tokens": self.reserved_tokens,
+            "reserved_cost_usd": self.reserved_cost_usd,
             "decision": asdict(self.decide()),
         }
 

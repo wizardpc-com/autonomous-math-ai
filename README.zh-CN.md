@@ -10,7 +10,8 @@ AI 辅助数学研究。它负责研究任务、反证搜索、独立审计、�
 > 都不会自动成为证明。只有确定性检查、fresh independent audit 和 canonical gate
 > 可以改变可信状态。
 
-[English README](README.md) · [快速开始](docs/quickstart.md) ·
+[English README](README.md) · [快速开始](docs/quickstart.zh-CN.md) ·
+[配置](docs/configuration.zh-CN.md) · [Provider](docs/providers.zh-CN.md) ·
 [架构](docs/architecture.md) · [可信模型](docs/trust-model.md)
 
 ## 核心边界
@@ -49,15 +50,18 @@ Codex 发现入口，引用同一份 package policy，不包含第二套 engine 
 ## 零额度开始
 
 ```console
-amr init ./research-target
+amr init ./research-target --project-id research-target --final-claim-id C_ROOT
 amr validate --project ./research-target
+amr config validate --project ./research-target
+amr config explain --project ./research-target
 amr run --project ./research-target --dry-run
 amr run --project ./research-target --mock --hours 0.01
 amr detect-tools --project-root ./research-target
 ```
 
-这些命令不会启动真实模型。真实运行需要单独配置 Codex App Server，并应在确认模型、
-预算、权限、canonical 输入和审计规则后显式启动。
+这些命令不会启动真实模型。初始化骨架故意保留数学占位标记；补全命题和检查清单后，
+再运行 `amr validate --strict`。Codex App Server 是开箱即用的默认 provider，复用
+operator 的 Codex 登录；API 只是显式可选入口，不配置 API 就不会要求 API key。
 
 ## 长期运行结构
 
@@ -73,7 +77,9 @@ epoch 到期、预算耗尽、operator stop 或内部失败后，controller 停�
 研究和审计角色只能通过 controller 管理的 broker 请求有限机械任务。默认使用
 Spark/high/null；只有明确的永久 unavailable/access denied 才允许一次
 Luna/medium/null fallback。临时错误不会缓存为模型不可用，也不会回退到父模型、fast
-或 priority service。
+或 priority service。默认没有静态子工席位上限，但仍受独立的 15 亿 token 默认额度、
+CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超时和 operator stop
+约束。主角色默认额度为 5 亿 token；监视面板并列显示两套额度。
 
 机械结果只是父角色可以检查的执行证据。父研究模型负责解释，强 Auditor 负责最终判词。
 
@@ -85,7 +91,8 @@ Luna/medium/null fallback。临时错误不会缓存为模型不可用，也不�
 - telemetry 缺失时记录为 unknown，而不是确定的 0。
 - dry-run、mock、active live、failed live 和 completed live 明确区分。
 
-项目目前处于 alpha 阶段。真实 campaign 前请阅读[快速开始](docs/quickstart.md)、
+项目目前处于 alpha 阶段。真实 campaign 前请阅读[快速开始](docs/quickstart.zh-CN.md)、
+[配置文档](docs/configuration.zh-CN.md)、[Provider 文档](docs/providers.zh-CN.md)、
 [架构](docs/architecture.md)、[可信模型](docs/trust-model.md)和
 [安全策略](SECURITY.md)。
 

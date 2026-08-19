@@ -5,10 +5,25 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .mechanical import (
+    MECHANICAL_TASK_KINDS, installed_mechanical_runner_adapters,
+)
 from .project import ProjectManifest, discover_workspace_root
+from .profiles import (
+    BUILTIN_PROFILE_NAME, CONFIG_SCHEMA_VERSION, builtin_profile,
+    load_user_profile, migrate_config,
+)
+from .provider_config import (
+    mapped_reasoning_effort, redact_config, secret_reference_issues,
+    validate_provider_and_routes,
+)
+from .resources import schema_resource
+from .schema import load_schema, validate
 
 
-DEFAULT_PROTECTED = ["claims", "proofs", "state", "artifacts", "experiments"]
+DEFAULT_PROTECTED = [
+    "claims", "proofs", "state", "artifacts", "experiments",
+]
 
 
 def default_max_audit(max_research_workers: int) -> int:
@@ -36,6 +51,9 @@ class HarnessConfig:
     config_path: Path
     manifest: ProjectManifest | None = None
     workspace_root: Path | None = None
+    profile_name: str = BUILTIN_PROFILE_NAME
+    user_profile_path: Path | None = None
+    migrations_applied: tuple[str, ...] = ()
 
     @property
     def max_director(self) -> int:
@@ -56,10 +74,9 @@ class HarnessConfig:
         return int(self.raw["scheduler"]["max_audit"])
 
     @property
-    def max_mechanical_subworkers(self) -> int:
-        # Legacy/disabled configurations have no mechanical pool. Schema v6
-        # requires an explicit positive value before the broker can be enabled.
-        return int(self.raw["scheduler"].get("max_mechanical_subworkers", 0))
+    def max_mechanical_subworkers(self) -> int | None:
+        value = self.raw["scheduler"].get("max_mechanical_subworkers")
+        return int(value) if value is not None else None
 
     @property
     def project_name(self) -> str:
@@ -89,6 +106,60 @@ class HarnessConfig:
         route = self.raw["models"][role]
         return str(route["model"]), str(route["effort"])
 
+    def route_for(self, role: str) -> dict[str, Any]:
+        route = dict(self.raw["models"][role])
+        provider = dict(self.raw["providers"][str(route["provider"])])
+        route["mapped_effort"] = mapped_reasoning_effort(provider, route)
+        route["endpoint"] = route.get("endpoint") or provider.get("endpoint")
+        route["profile"] = route.get("profile") or provider.get("profile")
+        return route
+
+    def provider_for(self, role: str) -> dict[str, Any]:
+        route = self.raw["models"][role]
+        return dict(self.raw["providers"][str(route["provider"])])
+
+    def role_timeout(self, role: str) -> float:
+        route = self.raw["models"].get(role, {})
+        value = route.get("timeout_seconds")
+        if value is None:
+            value = self.raw["timeouts"].get(
+                role, self.raw["timeouts"]["default_seconds"],
+            )
+        return float(value)
+
+    def role_concurrency(self, role: str) -> int:
+        route = self.raw["models"][role]
+        return int(route["max_concurrency"])
+
+    def role_token_limit(self, role: str) -> int | None:
+        value = self.raw["models"].get(role, {}).get("token_limit")
+        if value is None:
+            value = self.raw["budgets"].get("per_thread", {}).get(role)
+        if value is None:
+            value = self.raw["budgets"].get("per_thread_default")
+        return int(value) if value is not None else None
+
+    def retry_limit(self, role: str, retry_class: str) -> int:
+        route = self.raw["models"][role]
+        return int(route.get("retries", {}).get(retry_class, 0))
+
+    def explained(self) -> dict[str, Any]:
+        return {
+            "config_schema_version": CONFIG_SCHEMA_VERSION,
+            "profile": self.profile_name,
+            "project_config": str(self.config_path),
+            "user_profile": (
+                str(self.user_profile_path) if self.user_profile_path is not None else None
+            ),
+            "migrations_applied": list(self.migrations_applied),
+            "precedence": [
+                "builtin profile", "project config", "explicit user profile",
+                "core trust-boundary validation",
+            ],
+            "effective_config": redact_config(self.raw),
+            "model_turns_started": 0,
+        }
+
 
 def load_config(
     project_root: Path,
@@ -96,6 +167,7 @@ def load_config(
     *,
     workspace_root: Path | None = None,
     require_manifest: bool = False,
+    profile_path: Path | None = None,
 ) -> HarnessConfig:
     project_root = project_root.resolve()
     manifest_path = project_root / "autonomous" / "project.json"
@@ -110,7 +182,36 @@ def load_config(
     if not path.is_relative_to(project_root):
         raise ValueError("config must be inside the target project")
     # JSON is a strict YAML subset and avoids another long-running dependency.
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    project_document = json.loads(path.read_text(encoding="utf-8"))
+    migrated, migrations = migrate_config(project_document)
+    declared_project = migrated.get("project", {})
+    declared_name = str(declared_project.get("name") or project_root.name)
+    declared_final = str(
+        declared_project.get("final_conjecture_claim_id")
+        or (manifest.final_claim_id if manifest is not None else "C_ROOT")
+    )
+    base = builtin_profile(declared_name, declared_final)
+    raw = deep_merge(base, migrated)
+    selected_profile = str(raw.get("profile") or BUILTIN_PROFILE_NAME)
+    if selected_profile != BUILTIN_PROFILE_NAME:
+        raise ValueError(
+            "project config profile must be codex-app-server-default; use --profile "
+            "for an explicit user profile"
+        )
+    resolved_profile: Path | None = None
+    if profile_path is not None:
+        resolved_profile = profile_path.resolve()
+        profile_name, overrides = load_user_profile(resolved_profile)
+        raw = deep_merge(raw, overrides)
+        selected_profile = profile_name
+    secret_issues = secret_reference_issues(raw)
+    if secret_issues:
+        raise ValueError(
+            "configuration contains forbidden secret material: "
+            + "; ".join(secret_issues)
+        )
+    with schema_resource("config.schema.json") as config_schema_path:
+        validate(raw, load_schema(config_schema_path))
     _validate_config(raw)
     configured_name = str(raw.get("project", {}).get("name") or project_root.name)
     expected_name = manifest.project_id if manifest is not None else project_root.name
@@ -129,11 +230,17 @@ def load_config(
         config_path=path,
         manifest=manifest,
         workspace_root=discover_workspace_root(project_root, workspace_root),
+        profile_name=selected_profile,
+        user_profile_path=resolved_profile,
+        migrations_applied=tuple(migrations),
     )
 
 
 def _validate_config(raw: dict[str, Any]) -> None:
-    for section in ("scheduler", "budgets", "models", "audit", "stagnation", "workspace", "policy"):
+    for section in (
+        "scheduler", "budgets", "providers", "models", "audit",
+        "stagnation", "workspace", "policy",
+    ):
         if section not in raw:
             raise ValueError(f"config missing section: {section}")
     scheduler = raw["scheduler"]
@@ -150,6 +257,10 @@ def _validate_config(raw: dict[str, Any]) -> None:
         if not str(project.get("final_conjecture_claim_id", "")).strip():
             raise ValueError("project.final_conjecture_claim_id must be non-empty")
     schema_version = int(raw.get("schema_version", 0))
+    if schema_version != CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            f"effective configuration must use schema v{CONFIG_SCHEMA_VERSION}"
+        )
     if schema_version >= 3:
         required_concurrency = {
             "max_director", "max_research_workers", "max_audit",
@@ -212,6 +323,16 @@ def _validate_config(raw: dict[str, Any]) -> None:
     global_tokens = raw["budgets"].get("global_tokens")
     if global_tokens is not None and int(global_tokens) <= 0:
         raise ValueError("global token budget must be positive or null")
+    mechanical_tokens = raw["budgets"].get("mechanical_tokens")
+    if mechanical_tokens is not None and int(mechanical_tokens) <= 0:
+        raise ValueError("mechanical token budget must be positive or null")
+    for key in ("global_cost_usd", "mechanical_cost_usd"):
+        value = raw["budgets"].get(key)
+        if value is not None and (
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            or value <= 0
+        ):
+            raise ValueError(f"{key} must be positive or null")
     per_thread_limit_action = str(
         raw["budgets"].get("per_thread_limit_action", "observe")
     )
@@ -240,14 +361,11 @@ def _validate_config(raw: dict[str, Any]) -> None:
         for role, route in raw.get(table_name, {}).items():
             if not route.get("model") or not route.get("effort"):
                 raise ValueError(f"model route incomplete for {table_name}.{role}")
-            if route.get("service_tier") not in {None, ""}:
-                raise ValueError(
-                    "all explicit fast or priority service tiers are forbidden by project policy"
-                )
     required_routes = {"director", "prover", "falsifier", "explorer", "auditor", "evaluator_auditor", "smoke"}
     missing_routes = required_routes - set(raw["models"])
     if missing_routes:
         raise ValueError(f"missing model routes: {sorted(missing_routes)}")
+    validate_provider_and_routes(raw)
     policy = raw["policy"]
     if policy.get("stable_core") != "persistent_filesystem_controller":
         raise ValueError("policy stable_core must be persistent_filesystem_controller")
@@ -292,21 +410,36 @@ def _validate_config(raw: dict[str, Any]) -> None:
             )
     if type(worker.get("enabled")) is not bool:
         raise ValueError("one_shot_compute_worker.enabled must be boolean")
-    enabled = bool(worker.get("enabled", False))
-    if enabled and max_mechanical is None:
+    mechanical_adapters: set[str] = set()
+    installed_runners = installed_mechanical_runner_adapters()
+    for route_name in ("primary_route", "fallback_route"):
+        route = worker.get(route_name)
+        if not isinstance(route, dict):
+            raise ValueError(f"one_shot_compute_worker.{route_name} must be an object")
+        provider_name = route.get("provider")
+        if provider_name not in raw["providers"]:
+            raise ValueError(f"mechanical {route_name} names an unknown provider")
+        provider = raw["providers"][provider_name]
+        if provider["capabilities"].get("mechanical_one_shot") is not True:
+            raise ValueError(
+                f"mechanical {route_name} provider lacks mechanical_one_shot capability"
+            )
+        adapter = str(provider.get("adapter"))
+        mechanical_adapters.add(adapter)
+        if adapter not in installed_runners:
+            raise ValueError(
+                f"mechanical {route_name} requires an installed controller-managed "
+                f"runner for provider adapter {adapter!r}"
+            )
+        if not route.get("model") or not route.get("effort"):
+            raise ValueError(f"mechanical {route_name} is incomplete")
+        mapped_reasoning_effort(provider, route)
+        if route.get("service_tier") not in {None, ""}:
+            raise ValueError("mechanical workers must explicitly clear service tier")
+    if len(mechanical_adapters) != 1:
         raise ValueError(
-            "enabled one-shot compute worker requires max_mechanical_subworkers"
+            "mechanical primary/fallback routes must share one installed runner adapter"
         )
-    expected_primary = {
-        "model": "gpt-5.3-codex-spark", "effort": "high", "service_tier": None,
-    }
-    expected_fallback = {
-        "model": "gpt-5.6-luna", "effort": "medium", "service_tier": None,
-    }
-    if worker.get("primary_route") != expected_primary:
-        raise ValueError("mechanical primary route must be Spark/high/null")
-    if worker.get("fallback_route") != expected_fallback:
-        raise ValueError("mechanical fallback route must be Luna/medium/null")
     if worker.get("service_tier") is not None:
         raise ValueError("mechanical workers must explicitly clear service tier")
     if worker.get("fallback_condition") != "permanent_unavailable_or_access_denied":
@@ -323,6 +456,83 @@ def _validate_config(raw: dict[str, Any]) -> None:
     for key in positive_worker_keys:
         if type(worker.get(key)) is not int or int(worker[key]) <= 0:
             raise ValueError(f"one_shot_compute_worker.{key} must be positive")
+    selection = worker.get("selection_policy")
+    if not isinstance(selection, dict) or set(selection) != {"mode", "custom_thresholds"}:
+        raise ValueError("one_shot_compute_worker.selection_policy fields are invalid")
+    if selection["mode"] not in {
+        "preferred", "balanced", "conservative", "disabled", "custom",
+    }:
+        raise ValueError("invalid mechanical selection policy")
+    if not isinstance(selection["custom_thresholds"], dict):
+        raise ValueError("mechanical custom_thresholds must be an object")
+    if selection["mode"] == "custom" and not selection["custom_thresholds"]:
+        raise ValueError("custom mechanical selection policy requires thresholds")
+    custom_thresholds = selection["custom_thresholds"]
+    allowed_custom_thresholds = {
+        "allowed_task_kinds", "max_timeout_seconds",
+        "max_expected_artifacts", "max_input_files",
+    }
+    unknown_thresholds = set(custom_thresholds) - allowed_custom_thresholds
+    if unknown_thresholds:
+        raise ValueError(
+            f"unknown mechanical custom thresholds: {sorted(unknown_thresholds)}"
+        )
+    if "allowed_task_kinds" in custom_thresholds and (
+        not isinstance(custom_thresholds["allowed_task_kinds"], list)
+        or not custom_thresholds["allowed_task_kinds"]
+        or any(
+            not isinstance(item, str) or not item
+            for item in custom_thresholds["allowed_task_kinds"]
+        )
+    ):
+        raise ValueError("mechanical allowed_task_kinds must be a non-empty string list")
+    if "allowed_task_kinds" in custom_thresholds and not set(
+        custom_thresholds["allowed_task_kinds"]
+    ) <= set(MECHANICAL_TASK_KINDS):
+        raise ValueError("mechanical allowed_task_kinds contains an unknown task kind")
+    for key in (
+        "max_timeout_seconds", "max_expected_artifacts", "max_input_files",
+    ):
+        if key in custom_thresholds and (
+            type(custom_thresholds[key]) is not int or custom_thresholds[key] < 1
+        ):
+            raise ValueError(f"mechanical {key} must be a positive integer")
+    estimated_cost = worker.get("estimated_cost_usd")
+    if estimated_cost is not None and (
+        not isinstance(estimated_cost, (int, float))
+        or isinstance(estimated_cost, bool) or estimated_cost <= 0
+    ):
+        raise ValueError("mechanical estimated_cost_usd must be positive or null")
+    backpressure = worker.get("backpressure")
+    required_backpressure = {
+        "dispatch_batch_size", "max_queue_depth", "max_active_per_cpu",
+        "minimum_dispatch_interval_seconds",
+    }
+    if not isinstance(backpressure, dict) or set(backpressure) != required_backpressure:
+        raise ValueError("mechanical backpressure fields are invalid")
+    if type(backpressure["dispatch_batch_size"]) is not int or backpressure["dispatch_batch_size"] < 1:
+        raise ValueError("mechanical dispatch_batch_size must be positive")
+    if type(backpressure["max_queue_depth"]) is not int or backpressure["max_queue_depth"] < 1:
+        raise ValueError("mechanical max_queue_depth must be positive")
+    if (
+        not isinstance(backpressure["max_active_per_cpu"], (int, float))
+        or isinstance(backpressure["max_active_per_cpu"], bool)
+        or backpressure["max_active_per_cpu"] <= 0
+    ):
+        raise ValueError("mechanical max_active_per_cpu must be positive")
+    if float(backpressure["minimum_dispatch_interval_seconds"]) < 0:
+        raise ValueError("mechanical minimum dispatch interval must be non-negative")
+    core_protected = set(DEFAULT_PROTECTED)
+    configured_protected = set(raw["workspace"].get("protected_paths", []))
+    if not core_protected <= configured_protected:
+        raise ValueError(
+            "project config cannot remove core protected paths: "
+            f"{sorted(core_protected - configured_protected)}"
+        )
+    if raw["workspace"].get("network_access") is not False:
+        raise ValueError("core workspace policy requires network_access=false")
+    if raw["audit"].get("critical_double_audit") is not True:
+        raise ValueError("core trust policy requires critical_double_audit=true")
     if schema_version < 7:
         for key in (
             "runner_path", "task_schema_path", "result_schema_path",

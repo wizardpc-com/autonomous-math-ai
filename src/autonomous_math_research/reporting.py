@@ -58,6 +58,8 @@ def render_nightly_report(
     telemetry_states: Counter[str] = Counter()
     unknown_telemetry_by_role: Counter[str] = Counter()
     unknown_telemetry_by_model: Counter[str] = Counter()
+    cost_by_role: dict[str, float] = defaultdict(float)
+    unknown_cost_by_role: Counter[str] = Counter()
     start_times: list[datetime] = []
     end_times: list[datetime] = []
     all_cost_records = [*jobs, *mechanical_jobs]
@@ -67,6 +69,11 @@ def render_nightly_report(
         usage = job.get("token_usage") or {}
         counted_tokens = int(usage.get("total_tokens", 0))
         tokens_by_role[role] += counted_tokens
+        raw_cost = job.get("cost_usd")
+        if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
+            cost_by_role[role] += float(raw_cost)
+        elif str(job.get("cost_telemetry") or "unknown") == "unknown":
+            unknown_cost_by_role[role] += 1
         actual_model = job.get("actual_model")
         requested_model = job.get("requested_model") or job.get("model")
         model = str(
@@ -102,6 +109,11 @@ def render_nightly_report(
         except ValueError:
             pass
     total_tokens = sum(tokens_by_role.values())
+    main_tokens = sum(
+        value for role, value in tokens_by_role.items()
+        if role != "mechanical_subworker"
+    )
+    mechanical_tokens = tokens_by_role.get("mechanical_subworker", 0)
     wall_seconds = (
         max(0.0, (max(end_times) - min(start_times)).total_seconds())
         if start_times and end_times else 0.0
@@ -149,9 +161,21 @@ def render_nightly_report(
         )
         telemetry_summary = rendered_states or "unknown"
     token_total_label = (
-        f"记录总 tokens：{total_tokens}"
+        f"记录总 tokens：{total_tokens}（主角色 {main_tokens}；机械 {mechanical_tokens}）"
         if not telemetry_states.get("unknown")
-        else f"记录 tokens 下界：{total_tokens}（{telemetry_states['unknown']} 个 job 未观察到 telemetry，不能断言为 0）"
+        else (
+            f"记录 tokens 下界：{total_tokens}（主角色 {main_tokens}；机械 {mechanical_tokens}；"
+            f"{telemetry_states['unknown']} 个 job 未观察到 telemetry，不能断言为 0）"
+        )
+    )
+    observed_cost = sum(cost_by_role.values())
+    unknown_cost_jobs = sum(unknown_cost_by_role.values())
+    cost_total_label = (
+        f"记录成本：USD {observed_cost:.6f}"
+        + (
+            f"；另有 {unknown_cost_jobs} 个 job 成本 telemetry unknown"
+            if unknown_cost_jobs else ""
+        )
     )
 
     def role_token_line(role: str, tokens: int) -> str:
@@ -235,6 +259,7 @@ def render_nightly_report(
         *( ["- 无"] if not seeds else [] ), "",
         "## 【token / model / runtime 使用】", "",
         f"- {token_total_label}",
+        f"- {cost_total_label}",
         f"- token telemetry：{telemetry_summary}",
         f"- 记录 wall runtime：{wall_seconds:.2f} 秒",
         *(role_token_line(role, count) for role, count in sorted(tokens_by_role.items())),
@@ -245,8 +270,15 @@ def render_nightly_report(
         f"- manifest SHA-256：{(policy_manifest or {}).get('manifest_sha256', '未记录')}",
         f"- stable core：{(policy_manifest or {}).get('stable_core', '未记录')}",
         f"- source drift：{bool((policy_status or {}).get('source_drift', False))}",
-        "- requested service tier：null（App Server request 显式清除 tier override）",
-        "- one-shot mechanical route：Spark/high/null；仅永久 unavailable/access denied 时切换 Luna/medium/null。",
+        "- requested service tiers：" + (
+            ", ".join(sorted({str(job.get("requested_service_tier") or "null") for job in jobs}))
+            if jobs else "无模型 job"
+        ),
+        "- one-shot mechanical routes：" + (
+            f"{(policy_manifest or {}).get('one_shot_compute_worker', {}).get('primary_route')} → "
+            f"{(policy_manifest or {}).get('one_shot_compute_worker', {}).get('fallback_route')}；"
+            "仅永久 unavailable/access denied 时回退。"
+        ),
         "- mechanical actual-model attestation：" + (
             ", ".join(
                 f"{state} ({count} jobs)"
