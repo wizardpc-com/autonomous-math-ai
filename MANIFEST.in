@@ -1,0 +1,8 @@
+include LICENSE README.md
+recursive-include src/autonomous_math_research/resources *.json *.md *.py
+recursive-include templates/minimal-project *.json *.md
+recursive-include docs *.md
+recursive-include tests/fixtures *.json *.md
+prune **/__pycache__
+global-exclude *.py[cod]
+global-exclude .env *.pem *.key

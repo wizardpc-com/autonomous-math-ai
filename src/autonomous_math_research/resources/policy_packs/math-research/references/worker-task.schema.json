@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Controlled one-shot mechanical worker task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "task_kind",
+    "objective",
+    "mathematical_statement",
+    "input_files",
+    "allowed_tools",
+    "bounds",
+    "timeout_seconds",
+    "expected_artifacts",
+    "success_condition",
+    "falsification_condition",
+    "stop_condition",
+    "verification_steps",
+    "requires_mathematical_judgment",
+    "project_id",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"},
+    "task_kind": {
+      "type": "string",
+      "enum": [
+        "finite_enumeration",
+        "finite_exact_computation",
+        "formula_expansion",
+        "code_preparation",
+        "code_modification",
+        "data_extraction",
+        "data_normalization",
+        "deterministic_reproduction",
+        "artifact_verification",
+        "specified_formal_check",
+        "mechanical_analysis"
+      ]
+    },
+    "objective": {"type": "string"},
+    "mathematical_statement": {"type": "string"},
+    "input_files": {"type": "array", "items": {"type": "string"}},
+    "allowed_tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"}
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finite", "description", "parameters"],
+      "properties": {
+        "finite": {"type": "boolean", "const": true},
+        "description": {"type": "string"},
+        "parameters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "value"],
+            "properties": {
+              "name": {"type": "string"},
+              "value": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    "expected_artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "pattern": "^artifacts/[A-Za-z0-9._/-]+$"}
+    },
+    "success_condition": {"type": "string"},
+    "falsification_condition": {"type": "string"},
+    "stop_condition": {"type": "string"},
+    "verification_steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"}
+    },
+    "requires_mathematical_judgment": {"type": "boolean", "const": false},
+    "project_id": {"type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{0,99}$"},
+    "notes": {"type": ["string", "null"]}
+  }
+}

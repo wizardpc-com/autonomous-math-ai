@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-math-research"
+version = "0.2.0"
+description = "A fail-closed, append-only harness for autonomous mathematical research"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Autonomous Math Research contributors"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.scripts]
+amr = "autonomous_math_research.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+autonomous_math_research = [
+  "resources/schemas/*.json",
+  "resources/policy_packs/math-research/**/*.md",
+  "resources/policy_packs/math-research/**/*.json",
+  "resources/policy_packs/math-research/**/*.py",
+]
+
+[tool.unittest]
+start-directory = "tests"

@@ -1,0 +1,62 @@
+{
+  "schema_version": 7,
+  "project": {"name": "minimal-math-project", "final_conjecture_claim_id": "C_ROOT"},
+  "engine": {
+    "poll_interval_seconds": 0.1,
+    "max_consecutive_controller_errors": 5,
+    "error_rate_threshold": 0.5,
+    "error_rate_min_jobs": 4,
+    "max_retries": 1,
+    "transient_protocol_max_retries": 1,
+    "model_protocol_max_retries": 1,
+    "director_max_retries": 1,
+    "director_debounce_seconds": 2.0
+  },
+  "scheduler": {
+    "max_director": 1,
+    "max_research_workers": 8,
+    "max_audit": 8,
+    "max_mechanical_subworkers": 8,
+    "independent_exploration_fraction": 0.25
+  },
+  "budgets": {
+    "global_tokens": 2000000000,
+    "soft_fraction": 0.75,
+    "hard_fraction": 0.95,
+    "per_thread_limit_action": "observe",
+    "per_thread_default": 100000,
+    "per_thread": {"director": 60000, "prover": 160000, "falsifier": 120000, "explorer": 120000, "auditor": 160000, "evaluator_auditor": 120000},
+    "per_role": {"director": 2000000000, "prover": 2000000000, "falsifier": 2000000000, "explorer": 2000000000, "auditor": 2000000000, "evaluator_auditor": 2000000000},
+    "estimated_tokens": {"LOW": 60000, "MEDIUM": 120000, "HIGH": 180000, "director": 60000, "auditor": 160000, "evaluator_auditor": 120000}
+  },
+  "models": {
+    "director": {"model": "gpt-5.6-sol", "effort": "high", "service_tier": null},
+    "prover": {"model": "gpt-5.6-sol", "effort": "xhigh", "service_tier": null},
+    "falsifier": {"model": "gpt-5.6-sol", "effort": "high", "service_tier": null},
+    "explorer": {"model": "gpt-5.6-sol", "effort": "high", "service_tier": null},
+    "auditor": {"model": "gpt-5.6-sol", "effort": "xhigh", "service_tier": null},
+    "evaluator_auditor": {"model": "gpt-5.6-sol", "effort": "xhigh", "service_tier": null},
+    "smoke": {"model": "gpt-5.6-terra", "effort": "medium", "service_tier": null}
+  },
+  "audit": {"immediate_threshold": "HIGH", "critical_double_audit": true, "low_impact_batch_size": 8},
+  "stagnation": {"attempt_threshold": 3, "priority_penalty": 0.2, "force_diversification": true},
+  "rate_limits": {"reduce_exploration_percent": 75, "drain_percent": 90, "stop_percent": 98, "poll_interval_seconds": 60},
+  "observability": {"live_agent_feed": true, "flush_interval_seconds": 0.5, "max_text_chunk_chars": 2000, "max_channel_chars_per_turn": 24000, "capture_command_output": true, "max_command_output_chars_per_item": 4000},
+  "timeouts": {"default_seconds": 3600, "director": 900, "prover": 3600, "falsifier": 1800, "explorer": 2400, "auditor": 3000, "evaluator_auditor": 2400},
+  "workspace": {"protected_paths": ["claims", "proofs", "state", "artifacts", "experiments"], "use_worktree_for_code_modification": true, "network_access": false},
+  "policy": {
+    "pack": "math-research",
+    "stable_core": "persistent_filesystem_controller",
+    "one_shot_compute_worker": {
+      "enabled": true,
+      "service_tier": null,
+      "primary_route": {"model": "gpt-5.3-codex-spark", "effort": "high", "service_tier": null},
+      "fallback_route": {"model": "gpt-5.6-luna", "effort": "medium", "service_tier": null},
+      "fallback_condition": "permanent_unavailable_or_access_denied",
+      "recursive_spawn_allowed": false,
+      "transient_max_retries": 1,
+      "model_protocol_max_retries": 1,
+      "estimated_tokens": 60000
+    }
+  }
+}

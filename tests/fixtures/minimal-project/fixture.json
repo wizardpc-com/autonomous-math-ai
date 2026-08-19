@@ -1,0 +1,11 @@
+{
+  "project_id": "minimal-math-project",
+  "final_claim_id": "C_ROOT",
+  "expected_protocol_version": 2,
+  "expected_default_caps": {
+    "director": 1,
+    "research": 8,
+    "audit": 8,
+    "mechanical": 8
+  }
+}

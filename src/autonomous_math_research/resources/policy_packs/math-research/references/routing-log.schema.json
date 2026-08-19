@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Math research routing log record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "timestamp_utc",
+    "task_id",
+    "research_phase",
+    "role",
+    "requested_model",
+    "requested_reasoning_effort",
+    "actual_model",
+    "actual_reasoning_effort",
+    "observation_source",
+    "delegation_reason",
+    "gate_evidence",
+    "result_usefulness",
+    "new_mathematical_information",
+    "retry_or_rework_needed",
+    "duplicate_of",
+    "usage",
+    "next_controller_decision"
+  ],
+  "properties": {
+    "timestamp_utc": {"type": "string", "format": "date-time"},
+    "task_id": {"type": "string", "minLength": 1},
+    "research_phase": {"type": "string", "enum": ["unknown-route", "promising-route", "mature-route", "narrow-bottleneck", "candidate-proof", "verification"]},
+    "role": {"type": "string", "enum": ["main", "explorer", "breakthrough", "auditor", "compute-worker", "multi-agent"]},
+    "requested_model": {"type": ["string", "null"]},
+    "requested_reasoning_effort": {"type": ["string", "null"]},
+    "actual_model": {"type": ["string", "null"]},
+    "actual_reasoning_effort": {"type": ["string", "null"]},
+    "observation_source": {"type": ["string", "null"]},
+    "delegation_reason": {"type": "string", "minLength": 1},
+    "gate_evidence": {"type": "array", "items": {"type": "string"}},
+    "result_usefulness": {"type": "string", "enum": ["pending", "none", "low", "medium", "high"]},
+    "new_mathematical_information": {"type": ["boolean", "null"]},
+    "retry_or_rework_needed": {"type": ["boolean", "null"]},
+    "duplicate_of": {"type": ["string", "null"]},
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "cached_input_tokens", "output_tokens", "latency_seconds", "cost"],
+      "properties": {
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cached_input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "latency_seconds": {"type": ["number", "null"], "minimum": 0},
+        "cost": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["amount", "currency"],
+              "properties": {
+                "amount": {"type": "number", "minimum": 0},
+                "currency": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "next_controller_decision": {"type": "string"}
+  }
+}

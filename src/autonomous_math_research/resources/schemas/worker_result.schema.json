@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_type", "main_finding", "status", "artifact_paths", "next_suggested_question", "evidence_level"],
+  "properties": {
+    "result_type": {"type": "string", "enum": ["PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION", "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE", "COMPUTATIONAL_PATTERN", "NO_PROGRESS", "BLOCKED", "TOOL_ERROR"]},
+    "main_finding": {"type": "string"},
+    "status": {"type": "string"},
+    "artifact_paths": {"type": "array", "items": {"type": "string"}},
+    "next_suggested_question": {"type": "string"},
+    "evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]}
+  }
+}

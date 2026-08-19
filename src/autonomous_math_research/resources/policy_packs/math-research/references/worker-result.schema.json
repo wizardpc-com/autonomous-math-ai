@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Math research one-shot worker result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "status",
+    "evidence_level",
+    "objective",
+    "completed_scope",
+    "key_findings",
+    "counterexample",
+    "artifacts",
+    "commands",
+    "toolchain",
+    "interpretation",
+    "limitations",
+    "blocked_on",
+    "observations"
+  ],
+  "properties": {
+    "task_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["COMPLETED", "FALSIFIED", "NO_COUNTEREXAMPLE_WITHIN_SCOPE", "FORMAL_CHECK_PASSED", "BLOCKED", "TOOL_ERROR"]},
+    "evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]},
+    "objective": {"type": "string"},
+    "completed_scope": {"type": "string"},
+    "key_findings": {"type": "array", "items": {"type": "string"}},
+    "counterexample": {"type": ["string", "null"]},
+    "artifacts": {"type": "array", "items": {"type": "string"}},
+    "commands": {"type": "array", "items": {"type": "string"}},
+    "toolchain": {"type": "array", "items": {"type": "string"}},
+    "interpretation": {"type": "string"},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "blocked_on": {"type": ["string", "null"]},
+    "observations": {"type": "array", "items": {"type": "string"}}
+  }
+}

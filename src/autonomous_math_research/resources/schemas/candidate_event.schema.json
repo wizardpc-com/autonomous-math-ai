@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "producer_task_id", "claim_id", "parent_claim_id", "type", "impact", "concise_summary", "exact_statement", "artifact_paths", "reproduction_commands", "dependency_impact", "proposed_evidence_level", "assumptions", "dependencies", "representation", "bridge_representation_ids"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "producer_thread_id": {"type": ["string", "null"]},
+    "producer_task_id": {"type": "string", "minLength": 1},
+    "claim_id": {"type": "string", "minLength": 1},
+    "parent_claim_id": {"type": ["string", "null"]},
+    "source_run_id": {"type": ["string", "null"]},
+    "type": {"type": "string", "enum": ["THEOREM_CANDIDATE", "COUNTEREXAMPLE", "KEY_LEMMA", "KEY_REFUTATION", "REDUCTION", "OBSTRUCTION", "EQUIVALENCE", "COMPUTATIONAL_COLLISION", "COMPUTATIONAL_PATTERN", "REPRESENTATION_BRIDGE"]},
+    "impact": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+    "concise_summary": {"type": "string", "minLength": 1},
+    "exact_statement": {"type": "string", "minLength": 1},
+    "artifact_paths": {"type": "array", "items": {"type": "string"}},
+    "reproduction_commands": {"type": "array", "items": {"type": "string"}},
+    "dependency_impact": {"type": "array", "items": {"type": "string"}},
+    "proposed_evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]},
+    "assumptions": {"type": "array", "items": {"type": "string"}},
+    "dependencies": {"type": "array", "items": {"type": "string"}},
+    "bridge_representation_ids": {"type": "array", "items": {"type": "string"}},
+    "timestamp": {"type": "string", "minLength": 1},
+    "representation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch", "localization", "saturation", "normalization", "content", "exceptional_factors", "combination_scope"],
+      "properties": {
+        "branch": {"type": "string"},
+        "localization": {"type": "string"},
+        "saturation": {"type": "string"},
+        "normalization": {"type": "string"},
+        "content": {"type": "string"},
+        "exceptional_factors": {"type": "array", "items": {"type": "string"}},
+        "combination_scope": {"type": "string"}
+      }
+    }
+  }
+}

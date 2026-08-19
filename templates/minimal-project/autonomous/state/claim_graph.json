@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "claims": [
+    {
+      "claim_id": "C_ROOT",
+      "statement": "Replace this neutral example with the exact conjecture statement.",
+      "assumptions": [],
+      "math_status": "OPEN",
+      "trust_status": "CANONICAL_TRUSTED",
+      "dependencies": [],
+      "downstream_dependents": [],
+      "evidence_paths": [],
+      "known_counterexamples": [],
+      "current_gaps": ["Project has not yet supplied mathematical content."],
+      "active_tasks": [],
+      "last_meaningful_progress": null,
+      "priority": {"score": 1.0},
+      "source_status": "OPEN",
+      "evidence_level": "E0_SPECULATIVE"
+    }
+  ]
+}
