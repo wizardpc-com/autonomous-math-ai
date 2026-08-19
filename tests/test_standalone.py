@@ -11,7 +11,7 @@ import tomllib
 import unittest
 from uuid import uuid4
 
-from autonomous_math_research.cli import main as cli_main
+from autonomous_math_research.cli import build_parser, main as cli_main
 from autonomous_math_research.catalog import rebuild_catalog
 from autonomous_math_research.config import load_config
 from autonomous_math_research.controller import (
@@ -193,6 +193,13 @@ class StandalonePackageTests(unittest.TestCase):
             "https://github.com/wizardpc-com/autonomous-math-ai",
         )
 
+    def test_detect_tools_cli_uses_an_explicit_project_root(self) -> None:
+        args = build_parser().parse_args([
+            "detect-tools", "--project-root", str(self.project),
+        ])
+        self.assertEqual(args.command, "detect-tools")
+        self.assertEqual(args.project_root, self.project)
+
     def test_mechanical_runner_has_no_source_checkout_import_fallback(self) -> None:
         with policy_resource("scripts/run_worker.py") as runner:
             text = runner.read_text(encoding="utf-8")
@@ -269,13 +276,21 @@ class StandalonePackageTests(unittest.TestCase):
             "E:" + "\\math-ai-research",
             "projects" + "/",
             "tools" + ".autonomous_math_research",
-            "." + "agents",
         )
         for marker in forbidden:
             self.assertNotIn(marker, text)
         path_text = "\n".join(path.as_posix() for path in release_paths)
-        for marker in forbidden[:-3]:
+        for marker in forbidden[:-2]:
             self.assertNotIn(marker, path_text)
+
+        # A repository-local discovery entry is allowed, but the installable
+        # implementation must never import or resolve runtime resources from it.
+        source_text = "\n".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in (package_root / "src").rglob("*")
+            if path.is_file() and path.suffix == ".py"
+        )
+        self.assertNotIn("." + "agents", source_text)
 
 
 if __name__ == "__main__":

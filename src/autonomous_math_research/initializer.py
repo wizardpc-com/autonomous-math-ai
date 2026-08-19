@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 import re
 
+from .profiles import builtin_profile
 from .storage import atomic_write_json, atomic_write_text
 
 
@@ -33,7 +34,26 @@ turning them into trusted conclusions. Return only Output Protocol v2.
 Reconstruct the candidate independently from its sealed bundle. Do not read the
 producer transcript. Return only PASS, REJECT, or UNRESOLVED in Output Protocol v2.
 """,
+    "evaluator_auditor.md": """# Evaluator Auditor
+
+Independently reproduce bounded computational evidence and evaluate only the
+assigned evidence contract. Never promote finite evidence to proof. Return only
+Output Protocol v2.
+""",
+    "smoke.md": """# Smoke
+
+Exercise only the configured provider protocol and output schema. Do not perform
+mathematical research or modify canonical state. Return only Output Protocol v2.
+""",
+    "mechanical_worker.md": """# Mechanical Worker
+
+Execute one finite, mechanically checkable packet. Do not select research
+strategy, spawn another worker, modify canonical state, or claim proof.
+""",
 }
+
+_PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_CLAIM_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,99}$")
 
 
 def _project_id(directory: Path) -> str:
@@ -43,108 +63,29 @@ def _project_id(directory: Path) -> str:
     return value[:100]
 
 
-def _config(project_id: str) -> dict:
-    return {
-        "schema_version": 7,
-        "project": {"name": project_id, "final_conjecture_claim_id": "C_ROOT"},
-        "engine": {
-            "poll_interval_seconds": 0.1, "max_consecutive_controller_errors": 5,
-            "error_rate_threshold": 0.5, "error_rate_min_jobs": 4,
-            "max_retries": 1, "transient_protocol_max_retries": 1,
-            "model_protocol_max_retries": 1, "director_max_retries": 1,
-            "director_debounce_seconds": 2.0,
-        },
-        "scheduler": {
-            "max_director": 1, "max_research_workers": 8, "max_audit": 8,
-            "max_mechanical_subworkers": 8,
-            "independent_exploration_fraction": 0.25,
-        },
-        "budgets": {
-            "global_tokens": 2_000_000_000, "soft_fraction": 0.75,
-            "hard_fraction": 0.95, "per_thread_limit_action": "observe",
-            "per_thread_default": 100_000,
-            "per_thread": {
-                "director": 60_000, "prover": 160_000, "falsifier": 120_000,
-                "explorer": 120_000, "auditor": 160_000,
-                "evaluator_auditor": 120_000,
-            },
-            "per_role": {
-                role: 2_000_000_000 for role in (
-                    "director", "prover", "falsifier", "explorer", "auditor",
-                    "evaluator_auditor",
-                )
-            },
-            "estimated_tokens": {
-                "LOW": 60_000, "MEDIUM": 120_000, "HIGH": 180_000,
-                "director": 60_000, "auditor": 160_000,
-                "evaluator_auditor": 120_000,
-            },
-        },
-        "models": {
-            "director": {"model": "gpt-5.6-sol", "effort": "high", "service_tier": None},
-            "prover": {"model": "gpt-5.6-sol", "effort": "xhigh", "service_tier": None},
-            "falsifier": {"model": "gpt-5.6-sol", "effort": "high", "service_tier": None},
-            "explorer": {"model": "gpt-5.6-sol", "effort": "high", "service_tier": None},
-            "auditor": {"model": "gpt-5.6-sol", "effort": "xhigh", "service_tier": None},
-            "evaluator_auditor": {"model": "gpt-5.6-sol", "effort": "xhigh", "service_tier": None},
-            "smoke": {"model": "gpt-5.6-terra", "effort": "medium", "service_tier": None},
-        },
-        "audit": {
-            "immediate_threshold": "HIGH", "critical_double_audit": True,
-            "low_impact_batch_size": 8,
-        },
-        "stagnation": {
-            "attempt_threshold": 3, "priority_penalty": 0.2,
-            "force_diversification": True,
-        },
-        "rate_limits": {
-            "reduce_exploration_percent": 75, "drain_percent": 90,
-            "stop_percent": 98, "poll_interval_seconds": 60,
-        },
-        "observability": {
-            "live_agent_feed": True, "flush_interval_seconds": 0.5,
-            "max_text_chunk_chars": 2000, "max_channel_chars_per_turn": 24000,
-            "capture_command_output": True,
-            "max_command_output_chars_per_item": 4000,
-        },
-        "timeouts": {
-            "default_seconds": 3600, "director": 900, "prover": 3600,
-            "falsifier": 1800, "explorer": 2400, "auditor": 3000,
-            "evaluator_auditor": 2400,
-        },
-        "workspace": {
-            "protected_paths": ["claims", "proofs", "state", "artifacts", "experiments"],
-            "use_worktree_for_code_modification": True, "network_access": False,
-        },
-        "policy": {
-            "pack": "math-research", "stable_core": "persistent_filesystem_controller",
-            "one_shot_compute_worker": {
-                "enabled": True, "service_tier": None,
-                "primary_route": {
-                    "model": "gpt-5.3-codex-spark", "effort": "high",
-                    "service_tier": None,
-                },
-                "fallback_route": {
-                    "model": "gpt-5.6-luna", "effort": "medium",
-                    "service_tier": None,
-                },
-                "fallback_condition": "permanent_unavailable_or_access_denied",
-                "recursive_spawn_allowed": False, "transient_max_retries": 1,
-                "model_protocol_max_retries": 1, "estimated_tokens": 60_000,
-            },
-        },
-    }
+def _config(project_id: str, final_claim_id: str) -> dict:
+    return builtin_profile(project_id, final_claim_id)
 
 
-def initialize_project(directory: Path, *, force_empty: bool = False) -> Path:
+def initialize_project(
+    directory: Path,
+    *,
+    project_id: str | None = None,
+    final_claim_id: str = "C_ROOT",
+    force_empty: bool = False,
+) -> Path:
     root = directory.resolve()
     if root.exists() and any(root.iterdir()) and not force_empty:
         raise ValueError("init target must be absent or empty")
     root.mkdir(parents=True, exist_ok=True)
-    project_id = _project_id(root)
+    selected_project_id = project_id or _project_id(root)
+    if not _PROJECT_ID_RE.fullmatch(selected_project_id):
+        raise ValueError("project_id must be a normalized portable identifier")
+    if not _CLAIM_ID_RE.fullmatch(final_claim_id):
+        raise ValueError("final_claim_id must be a portable claim identifier")
     manifest = {
-        "schema_version": 1, "project_id": project_id,
-        "final_claim_id": "C_ROOT", "config": "autonomous/config.json",
+        "schema_version": 1, "project_id": selected_project_id,
+        "final_claim_id": final_claim_id, "config": "autonomous/config.json",
         "claim_graph": "autonomous/state/claim_graph.json",
         "trusted_state": "autonomous/state/nightly_trusted.json",
         "runtime_root": "autonomous", "prompt_root": "autonomous/prompts",
@@ -153,20 +94,26 @@ def initialize_project(directory: Path, *, force_empty: bool = False) -> Path:
             "research": ["claims/CLAIMS.md", "state/PROGRESS.md"],
             "audit": ["claims/CLAIMS.md", "state/PROGRESS.md"],
         },
-        "protected_paths": ["claims", "proofs", "state", "artifacts", "experiments"],
+        "protected_paths": [
+            "claims", "proofs", "state", "artifacts", "experiments",
+            "certificates", "audit",
+        ],
     }
     atomic_write_json(root / "autonomous" / "project.json", manifest)
-    atomic_write_json(root / "autonomous" / "config.json", deepcopy(_config(project_id)))
+    atomic_write_json(
+        root / "autonomous" / "config.json",
+        deepcopy(_config(selected_project_id, final_claim_id)),
+    )
     atomic_write_json(root / "autonomous" / "state" / "claim_graph.json", {
         "schema_version": 2,
         "claims": [{
-            "claim_id": "C_ROOT",
-            "statement": "Replace this neutral example with the exact conjecture statement.",
+            "claim_id": final_claim_id,
+            "statement": "AMR_PLACEHOLDER: replace with the exact final claim statement.",
             "assumptions": [], "math_status": "OPEN",
             "trust_status": "CANONICAL_TRUSTED", "dependencies": [],
             "downstream_dependents": [], "evidence_paths": [],
             "known_counterexamples": [],
-            "current_gaps": ["Project has not yet supplied mathematical content."],
+            "current_gaps": ["AMR_PLACEHOLDER: mathematical content is not configured."],
             "active_tasks": [], "last_meaningful_progress": None,
             "priority": {"score": 1.0}, "source_status": "OPEN",
             "evidence_level": "E0_SPECULATIVE",
@@ -174,20 +121,60 @@ def initialize_project(directory: Path, *, force_empty: bool = False) -> Path:
     })
     atomic_write_json(root / "autonomous" / "state" / "nightly_trusted.json", {
         "audited_candidate_fingerprints": [],
-        "claim_evidence_levels": {"C_ROOT": "E0_SPECULATIVE"},
+        "claim_evidence_levels": {final_claim_id: "E0_SPECULATIVE"},
         "last_updated": None, "schema_version": 1,
     })
     for name, content in _PROMPTS.items():
         atomic_write_text(root / "autonomous" / "prompts" / name, content)
     atomic_write_text(
         root / "claims" / "CLAIMS.md",
-        "# Claims\n\n- `C_ROOT`: Replace with an exact conjecture statement.\n",
+        f"# Claims\n\n- `{final_claim_id}`: AMR_PLACEHOLDER — replace with the exact final claim.\n",
     )
     atomic_write_text(
         root / "state" / "PROGRESS.md",
         "# Progress\n\nNo research has been run.\n",
     )
-    for name in ("proofs", "artifacts", "experiments"):
-        marker = root / name / ".gitkeep"
-        atomic_write_text(marker, "")
+    atomic_write_text(
+        root / "README.md",
+        f"# {selected_project_id}\n\n"
+        "Neutral project scaffold for Autonomous Math AI. Complete "
+        "`INITIALIZATION_CHECKLIST.md` before a real campaign.\n",
+    )
+    atomic_write_text(
+        root / "AGENTS.md",
+        "# Project instructions\n\n"
+        "Preserve falsification-first scheduling, fresh independent audit, append-only "
+        "evidence, schema preflight, crash recovery, representation compatibility, and "
+        "canonical gates. Model or mechanical output is never proof by itself.\n",
+    )
+    atomic_write_text(
+        root / "INITIALIZATION_CHECKLIST.md",
+        "# Initialization checklist\n\n"
+        "- [ ] Replace every `AMR_PLACEHOLDER` marker.\n"
+        f"- [ ] Confirm project id `{selected_project_id}` and final claim id `{final_claim_id}`.\n"
+        "- [ ] Record the exact claim, domain, quantifiers, assumptions, and dependencies.\n"
+        "- [ ] Review canonical inputs and protected paths.\n"
+        "- [ ] Review every role's provider, model, effort, timeout, retries, budgets, and concurrency.\n"
+        "- [ ] Review mechanical-worker policy, routes, backpressure, and separate budget.\n"
+        "- [ ] Keep credentials as environment/system/profile references only.\n"
+        "- [ ] Run `amr config validate`, `amr config explain`, and `amr validate --strict`.\n",
+    )
+    atomic_write_text(
+        root / "autonomous" / "README.md",
+        "# Autonomous adapter\n\n"
+        "`project.json` maps this project into the generic harness. Runtime evidence is "
+        "append-only; canonical project files remain behind controller and audit gates.\n",
+    )
+    directory_readmes = {
+        "proofs": "Informal or formal proof material; trust changes still require audit.",
+        "tasks": "Human-authored bounded task packets and planning inputs.",
+        "experiments": "Reproducible exact or symbolic experiment definitions.",
+        "certificates": "Machine-checkable certificates and verification metadata.",
+        "audit": "Independent audit inputs and durable audit records.",
+        "sources": "Source bibliography, snapshots, and provenance notes.",
+        "conversations": "Optional human conversation exports; never canonical proof evidence.",
+        "artifacts": "Content-addressed or reproducible research artifacts.",
+    }
+    for name, description in directory_readmes.items():
+        atomic_write_text(root / name / "README.md", f"# {name.title()}\n\n{description}\n")
     return root

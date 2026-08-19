@@ -126,6 +126,7 @@ ALLOWED_WORKER_REASONING_EFFORTS = {
     "medium",
     "high",
     "xhigh",
+    "max",
 }
 WORKER_ISOLATION_OVERRIDES = {
     "approval_policy": "never",
@@ -145,9 +146,47 @@ WORKER_ISOLATION_OVERRIDES = {
     "features.plugins": False,
     "features.apps": False,
 }
+
+
+def load_worker_routes(path: Path | None, *, broker_managed: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+    if path is None:
+        return (
+            {"provider": "codex", "profile": None, **FIXED_WORKER_ROUTES[0]},
+            {"provider": "codex", "profile": None, **FIXED_WORKER_ROUTES[1]},
+        )
+    resolved = path.resolve()
+    if broker_managed and not resolved.is_relative_to(REPO_ROOT):
+        raise ContractError("broker route configuration must stay inside the project")
+    value = read_json(resolved)
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "primary_route", "fallback_route",
+    }:
+        raise ContractError("mechanical route configuration fields are invalid")
+    if value["schema_version"] != 1:
+        raise ContractError("unsupported mechanical route configuration version")
+    expected = {
+        "provider", "model", "reasoning_effort", "service_tier", "profile",
+    }
+    routes: list[dict[str, Any]] = []
+    for name in ("primary_route", "fallback_route"):
+        route = value[name]
+        if not isinstance(route, dict) or set(route) != expected:
+            raise ContractError(f"{name} fields are invalid")
+        if not isinstance(route["provider"], str) or not route["provider"]:
+            raise ContractError(f"{name}.provider must be non-empty")
+        if not isinstance(route["model"], str) or not route["model"]:
+            raise ContractError(f"{name}.model must be non-empty")
+        if route["reasoning_effort"] not in ALLOWED_WORKER_REASONING_EFFORTS:
+            raise ContractError(f"{name}.reasoning_effort is unsupported by the Codex runner")
+        if route["service_tier"] is not None:
+            raise ContractError(f"{name}.service_tier must be null")
+        if route["profile"] is not None and not isinstance(route["profile"], str):
+            raise ContractError(f"{name}.profile must be a string or null")
+        routes.append(dict(route))
+    return routes[0], routes[1]
 MODEL_STATUS_PATH = REPO_ROOT / ".tooling" / "math-worker-model-status.json"
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
-PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
+PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 REQUIRED_TASK_FIELDS = (
     "task_id",
     "objective",
@@ -1592,6 +1631,12 @@ def main() -> int:
         default=None,
         help="Attempt-local model circuit-breaker snapshot (broker-managed execution only).",
     )
+    parser.add_argument(
+        "--route-config",
+        type=Path,
+        default=None,
+        help="Controller-owned provider/model route configuration.",
+    )
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("timeout must be a positive integer")
@@ -1602,6 +1647,10 @@ def main() -> int:
     try:
         receipt = create_broker_receipt(args)
         model_status_path = broker_model_status_path(args)
+        primary_route, fallback_route_config = load_worker_routes(
+            args.route_config, broker_managed=bool(args.broker_managed),
+        )
+        fixed_routes = (primary_route, fallback_route_config)
         packet_path = args.task_packet.resolve()
         raw_packet = read_json(packet_path)
         task_schema = read_json(TASK_SCHEMA_SOURCE)
@@ -1649,7 +1698,7 @@ def main() -> int:
         }
         if forbidden_overrides:
             raise ContractError(
-                "worker routes are fixed to Spark/high/null then Luna/medium/null; "
+                "worker routes are controller-configured and environment overrides are forbidden; "
                 f"environment overrides are forbidden: {sorted(forbidden_overrides)}"
             )
 
@@ -1661,7 +1710,7 @@ def main() -> int:
         selected_route: dict[str, Any] | None = None
         failure: dict[str, Any] | None = None
 
-        for route_index, route in enumerate(FIXED_WORKER_ROUTES):
+        for route_index, route in enumerate(fixed_routes):
             model = str(route["model"])
             reasoning_effort = str(route["reasoning_effort"])
             service_tier = route["service_tier"]
@@ -1689,8 +1738,10 @@ def main() -> int:
                 })
                 if route_index == 0:
                     fallback = {
-                        "from_model": DEFAULT_WORKER_MODEL,
-                        "to_model": FALLBACK_WORKER_MODEL,
+                        "from_provider": primary_route["provider"],
+                        "from_model": primary_route["model"],
+                        "to_provider": fallback_route_config["provider"],
+                        "to_model": fallback_route_config["model"],
                         "reason": "primary exact configuration cached as permanently unavailable",
                         "primary_actual_attempted": False,
                     }
@@ -1699,7 +1750,7 @@ def main() -> int:
                     "kind": "model_unavailable",
                     "retryable": False,
                     "message": (
-                        "fallback Luna configuration is cached as permanently unavailable; "
+                        "fallback configuration is cached as permanently unavailable; "
                         "no other model is permitted"
                     ),
                 }
@@ -1727,8 +1778,8 @@ def main() -> int:
                 artifacts=preserved,
                 toolchain=[
                     f"Codex CLI {codex_version}",
-                    f"primary={DEFAULT_WORKER_MODEL}/{DEFAULT_WORKER_REASONING_EFFORT}/null",
-                    f"fallback={FALLBACK_WORKER_MODEL}/{FALLBACK_WORKER_REASONING_EFFORT}/null",
+                    f"primary={primary_route['model']}/{primary_route['reasoning_effort']}/null",
+                    f"fallback={fallback_route_config['model']}/{fallback_route_config['reasoning_effort']}/null",
                 ],
             )
             write_json(run_dir / "result.json", result)
@@ -1737,7 +1788,10 @@ def main() -> int:
                 "codex_executable": codex.name,
                 "codex_version": codex_version,
                 "broker_managed": bool(args.broker_managed),
-                "fixed_routes": list(FIXED_WORKER_ROUTES),
+                "fixed_routes": list(fixed_routes),
+                "requested_provider": primary_route["provider"],
+                "selected_provider": None,
+                "selected_provider_profile": None,
                 "selected_model": None,
                 "selected_reasoning_effort": None,
                 "selected_service_tier": None,
@@ -1757,6 +1811,8 @@ def main() -> int:
 
         model = str(selected_route["model"])
         reasoning_effort = str(selected_route["reasoning_effort"])
+        provider = str(selected_route["provider"])
+        provider_profile = selected_route.get("profile")
         service_tier = None
 
         last_message = run_dir / "result.raw.json"
@@ -1850,10 +1906,12 @@ def main() -> int:
                         run_dir=run_dir,
                         path=model_status_path,
                     )
-                    if model == DEFAULT_WORKER_MODEL:
+                    if model == str(primary_route["model"]):
                         fallback = {
-                            "from_model": DEFAULT_WORKER_MODEL,
-                            "to_model": FALLBACK_WORKER_MODEL,
+                            "from_provider": primary_route["provider"],
+                            "from_model": primary_route["model"],
+                            "to_provider": fallback_route_config["provider"],
+                            "to_model": fallback_route_config["model"],
                             "reason": (
                                 "primary worker execution returned permanent unavailable/access denied; "
                                 "controller must continue once with cached-primary Luna fallback"
@@ -1912,7 +1970,10 @@ def main() -> int:
                 "codex_executable": codex.name,
                 "codex_version": codex_version,
                 "broker_managed": bool(args.broker_managed),
-                "fixed_routes": list(FIXED_WORKER_ROUTES),
+                "fixed_routes": list(fixed_routes),
+                "requested_provider": provider,
+                "selected_provider": provider,
+                "selected_provider_profile": provider_profile,
                 **requested_configuration(
                     model=model,
                     reasoning_effort=reasoning_effort,

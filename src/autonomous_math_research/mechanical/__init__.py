@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
+from importlib.metadata import entry_points
 import json
 import os
 from pathlib import Path
@@ -82,7 +83,7 @@ FALLBACK_MECHANICAL_ROUTE = {
     "service_tier": None,
 }
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
-_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
+_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 _FORBIDDEN_TOOL_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:codex|subagents?|agents?|workers?|web(?:_search)?|"
     r"network|browsers?|plugins?|apps?|memory|multi[-_ ]?agent)(?![A-Za-z0-9])",
@@ -288,7 +289,11 @@ def validate_mechanical_request(
     return {**value, "task_packet": packet}
 
 
-def validate_mechanical_response(value: Any) -> dict[str, Any]:
+def validate_mechanical_response(
+    value: Any,
+    *,
+    allowed_routes: set[tuple[str | None, str | None, None]] | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != MECHANICAL_RESPONSE_FIELDS:
         raise MechanicalTaskRejected("mechanical response fields are invalid")
     if value["schema_version"] != MECHANICAL_SCHEMA_VERSION:
@@ -296,7 +301,7 @@ def validate_mechanical_response(value: Any) -> dict[str, Any]:
     if value["service_tier"] is not None:
         raise MechanicalTaskRejected("mechanical response reported a forbidden service tier")
     route = (value["model"], value["reasoning_effort"], value["service_tier"])
-    allowed = {
+    allowed = allowed_routes or {
         tuple(PRIMARY_MECHANICAL_ROUTE.values()),
         tuple(FALLBACK_MECHANICAL_ROUTE.values()),
         (None, None, None),
@@ -323,12 +328,16 @@ class MechanicalExecution:
     result: dict[str, Any]
     model: str | None
     reasoning_effort: str | None
+    provider: str | None = None
+    provider_profile: str | None = None
     service_tier: None = None
     actual_model: str | None = None
     actual_reasoning_effort: str | None = None
     model_route_attestation: str = "unobservable"
     token_usage: TokenUsage = field(default_factory=TokenUsage)
     token_telemetry: str = "unknown"
+    cost_usd: float | None = None
+    cost_telemetry: str = "unknown"
     artifacts: list[str] = field(default_factory=list)
     runner_directory: str | None = None
     fallback: dict[str, Any] | None = None
@@ -342,6 +351,63 @@ class MechanicalRunner(Protocol):
     async def run(
         self, *, packet_path: Path, output_root: Path, timeout_seconds: int,
     ) -> MechanicalExecution: ...
+
+
+def installed_mechanical_runner_adapters() -> set[str]:
+    """Return provider adapter ids with a controller-managed one-shot runner."""
+    return {
+        "codex_app_server",
+        *(item.name for item in entry_points(
+            group="autonomous_math_research.mechanical_runners"
+        )),
+    }
+
+
+def build_mechanical_runner(
+    config: Any,
+    repository_root: Path,
+    *,
+    primary_route: dict[str, Any],
+    fallback_route: dict[str, Any],
+) -> MechanicalRunner:
+    """Build the pinned runner only after capability/configuration preflight."""
+    route_adapters = {
+        str(config.raw["providers"][str(route["provider"])]["adapter"])
+        for route in (primary_route, fallback_route)
+    }
+    if route_adapters == {"codex_app_server"}:
+        return SubprocessMechanicalRunner(
+            repository_root,
+            primary_route=primary_route,
+            fallback_route=fallback_route,
+        )
+    if len(route_adapters) != 1:
+        raise ValueError(
+            "mechanical primary/fallback routes must share one installed runner adapter"
+        )
+    adapter = next(iter(route_adapters))
+    factories = {
+        item.name: item.load()
+        for item in entry_points(
+            group="autonomous_math_research.mechanical_runners"
+        )
+    }
+    factory = factories.get(adapter)
+    if factory is None:
+        raise ValueError(
+            f"mechanical runner adapter {adapter!r} is not installed"
+        )
+    runner = factory(
+        config=config,
+        repository_root=repository_root.resolve(),
+        primary_route=dict(primary_route),
+        fallback_route=dict(fallback_route),
+    )
+    if not callable(getattr(runner, "run", None)):
+        raise TypeError(
+            f"mechanical runner adapter {adapter!r} did not return a runner"
+        )
+    return runner
 
 
 def _merge_usage(target: TokenUsage, raw: Any) -> bool:
@@ -403,8 +469,26 @@ def _runner_usage(metadata: dict[str, Any]) -> tuple[TokenUsage, str]:
 class SubprocessMechanicalRunner:
     """Controller-only launcher for the pinned one-shot skill runner."""
 
-    def __init__(self, repository_root: Path):
+    def __init__(
+        self,
+        repository_root: Path,
+        *,
+        primary_route: dict[str, Any] | None = None,
+        fallback_route: dict[str, Any] | None = None,
+    ):
         self.repository_root = repository_root.resolve()
+        self.primary_route = dict(primary_route or {
+            "provider": "codex",
+            **PRIMARY_MECHANICAL_ROUTE,
+            "profile": None,
+            "endpoint": None,
+        })
+        self.fallback_route = dict(fallback_route or {
+            "provider": "codex",
+            **FALLBACK_MECHANICAL_ROUTE,
+            "profile": None,
+            "endpoint": None,
+        })
         package_root = Path(__file__).resolve().parent
         policy_root = (
             package_root / "resources" / "policy_packs" / "math-research"
@@ -424,9 +508,8 @@ class SubprocessMechanicalRunner:
         self._unavailable_records: dict[tuple[str, str | None, None], dict[str, Any]] = {}
         self._load_read_only_status_seed()
 
-    @staticmethod
     def _route_key(
-        model: Any, reasoning_effort: Any, service_tier: Any,
+        self, model: Any, reasoning_effort: Any, service_tier: Any,
     ) -> tuple[str, str | None, None] | None:
         if service_tier is not None or not isinstance(model, str):
             return None
@@ -434,13 +517,13 @@ class SubprocessMechanicalRunner:
         key = (model, effort, None)
         permitted = {
             (
-                str(PRIMARY_MECHANICAL_ROUTE["model"]),
-                str(PRIMARY_MECHANICAL_ROUTE["reasoning_effort"]),
+                str(self.primary_route["model"]),
+                str(self.primary_route["reasoning_effort"]),
                 None,
             ),
             (
-                str(FALLBACK_MECHANICAL_ROUTE["model"]),
-                str(FALLBACK_MECHANICAL_ROUTE["reasoning_effort"]),
+                str(self.fallback_route["model"]),
+                str(self.fallback_route["reasoning_effort"]),
                 None,
             ),
         }
@@ -647,6 +730,19 @@ class SubprocessMechanicalRunner:
         self.result_schema = snapshot(worker_manifest["result_schema"])
         self.schema_validator = snapshot(worker_manifest["schema_validator"])
         self.contract_definitions = snapshot(worker_manifest["contract_definitions"])
+        for attribute, name in (
+            ("primary_route", "primary_route"),
+            ("fallback_route", "fallback_route"),
+        ):
+            route = worker_manifest[name]
+            setattr(self, attribute, {
+                "provider": route["provider"],
+                "model": route["model"],
+                "reasoning_effort": route["effort"],
+                "service_tier": None,
+                "profile": route.get("profile"),
+                "endpoint": route.get("endpoint"),
+            })
         self.expected_hashes = {
             self.script.resolve(): str(worker_manifest["runner"]["sha256"]),
             self.task_schema.resolve(): str(worker_manifest["task_schema"]["sha256"]),
@@ -779,6 +875,8 @@ class SubprocessMechanicalRunner:
         effort = metadata.get("selected_reasoning_effort") or metadata.get(
             "requested_reasoning_effort"
         )
+        provider = metadata.get("selected_provider") or metadata.get("requested_provider")
+        provider_profile = metadata.get("selected_provider_profile")
         actual_model = metadata.get("actual_model")
         actual_effort = metadata.get("actual_reasoning_effort")
         model_attestation = str(
@@ -788,6 +886,14 @@ class SubprocessMechanicalRunner:
             "selected_service_tier", metadata.get("requested_service_tier")
         )
         observed_tier = metadata.get("observed_service_tier")
+        raw_cost = metadata.get("cost_usd")
+        cost_usd = (
+            float(raw_cost)
+            if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool)
+            and raw_cost >= 0
+            else None
+        )
+        cost_telemetry = "observed" if cost_usd is not None else "unknown"
         observed_tier_violation = (
             observed_tier is not None
             and observed_tier != ""
@@ -854,11 +960,15 @@ class SubprocessMechanicalRunner:
             result=result if isinstance(result, dict) else {},
             model=str(model) if model else None,
             reasoning_effort=str(effort) if effort else None,
+            provider=str(provider) if provider else None,
+            provider_profile=(str(provider_profile) if provider_profile else None),
             actual_model=(str(actual_model) if actual_model else None),
             actual_reasoning_effort=(str(actual_effort) if actual_effort else None),
             model_route_attestation=model_attestation,
             token_usage=usage,
             token_telemetry=telemetry,
+            cost_usd=cost_usd,
+            cost_telemetry=cost_telemetry,
             artifacts=artifacts,
             runner_directory=str(run_dir),
             fallback=(
@@ -1061,6 +1171,27 @@ class SubprocessMechanicalRunner:
             "--timeout", str(int(timeout_seconds)),
             "--broker-managed",
         ]
+        route_config_path = (
+            output_root.parent / "route-configs" / f"{packet_path.stem}.json"
+        )
+        atomic_write_json(route_config_path, {
+            "schema_version": 1,
+            "primary_route": {
+                "provider": self.primary_route.get("provider"),
+                "model": self.primary_route["model"],
+                "reasoning_effort": self.primary_route["reasoning_effort"],
+                "service_tier": None,
+                "profile": self.primary_route.get("profile"),
+            },
+            "fallback_route": {
+                "provider": self.fallback_route.get("provider"),
+                "model": self.fallback_route["model"],
+                "reasoning_effort": self.fallback_route["reasoning_effort"],
+                "service_tier": None,
+                "profile": self.fallback_route.get("profile"),
+            },
+        })
+        command.extend(["--route-config", str(route_config_path)])
         receipt_path = self.receipt_path(packet_path, output_root)
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
         command.extend(["--broker-receipt", str(receipt_path)])

@@ -12,5 +12,8 @@
     "research": ["claims/CLAIMS.md", "state/PROGRESS.md"],
     "audit": ["claims/CLAIMS.md", "state/PROGRESS.md"]
   },
-  "protected_paths": ["claims", "proofs", "state", "artifacts", "experiments"]
+  "protected_paths": [
+    "claims", "proofs", "state", "artifacts", "experiments",
+    "certificates", "audit"
+  ]
 }

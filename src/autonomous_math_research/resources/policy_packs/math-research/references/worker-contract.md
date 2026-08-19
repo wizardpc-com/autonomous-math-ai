@@ -85,16 +85,31 @@ For `BLOCKED`, preserve all evidence obtained and set `blocked_on` to the smalle
 
 ## Broker and stop boundary
 
-Director, prover, falsifier, explorer, auditor, and evaluator_auditor may request this packet. They cannot launch the worker: the controller broker validates eligibility, binds `parent_job_id/subtask_id`, assigns an isolated directory, applies its independent concurrency cap and the global token governor, and records REQUESTED/STARTED/FALLBACK/COMPLETED/FAILED. Success, falsification, scope exhaustion, formal success, blockage, tool error, timeout, or the packet stop condition ends the worker process. Observations return to the parent role; they never trigger automatic follow-up work or trust changes.
+Director, prover, falsifier, explorer, auditor, and evaluator_auditor may request this packet. They cannot launch the worker: the controller broker validates eligibility, binds `parent_job_id/subtask_id`, assigns an isolated directory, applies the configured static cap (or resource-derived cap when unbounded), separate token/cost governor, queue and rate backpressure, and records REQUESTED/STARTED/FALLBACK/COMPLETED/FAILED. Success, falsification, scope exhaustion, formal success, blockage, tool error, timeout, or the packet stop condition ends the worker process. Observations return to the parent role; they never trigger automatic follow-up work or trust changes.
 
 The runner checks each observed command executable and every returned replay command against `allowed_tools`; parent-directory/repository-scope escapes and authentication/environment inspection fail non-retryably. Input copying also rejects VCS metadata and secret-bearing paths such as `.git/`, `.codex/`, `.ssh/`, `.env*`, credential files, and private keys. Copied inputs plus runner-owned task/schema/prompt files are hashed before the turn and must remain byte-identical afterward. Writes stay inside the isolated worker run directory.
 
-## Fixed routes and model-unavailable circuit breaker
+## Configured routes and model-unavailable circuit breaker
 
-The primary route is exactly `gpt-5.3-codex-spark` / `high` / `service_tier=null`. The only fallback is exactly `gpt-5.6-luna` / `medium` / `service_tier=null`, and it is allowed only after the primary exact configuration receives an explicit permanent unavailable/access-denied result. The command explicitly writes `service_tier=null`; it never inherits fast/priority. Model/effort/tier environment overrides are rejected. The child uses `approval_policy=never`, disables network access, memories, plugins, apps, multi-agent tools, and web search. The Codex process retains `CODEX_HOME` only to reuse the existing login, while a native permission profile denies model-started commands access to the filesystem root, grants only minimal runtime reads and the isolated workspace, and disables network. The command also uses `--strict-config`, so unsupported permission or isolation keys fail before a turn rather than silently weakening the boundary. `shell_environment_policy` removes `CODEX_HOME`, home/profile locators, API keys, tokens, passwords, credential helpers, and similar secret-bearing variables from model-started commands.
+The built-in default primary route is `gpt-5.3-codex-spark` / `high` /
+`service_tier=null`; the default fallback is `gpt-5.6-luna` / `medium` / null.
+The controller pins configurable provider/model/effort routes into the run-local
+policy bundle. Fallback remains allowed only after the exact primary
+configuration receives an explicit permanent unavailable/access-denied result.
+Environment route overrides are rejected. The child uses `approval_policy=never`, disables network access, memories, plugins, apps, multi-agent tools, and web search. The Codex process retains `CODEX_HOME` only to reuse the existing login, while a native permission profile denies model-started commands access to the filesystem root, grants only minimal runtime reads and the isolated workspace, and disables network. The command also uses `--strict-config`, so unsupported permission or isolation keys fail before a turn rather than silently weakening the boundary. `shell_environment_policy` removes `CODEX_HOME`, home/profile locators, API keys, tokens, passwords, credential helpers, and similar secret-bearing variables from model-started commands.
 
-Persist the exact Spark configuration as unavailable only after that explicit permanent rejection. A local parse/startup error, timeout, rate limit, network failure, or ambiguous App Server/transport failure is not evidence that the model is unavailable: it receives only the configured finite same-route retry budget. The first actual Spark execution is also its availability check; no extra paid probe turn exists. Once Spark is cached unavailable, later tasks skip Spark and go directly to Luna. Luna has no fallback. Never rotate to Sol, Terra, the parent/controller model, or a third route. `--retry-unavailable-route` remains an explicit operator override and is never passed by the autonomous broker.
+Persist the exact primary configuration as unavailable only after that explicit
+permanent rejection. A local parse/startup error, timeout, rate limit, network
+failure, or ambiguous transport failure is not evidence that the model is
+unavailable: it receives only the configured finite same-route retry budget.
+The first actual primary execution is also its availability check; no extra paid
+probe turn exists. Once primary is cached unavailable, later tasks use only the
+pinned fallback, which has no further fallback. Never rotate beyond the two
+pinned routes or to the parent/controller route. `--retry-unavailable-route`
+remains an explicit operator override and is never passed by the autonomous broker.
 
 In broker-managed mode, model availability state is seeded from controller-owned append-only events into an attempt-local file beneath the parent job; the worker never writes the repository-global status cache. The deterministic controller alone may atomically persist an exact permanent route rejection in the cross-run circuit breaker. Each attempt atomically maintains a controller receipt containing the exact packet hash, PID, output root, run directory and heartbeat. Crash recovery may reattach only to that matching lease. A retry is allowed only after an exited receipt or a safely dead PID; a missing, stale-but-live, or PID-ambiguous lease fails non-retryably instead of launching a duplicate or terminating an uncertain process. The runner, task/result schemas, queue-only broker client, compatibility validator and contract constants are all executed from one run-local pinned policy bundle.
 
-Spark/Luna output is mechanical execution evidence. The strong parent research role interprets it; the strong parent Auditor alone decides PASS/REJECT/UNRESOLVED. Candidate, independent-audit, and canonical gates remain unchanged.
+Mechanical-route output is execution evidence. The strong parent research role
+interprets it; the strong parent Auditor alone decides PASS/REJECT/UNRESOLVED.
+Candidate, independent-audit, and canonical gates remain unchanged.

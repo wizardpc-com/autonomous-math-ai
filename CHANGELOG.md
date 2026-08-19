@@ -6,9 +6,37 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Configuration schema v8, built-in Codex default profile, explicit user
+  profiles, migrations, and redacted `amr config validate/explain`.
+- Provider capability declarations, per-role provider/model routes, an optional
+  OpenAI-compatible adapter, and third-party adapter entry points.
+- `amr init --project-id/--final-claim-id`, a complete neutral scaffold,
+  initialization checklist, and zero-model `amr validate --strict`.
+- Separate main/mechanical token and cost governors, unbounded static mechanical
+  scheduling with resource/queue/rate backpressure, and provider/cost telemetry.
+- Repository-local Codex discovery entry for the bundled `math-research`
+  policy pack.
+- `amr detect-tools --project-root` for writing a tool inventory into the
+  selected research project rather than the harness checkout.
+- Conjecture-neutral catalog, evidence, lifecycle, policy, and mechanical
+  worker regression suites migrated from the former monorepo integration.
+
+### Changed
+
+- Codex App Server remains the default provider; API transports are opt-in.
+- New-project token defaults are 500 million for main roles and 1.5 billion for
+  mechanical workers; existing schema-v7 configs retain their pinned limits.
+- Mechanical delegation is preferred for finite, mechanically checkable work
+  while remaining one-shot, nonrecursive, and outside canonical trust.
+- The harness now lives in its own source checkout and research repositories
+  integrate exclusively through the installed `amr` CLI and project manifest.
+
 ### Planned
 
-- Broader backend adapters and additional deterministic verifier integrations.
+- Additional deterministic verifier integrations and third-party mechanical
+  runner adapters.
 
 ## [0.2.0] - 2026-08-19
 

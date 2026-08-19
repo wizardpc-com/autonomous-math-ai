@@ -133,8 +133,15 @@ class CodexBackend(Protocol):
 
 
 class AppServerBackend:
-    def __init__(self, config: HarnessConfig, trace_notification: Callable[[dict[str, Any]], Any] | None = None):
+    def __init__(
+        self,
+        config: HarnessConfig,
+        trace_notification: Callable[[dict[str, Any]], Any] | None = None,
+        *,
+        provider_name: str = "codex",
+    ):
         self.config = config
+        self.provider_name = provider_name
         self.client = AppServerClient(notification_handler=trace_notification)
         self.active: dict[str, tuple[str, str]] = {}
 
@@ -145,7 +152,8 @@ class AppServerBackend:
         del enabled
 
     def _model_for(self, role: str) -> tuple[str, str]:
-        return self.config.model_for(role)
+        route = self.config.route_for(role)
+        return str(route["model"]), str(route["mapped_effort"])
 
     async def start(self) -> None:
         await self.client.start()
@@ -168,6 +176,11 @@ class AppServerBackend:
         skill_path: Path | None = None,
     ) -> JobOutcome:
         del candidate_sink  # Real workers submit early candidates through the filesystem helper.
+        route_config = self.config.route_for(task.role)
+        if route_config["provider"] != self.provider_name:
+            raise ValueError(
+                f"AppServerBackend cannot execute provider route {route_config['provider']!r}"
+            )
         model, effort = self._model_for(task.role)
         developer = (
             "You are one bounded autonomous math-research role. Do not spawn research, strategy, "
@@ -227,14 +240,15 @@ class AppServerBackend:
                 )
             parsed = parse_structured_message(raw_output)
             validate(parsed, output_schema)
-            if task.role in {"prover", "falsifier", "explorer"} and parsed.get("claim_id") != task.target_claim:
-                raise ValueError("worker result claim_id does not match assigned target_claim")
             return JobOutcome(
                 job_id=job_id, task_id=task.task_id, role=task.role, claim_id=task.target_claim,
                 status=str(turn.get("status", "completed")), result=parsed,
                 thread_id=thread_id, turn_id=turn_id, model=model, reasoning_effort=effort,
+                provider=self.provider_name,
+                provider_profile=route_config.get("profile"),
                 requested_service_tier=None, observed_service_tier=observed_tier,
                 token_usage=usage, token_telemetry=token_telemetry,
+                cost_usd=None, cost_telemetry="unknown",
                 artifact_paths=list(parsed.get("artifact_paths", [])),
             )
         except Exception as exc:
@@ -264,8 +278,11 @@ class AppServerBackend:
                 job_id=job_id, task_id=task.task_id, role=task.role, claim_id=task.target_claim,
                 status="ERROR", result={}, thread_id=thread_id, turn_id=turn_id,
                 model=model, reasoning_effort=effort,
+                provider=self.provider_name,
+                provider_profile=route_config.get("profile"),
                 requested_service_tier=None, observed_service_tier=observed_tier,
                 token_usage=usage, token_telemetry=token_telemetry,
+                cost_usd=None, cost_telemetry="unknown",
                 error=str(redact_auth_material(str(exc))),
                 failure_kind=failure_kind, retryable=retryable, server_error=server_error,
                 terminal_event=terminal_event, raw_output=raw_output or None,
@@ -352,7 +369,9 @@ class MockCodexBackend:
                 status=script.get("status", "completed"), result=result,
                 thread_id=thread_id, turn_id=turn_id,
                 model="mock-no-fast", reasoning_effort="mock", token_usage=usage,
+                provider="mock", provider_profile=None,
                 token_telemetry="synthetic",
+                cost_usd=0.0, cost_telemetry="synthetic",
                 artifact_paths=list(result.get("artifact_paths", [])),
             )
         except Exception as exc:
@@ -376,7 +395,9 @@ class MockCodexBackend:
                 task_id=task.task_id, role=task.role, claim_id=task.target_claim,
                 status="ERROR", result={}, thread_id=thread_id, turn_id=turn_id,
                 model="mock-no-fast", reasoning_effort="mock", token_usage=usage,
+                provider="mock", provider_profile=None,
                 token_telemetry=token_telemetry,
+                cost_usd=0.0, cost_telemetry="synthetic",
                 error=str(redact_auth_material(str(exc))),
                 failure_kind=failure_kind, retryable=retryable, server_error=server_error,
                 terminal_event=(

@@ -13,7 +13,7 @@ from .models import stable_hash
 from .storage import atomic_write_json, file_digest
 
 
-POLICY_SCHEMA_VERSION = 4
+POLICY_SCHEMA_VERSION = 5
 STABLE_CORE = "persistent_filesystem_controller"
 POLICY_NAME = "math-research"
 POLICY_ROLES = {
@@ -121,7 +121,7 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
         "role_references", "one_shot_compute_worker", "manifest_sha256",
     }
     if not isinstance(value, dict) or set(value) != keys:
-        raise ValueError("pinned policy manifest fields must be exactly the v4 contract")
+        raise ValueError("pinned policy manifest fields must exactly match the current contract")
     if value["schema_version"] != POLICY_SCHEMA_VERSION:
         raise ValueError("unsupported pinned policy schema_version")
     if value["policy_name"] != POLICY_NAME:
@@ -152,20 +152,25 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
     worker_keys = {
         "enabled", "boundary", "primary_route", "fallback_route",
         "fallback_condition", "recursive_spawn_allowed", "transient_max_retries",
-        "model_protocol_max_retries", *WORKER_RESOURCES,
+        "model_protocol_max_retries", "selection_policy", "backpressure",
+        "estimated_tokens", "estimated_cost_usd", *WORKER_RESOURCES,
     }
     if not isinstance(worker, dict) or set(worker) != worker_keys:
         raise ValueError("pinned mechanical worker policy fields are invalid")
-    if worker["enabled"] is not True or worker["boundary"] != WORKER_BOUNDARY:
-        raise ValueError("pinned mechanical worker is disabled or outside its boundary")
-    if worker["primary_route"] != {
-        "model": "gpt-5.3-codex-spark", "effort": "high", "service_tier": None,
-    }:
-        raise ValueError("pinned mechanical primary route must be Spark/high/null")
-    if worker["fallback_route"] != {
-        "model": "gpt-5.6-luna", "effort": "medium", "service_tier": None,
-    }:
-        raise ValueError("pinned mechanical fallback route must be Luna/medium/null")
+    if type(worker["enabled"]) is not bool or worker["boundary"] != WORKER_BOUNDARY:
+        raise ValueError("pinned mechanical worker enabled/boundary fields are invalid")
+    route_keys = {
+        "provider", "model", "endpoint", "profile", "effort",
+        "unsupported_effort", "service_tier",
+    }
+    for route_name in ("primary_route", "fallback_route"):
+        route = worker[route_name]
+        if not isinstance(route, dict) or set(route) != route_keys:
+            raise ValueError(f"pinned mechanical {route_name} fields are invalid")
+        if not route["provider"] or not route["model"] or not route["effort"]:
+            raise ValueError(f"pinned mechanical {route_name} is incomplete")
+        if route["service_tier"] is not None:
+            raise ValueError(f"pinned mechanical {route_name} has a forbidden service tier")
     if worker["fallback_condition"] != "permanent_unavailable_or_access_denied":
         raise ValueError("pinned mechanical fallback condition is invalid")
     if worker["recursive_spawn_allowed"] is not False:
@@ -173,6 +178,21 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
     for key in ("transient_max_retries", "model_protocol_max_retries"):
         if type(worker[key]) is not int or worker[key] < 0:
             raise ValueError(f"pinned mechanical {key} is invalid")
+    if (
+        not isinstance(worker["selection_policy"], dict)
+        or set(worker["selection_policy"]) != {"mode", "custom_thresholds"}
+    ):
+        raise ValueError("pinned mechanical selection policy is invalid")
+    if not isinstance(worker["backpressure"], dict):
+        raise ValueError("pinned mechanical backpressure is invalid")
+    if type(worker["estimated_tokens"]) is not int or worker["estimated_tokens"] <= 0:
+        raise ValueError("pinned mechanical estimated_tokens is invalid")
+    if worker["estimated_cost_usd"] is not None and (
+        not isinstance(worker["estimated_cost_usd"], (int, float))
+        or isinstance(worker["estimated_cost_usd"], bool)
+        or worker["estimated_cost_usd"] <= 0
+    ):
+        raise ValueError("pinned mechanical estimated_cost_usd is invalid")
     for key in WORKER_RESOURCES:
         validated = _validate_entry(worker[key], f"pinned mechanical {key}")
         if validated["uri"] != _uri(WORKER_RESOURCES[key]):
@@ -208,6 +228,10 @@ def build_policy_manifest(config: HarnessConfig) -> dict[str, Any]:
             "recursive_spawn_allowed": worker["recursive_spawn_allowed"],
             "transient_max_retries": int(worker["transient_max_retries"]),
             "model_protocol_max_retries": int(worker["model_protocol_max_retries"]),
+            "selection_policy": worker["selection_policy"],
+            "backpressure": worker["backpressure"],
+            "estimated_tokens": int(worker["estimated_tokens"]),
+            "estimated_cost_usd": worker.get("estimated_cost_usd"),
             **{key: _entry(relative) for key, relative in WORKER_RESOURCES.items()},
         },
     }

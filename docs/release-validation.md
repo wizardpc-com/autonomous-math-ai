@@ -11,7 +11,20 @@ python -m unittest discover -s tests -p "test_*.py" -q
 
 The suite covers arbitrary target roots, manifest-owned identity, nondefault
 runtime roots, package resource lookup, immutable campaign input, monotone
-lifecycle, generic mock execution, and conjecture-neutral release scanning.
+lifecycle, generic mock execution, provider/capability normalization, effort
+mapping failures, secret redaction, strict initialization, unbounded mechanical
+backpressure, recursion prohibition, and conjecture-neutral release scanning.
+
+Also exercise the zero-model CLI surface:
+
+```console
+amr config validate --project <temporary-target>
+amr config explain --project <temporary-target>
+amr validate --project <temporary-target> --strict
+```
+
+The freshly initialized target is expected to fail the last command until its
+explicit `AMR_PLACEHOLDER` mathematical content is replaced.
 
 ## Build
 

@@ -16,6 +16,7 @@ from .app_server import (
     attest_model_route, attest_no_service_tier, parse_structured_message,
 )
 from .audit_gate import AuditGate
+from .backend import CodexBackend
 from .capabilities import inspect_generated_schema
 from .claim_graph import ClaimGraph
 from .config import HarnessConfig
@@ -24,10 +25,11 @@ from .contracts import (
     render_contract_keys,
 )
 from .models import (
-    AuditResult, CandidateEvent, Claim, EvidenceLevel, MathStatus, TokenUsage,
+    AuditResult, CandidateEvent, Claim, EvidenceLevel, MathStatus, ResearchTask, TokenUsage,
     TrustStatus, utc_now,
 )
 from .policy import pin_policy_manifest, policy_view_for_role
+from .provider_backend import ProviderRouterBackend
 from .reporting import write_report
 from .representation import RepresentationContract
 from .resources import schema_resource
@@ -64,6 +66,13 @@ class SmokeBudgetExhausted(RuntimeError):
     pass
 
 
+class SmokeProviderJobError(RuntimeError):
+    def __init__(self, *, failure_kind: str, retryable: bool, message: str):
+        self.failure_kind = failure_kind
+        self.retryable = retryable
+        super().__init__(message)
+
+
 def _redact_text(value: str) -> str:
     result = value
     for pattern in _SECRET_PATTERNS:
@@ -96,6 +105,8 @@ def _server_error(exc: Exception) -> dict[str, Any] | None:
 
 
 def _failure_kind(exc: Exception) -> tuple[str, bool]:
+    if isinstance(exc, SmokeProviderJobError):
+        return exc.failure_kind, exc.retryable
     if isinstance(exc, SmokeBudgetExhausted):
         return "budget_exhausted", False
     if isinstance(exc, OutputSchemaCompatibilityError):
@@ -201,7 +212,7 @@ async def run_real_smoke(
     schema_role: str | None = None,
     client_factory: Callable[..., AppServerClient] = AppServerClient,
 ) -> Path:
-    """Run an isolated no-fast/no-priority App Server smoke and finalize evidence."""
+    """Run an isolated no-fast/no-priority provider smoke and finalize evidence."""
     if token_budget <= 0:
         raise ValueError("smoke token budget must be positive")
     if schema_role not in {None, *SCHEMA_ROLES}:
@@ -224,21 +235,30 @@ async def run_real_smoke(
     capability: dict[str, Any] = {}
     live: dict[str, Any] | None = None
     client: AppServerClient | None = None
+    provider_backend: CodexBackend | None = None
     failure: Exception | None = None
-    model, effort = config.model_for("smoke")
+    smoke_route = config.route_for("smoke")
+    smoke_provider = str(smoke_route["provider"])
+    smoke_provider_config = config.raw["providers"][smoke_provider]
+    smoke_adapter = str(smoke_provider_config["adapter"])
+    model = str(smoke_route["model"])
+    effort = str(smoke_route["mapped_effort"])
+    requested_tier = smoke_route.get("service_tier")
     stopped_reason = (
-        "minimal real App Server smoke completed"
+        "minimal real provider smoke completed"
         if schema_role is None
-        else f"real App Server {schema_role} output schema accepted"
+        else f"real provider {schema_role} output schema accepted"
     )
     mode_label = "full-lifecycle" if schema_role is None else f"schema-role:{schema_role}"
     store.append("RUN_STARTED", {
         "mode": "smoke", "execution_mode": "smoke", "smoke_scope": mode_label,
-        "global_token_budget": token_budget, "requested_service_tier": None,
+        "global_token_budget": token_budget, "requested_service_tier": requested_tier,
+        "provider": smoke_provider,
         "budget_semantics": SMOKE_BUDGET_SEMANTICS, "budget_hard_cap": False,
     })
     store.append("SMOKE_STARTED", {
-        "model": model, "effort": effort, "token_budget": token_budget,
+        "provider": smoke_provider, "model": model, "effort": effort,
+        "requested_service_tier": requested_tier, "token_budget": token_budget,
         "schema_role": schema_role, "budget_semantics": SMOKE_BUDGET_SEMANTICS,
         "budget_hard_cap": False,
     })
@@ -261,6 +281,71 @@ async def run_real_smoke(
         *,
         include_policy: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if smoke_adapter != "codex_app_server":
+            assert provider_backend is not None
+            workspace = run_dir / "jobs" / f"{role}-{uuid4().hex[:8]}"
+            workspace.mkdir(parents=True, exist_ok=True)
+            started_at = utc_now()
+            started_clock = time.monotonic()
+            job_id = f"smoke-{role}-{uuid4().hex[:8]}"
+            final_prompt = prompt
+            if include_policy:
+                assert policy_manifest is not None
+                role_policy = policy_view_for_role(
+                    policy_manifest, policy_path,
+                    "auditor" if role == "auditor" else "smoke",
+                )
+                final_prompt = f"{prompt}\n\nPINNED RESEARCH POLICY: {role_policy}."
+            store.append("JOB_STARTED", {
+                "job_id": job_id, "role": role, "schema_role": schema_role,
+                "provider": smoke_provider, "model": model,
+                "reasoning_effort": effort,
+                "requested_service_tier": requested_tier,
+            })
+            task = ResearchTask(
+                task_id=job_id,
+                role="smoke",
+                target_claim="TOY-SUM-ODD",
+                exact_objective=f"Complete the bounded {role} smoke task.",
+                why_now="provider and schema smoke",
+                dependencies=[], expected_information_gain="LOW",
+                mathematical_impact="LOW", estimated_cost_tier="LOW",
+                required_files=[], stop_conditions=["return one schema-valid result"],
+                output_contract=(
+                    "audit_result.schema.json" if role == "auditor"
+                    else "director_plan.schema.json" if role == "director"
+                    else "worker_result.schema.json"
+                ),
+            )
+            outcome = await provider_backend.run_job(
+                job_id=job_id, task=task, prompt=final_prompt,
+                output_schema=schema, workspace=workspace,
+                writable_roots=[workspace], timeout=config.role_timeout("smoke"),
+                token_budget=budget,
+                candidate_sink=lambda _event: asyncio.sleep(0),
+                skill_path=None,
+            )
+            record = outcome.to_dict()
+            record.update({
+                "role": role,
+                "useful": schema_role is None and outcome.succeeded,
+                "cwd": str(workspace), "start_time": started_at,
+                "end_time": utc_now(),
+                "workspace_metadata": {
+                    "kind": "smoke_isolated_output", "path": str(workspace),
+                },
+                "elapsed_seconds": max(0.0, time.monotonic() - started_clock),
+                "exit_reason": outcome.error or outcome.status,
+            })
+            jobs.append(record)
+            store.append("JOB_COMPLETED", record)
+            if not outcome.succeeded:
+                raise SmokeProviderJobError(
+                    failure_kind=str(outcome.failure_kind or "provider_job_failed"),
+                    retryable=bool(outcome.retryable),
+                    message=outcome.failure_message,
+                )
+            return dict(outcome.result), record
         assert client is not None
         workspace = run_dir / "jobs" / f"{role}-{uuid4().hex[:8]}"
         workspace.mkdir(parents=True, exist_ok=True)
@@ -274,7 +359,9 @@ async def run_real_smoke(
         token_telemetry = "unknown"
         store.append("JOB_STARTED", {
             "job_id": job_id, "role": role, "schema_role": schema_role,
-            "requested_service_tier": None,
+            "provider": smoke_provider, "model": model,
+            "reasoning_effort": effort,
+            "requested_service_tier": requested_tier,
         })
         try:
             started = await client.start_thread(
@@ -326,7 +413,9 @@ async def run_real_smoke(
             record = {
                 "job_id": job_id, "role": role, "thread_id": thread_id,
                 "turn_id": turn_id, "model": model, "reasoning_effort": effort,
-                "status": "completed", "requested_service_tier": None,
+                "provider": smoke_provider,
+                "provider_profile": smoke_route.get("profile"),
+                "status": "completed", "requested_service_tier": requested_tier,
                 "observed_service_tier": observed_tier,
                 "token_usage": usage.to_dict(), "token_telemetry": token_telemetry,
                 "result": parsed, "useful": schema_role is None,
@@ -354,7 +443,9 @@ async def run_real_smoke(
             record = {
                 "job_id": job_id, "role": role, "thread_id": thread_id,
                 "turn_id": turn_id, "model": model, "reasoning_effort": effort,
-                "status": "ERROR", "requested_service_tier": None,
+                "provider": smoke_provider,
+                "provider_profile": smoke_route.get("profile"),
+                "status": "ERROR", "requested_service_tier": requested_tier,
                 "observed_service_tier": observed_tier,
                 "token_usage": usage.to_dict(), "token_telemetry": token_telemetry,
                 "result": {}, "useful": False, "error": _redact_text(str(exc)),
@@ -411,7 +502,9 @@ async def run_real_smoke(
         }
         atomic_write_json(run_dir / "SMOKE_MANIFEST.json", {
             "run_id": run_id, "execution_mode": "smoke", "scope": mode_label,
-            "requested_service_tier": None, "model": model, "effort": effort,
+            "provider": smoke_provider,
+            "requested_service_tier": requested_tier,
+            "model": model, "effort": effort,
             "token_budget": token_budget, "dispatch_token_budget": token_budget,
             "budget_semantics": SMOKE_BUDGET_SEMANTICS, "budget_hard_cap": False,
             "schemas": schema_manifest,
@@ -420,11 +513,23 @@ async def run_real_smoke(
         store.append("SCHEMA_PREFLIGHT_PASSED", {
             "schemas": schema_manifest, "scope": mode_label,
         })
-        capability = inspect_generated_schema(work_root=run_dir / "schema-probe")
-        client = client_factory(notification_handler=trace)
-        await client.start()
-        live = await client.probe_capabilities(config.project_root)
-        capability["live_probe"] = live
+        if smoke_adapter == "codex_app_server":
+            capability = inspect_generated_schema(work_root=run_dir / "schema-probe")
+            client = client_factory(notification_handler=trace)
+            await client.start()
+            live = await client.probe_capabilities(config.project_root)
+            capability["live_probe"] = live
+        else:
+            provider_backend = ProviderRouterBackend(config, roles={"smoke"})
+            await provider_backend.start()
+            capability = {
+                "provider": smoke_provider,
+                "adapter": smoke_adapter,
+                "declared_capabilities": smoke_provider_config["capabilities"],
+                "live_probe": None,
+                "normalization": "provider adapter plus shared local schema gate",
+            }
+            live = capability
         atomic_write_json(run_dir / "app_server_capabilities.json", capability)
 
         if schema_role is not None:
@@ -568,6 +673,14 @@ async def run_real_smoke(
             store.append("SCHEMA_PREFLIGHT_FAILED", payload)
         store.append("SMOKE_FAILED", payload)
     finally:
+        if provider_backend is not None:
+            try:
+                await provider_backend.close()
+            except Exception as close_exc:
+                store.append("PROVIDER_CLOSE_FAILED", {
+                    "provider": smoke_provider,
+                    "error": _redact_text(str(close_exc)),
+                })
         if client is not None:
             try:
                 await client.close()

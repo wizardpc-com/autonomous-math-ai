@@ -64,12 +64,14 @@ def _mechanical_broker_block(command: str) -> str:
     return (
         "\n\nCONTROLLED ONE-SHOT MECHANICAL DELEGATION\n"
         f"delegate_mechanical_task_command={command}\n"
-        "You may use this controller-owned broker only for a simple, repetitive, bounded task "
+        "Prefer this controller-owned broker whenever finite enumeration, data normalization, "
+        "formula expansion, code preparation, deterministic reproduction, or artifact checking "
+        "can be stated as a finite mechanical packet. Use it only for a simple, bounded task "
         "with a fixed method and mechanically checkable acceptance. Write one schema-v1 task "
         "packet inside this job workspace, then replace PATH_TO_MECHANICAL_TASK_PACKET.json in "
         "the command with that path. Never call codex exec or another agent directly. Never "
         "delegate strategy, lemma/invariant choice, interpretation, prioritization, or any task "
-        "requiring mathematical judgment. The returned Spark/Luna result is mechanical evidence "
+        "requiring mathematical judgment. The returned configured-route result is mechanical evidence "
         "only; you remain responsible for interpretation and, for an Auditor, the final verdict. "
         "The delegated child is one-shot and cannot delegate further."
     )

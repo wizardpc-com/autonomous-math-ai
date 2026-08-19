@@ -3,7 +3,7 @@
   "claims": [
     {
       "claim_id": "C_ROOT",
-      "statement": "Replace this neutral example with the exact conjecture statement.",
+      "statement": "AMR_PLACEHOLDER: replace with the exact final claim statement.",
       "assumptions": [],
       "math_status": "OPEN",
       "trust_status": "CANONICAL_TRUSTED",
@@ -11,7 +11,7 @@
       "downstream_dependents": [],
       "evidence_paths": [],
       "known_counterexamples": [],
-      "current_gaps": ["Project has not yet supplied mathematical content."],
+      "current_gaps": ["AMR_PLACEHOLDER: mathematical content is not configured."],
       "active_tasks": [],
       "last_meaningful_progress": null,
       "priority": {"score": 1.0},

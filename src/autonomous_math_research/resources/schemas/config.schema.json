@@ -1,0 +1,375 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autonomous-math-ai.invalid/schemas/config-v8.json",
+  "title": "Autonomous Math AI effective configuration v8",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "profile", "project", "engine", "scheduler",
+    "budgets", "providers", "models", "audit", "stagnation",
+    "rate_limits", "observability", "timeouts", "workspace", "policy"
+  ],
+  "properties": {
+    "schema_version": {"const": 8},
+    "profile": {"type": "string", "minLength": 1},
+    "project": {"$ref": "#/$defs/project"},
+    "engine": {"$ref": "#/$defs/engine"},
+    "scheduler": {"$ref": "#/$defs/scheduler"},
+    "budgets": {"$ref": "#/$defs/budgets"},
+    "providers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/provider"}
+    },
+    "models": {"$ref": "#/$defs/models"},
+    "audit": {"$ref": "#/$defs/audit"},
+    "stagnation": {"$ref": "#/$defs/stagnation"},
+    "rate_limits": {"$ref": "#/$defs/rateLimits"},
+    "observability": {"$ref": "#/$defs/observability"},
+    "timeouts": {"$ref": "#/$defs/timeouts"},
+    "workspace": {"$ref": "#/$defs/workspace"},
+    "policy": {"$ref": "#/$defs/policy"}
+  },
+  "$defs": {
+    "positiveInteger": {"type": "integer", "minimum": 1},
+    "nonNegativeInteger": {"type": "integer", "minimum": 0},
+    "positiveNumber": {"type": "number", "exclusiveMinimum": 0},
+    "nullablePositiveInteger": {
+      "anyOf": [{"$ref": "#/$defs/positiveInteger"}, {"type": "null"}]
+    },
+    "nullablePositiveNumber": {
+      "anyOf": [{"$ref": "#/$defs/positiveNumber"}, {"type": "null"}]
+    },
+    "nullableString": {
+      "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+    },
+    "project": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "final_conjecture_claim_id"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "final_conjecture_claim_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "engine": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "poll_interval_seconds", "max_consecutive_controller_errors",
+        "error_rate_threshold", "error_rate_min_jobs", "max_retries",
+        "transient_protocol_max_retries", "model_protocol_max_retries",
+        "director_max_retries", "director_debounce_seconds"
+      ],
+      "properties": {
+        "poll_interval_seconds": {"$ref": "#/$defs/positiveNumber"},
+        "max_consecutive_controller_errors": {"$ref": "#/$defs/positiveInteger"},
+        "error_rate_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "error_rate_min_jobs": {"$ref": "#/$defs/positiveInteger"},
+        "max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
+        "transient_protocol_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
+        "model_protocol_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
+        "director_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
+        "director_debounce_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "scheduler": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "max_director", "max_research_workers", "max_audit",
+        "max_mechanical_subworkers", "independent_exploration_fraction"
+      ],
+      "properties": {
+        "max_director": {"const": 1},
+        "max_research_workers": {"$ref": "#/$defs/positiveInteger"},
+        "max_audit": {"$ref": "#/$defs/positiveInteger"},
+        "max_mechanical_subworkers": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "independent_exploration_fraction": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "integerBudgetMap": {
+      "type": "object", "additionalProperties": {"$ref": "#/$defs/positiveInteger"}
+    },
+    "costBudgetMap": {
+      "type": "object", "additionalProperties": {"$ref": "#/$defs/nullablePositiveNumber"}
+    },
+    "budgets": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "global_tokens", "mechanical_tokens", "global_cost_usd",
+        "mechanical_cost_usd", "soft_fraction", "hard_fraction",
+        "per_thread_limit_action", "per_thread_default", "per_thread",
+        "per_role", "per_role_cost_usd", "estimated_tokens"
+      ],
+      "properties": {
+        "global_tokens": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "mechanical_tokens": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "global_cost_usd": {"$ref": "#/$defs/nullablePositiveNumber"},
+        "mechanical_cost_usd": {"$ref": "#/$defs/nullablePositiveNumber"},
+        "soft_fraction": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+        "hard_fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "per_thread_limit_action": {"enum": ["observe", "interrupt"]},
+        "per_thread_default": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "per_thread": {"$ref": "#/$defs/integerBudgetMap"},
+        "per_role": {"$ref": "#/$defs/integerBudgetMap"},
+        "per_role_cost_usd": {"$ref": "#/$defs/costBudgetMap"},
+        "estimated_tokens": {"$ref": "#/$defs/integerBudgetMap"}
+      }
+    },
+    "credential": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "reference"],
+      "properties": {
+        "kind": {"enum": ["environment", "system_credential", "provider_profile", "none"]},
+        "reference": {"$ref": "#/$defs/nullableString"}
+      }
+    },
+    "reasoningCapability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["parameter", "supported_efforts", "mapping"],
+      "properties": {
+        "parameter": {"$ref": "#/$defs/nullableString"},
+        "supported_efforts": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/effort"}
+        },
+        "mapping": {
+          "type": "object", "additionalProperties": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "pathList": {
+      "type": "array", "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "usageMapping": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+        "output_tokens", "reasoning_output_tokens", "total_tokens"
+      ],
+      "properties": {
+        "input_tokens": {"$ref": "#/$defs/pathList"},
+        "cached_input_tokens": {"$ref": "#/$defs/pathList"},
+        "cache_write_input_tokens": {"$ref": "#/$defs/pathList"},
+        "output_tokens": {"$ref": "#/$defs/pathList"},
+        "reasoning_output_tokens": {"$ref": "#/$defs/pathList"},
+        "total_tokens": {"$ref": "#/$defs/pathList"}
+      }
+    },
+    "providerCapabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "version", "structured_outputs", "reasoning",
+        "service_tier_parameter", "service_tiers", "usage_mapping",
+        "cost_path", "mechanical_one_shot"
+      ],
+      "properties": {
+        "version": {"const": 1},
+        "api_style": {"enum": ["responses", "chat_completions"]},
+        "structured_outputs": {"enum": ["native_json_schema", "json_text", "none"]},
+        "reasoning": {"$ref": "#/$defs/reasoningCapability"},
+        "service_tier_parameter": {"$ref": "#/$defs/nullableString"},
+        "service_tiers": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "usage_mapping": {"$ref": "#/$defs/usageMapping"},
+        "cost_path": {"$ref": "#/$defs/nullableString"},
+        "mechanical_one_shot": {"type": "boolean"}
+      }
+    },
+    "provider": {
+      "type": "object", "additionalProperties": false,
+      "required": ["adapter", "endpoint", "profile", "credential", "capabilities"],
+      "properties": {
+        "adapter": {"type": "string", "minLength": 1},
+        "endpoint": {"$ref": "#/$defs/nullableString"},
+        "profile": {"$ref": "#/$defs/nullableString"},
+        "credential": {"$ref": "#/$defs/credential"},
+        "capabilities": {"$ref": "#/$defs/providerCapabilities"}
+      }
+    },
+    "effort": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]},
+    "retries": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transport", "model_protocol"],
+      "properties": {
+        "transport": {"$ref": "#/$defs/nonNegativeInteger"},
+        "model_protocol": {"$ref": "#/$defs/nonNegativeInteger"}
+      }
+    },
+    "roleRoute": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "provider", "model", "endpoint", "profile", "effort",
+        "unsupported_effort", "service_tier", "output_mode",
+        "timeout_seconds", "retries", "max_concurrency", "token_limit",
+        "cost_limit_usd", "estimated_cost_usd"
+      ],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "endpoint": {"$ref": "#/$defs/nullableString"},
+        "profile": {"$ref": "#/$defs/nullableString"},
+        "effort": {"$ref": "#/$defs/effort"},
+        "unsupported_effort": {"enum": ["error", "map"]},
+        "service_tier": {"$ref": "#/$defs/nullableString"},
+        "output_mode": {"enum": ["auto", "native_json_schema", "json_text"]},
+        "timeout_seconds": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "retries": {"$ref": "#/$defs/retries"},
+        "max_concurrency": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "token_limit": {"$ref": "#/$defs/nullablePositiveInteger"},
+        "cost_limit_usd": {"$ref": "#/$defs/nullablePositiveNumber"},
+        "estimated_cost_usd": {"$ref": "#/$defs/nullablePositiveNumber"}
+      }
+    },
+    "models": {
+      "type": "object", "additionalProperties": false,
+      "required": ["director", "prover", "falsifier", "explorer", "auditor", "evaluator_auditor", "smoke"],
+      "properties": {
+        "director": {"$ref": "#/$defs/roleRoute"},
+        "prover": {"$ref": "#/$defs/roleRoute"},
+        "falsifier": {"$ref": "#/$defs/roleRoute"},
+        "explorer": {"$ref": "#/$defs/roleRoute"},
+        "auditor": {"$ref": "#/$defs/roleRoute"},
+        "evaluator_auditor": {"$ref": "#/$defs/roleRoute"},
+        "smoke": {"$ref": "#/$defs/roleRoute"}
+      }
+    },
+    "audit": {
+      "type": "object", "additionalProperties": false,
+      "required": ["immediate_threshold", "critical_double_audit", "low_impact_batch_size"],
+      "properties": {
+        "immediate_threshold": {"enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+        "critical_double_audit": {"const": true},
+        "low_impact_batch_size": {"$ref": "#/$defs/positiveInteger"}
+      }
+    },
+    "stagnation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attempt_threshold", "priority_penalty", "force_diversification"],
+      "properties": {
+        "attempt_threshold": {"$ref": "#/$defs/positiveInteger"},
+        "priority_penalty": {"type": "number", "minimum": 0},
+        "force_diversification": {"type": "boolean"}
+      }
+    },
+    "rateLimits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reduce_exploration_percent", "drain_percent", "stop_percent", "poll_interval_seconds"],
+      "properties": {
+        "reduce_exploration_percent": {"type": "number", "minimum": 0, "maximum": 100},
+        "drain_percent": {"type": "number", "minimum": 0, "maximum": 100},
+        "stop_percent": {"type": "number", "minimum": 0, "maximum": 100},
+        "poll_interval_seconds": {"$ref": "#/$defs/positiveNumber"}
+      }
+    },
+    "observability": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "live_agent_feed", "flush_interval_seconds", "max_text_chunk_chars",
+        "max_channel_chars_per_turn", "capture_command_output",
+        "max_command_output_chars_per_item"
+      ],
+      "properties": {
+        "live_agent_feed": {"type": "boolean"},
+        "flush_interval_seconds": {"$ref": "#/$defs/positiveNumber"},
+        "max_text_chunk_chars": {"$ref": "#/$defs/positiveInteger"},
+        "max_channel_chars_per_turn": {"$ref": "#/$defs/positiveInteger"},
+        "capture_command_output": {"type": "boolean"},
+        "max_command_output_chars_per_item": {"$ref": "#/$defs/positiveInteger"}
+      }
+    },
+    "timeouts": {
+      "type": "object", "required": ["default_seconds"],
+      "additionalProperties": {"$ref": "#/$defs/positiveInteger"},
+      "properties": {"default_seconds": {"$ref": "#/$defs/positiveInteger"}}
+    },
+    "workspace": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protected_paths", "use_worktree_for_code_modification", "network_access"],
+      "properties": {
+        "protected_paths": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "use_worktree_for_code_modification": {"type": "boolean"},
+        "network_access": {"const": false}
+      }
+    },
+    "mechanicalRoute": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "model", "endpoint", "profile", "effort", "unsupported_effort", "service_tier"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "endpoint": {"$ref": "#/$defs/nullableString"},
+        "profile": {"$ref": "#/$defs/nullableString"},
+        "effort": {"$ref": "#/$defs/effort"},
+        "unsupported_effort": {"enum": ["error", "map"]},
+        "service_tier": {"type": "null"}
+      }
+    },
+    "customThresholds": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "allowed_task_kinds": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "max_timeout_seconds": {"$ref": "#/$defs/positiveInteger"},
+        "max_expected_artifacts": {"$ref": "#/$defs/positiveInteger"},
+        "max_input_files": {"$ref": "#/$defs/positiveInteger"}
+      }
+    },
+    "selectionPolicy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "custom_thresholds"],
+      "properties": {
+        "mode": {"enum": ["preferred", "balanced", "conservative", "disabled", "custom"]},
+        "custom_thresholds": {"$ref": "#/$defs/customThresholds"}
+      }
+    },
+    "backpressure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dispatch_batch_size", "max_queue_depth", "max_active_per_cpu", "minimum_dispatch_interval_seconds"],
+      "properties": {
+        "dispatch_batch_size": {"$ref": "#/$defs/positiveInteger"},
+        "max_queue_depth": {"$ref": "#/$defs/positiveInteger"},
+        "max_active_per_cpu": {"$ref": "#/$defs/positiveNumber"},
+        "minimum_dispatch_interval_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "mechanicalPolicy": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "enabled", "selection_policy", "service_tier", "primary_route",
+        "fallback_route", "fallback_condition", "recursive_spawn_allowed",
+        "transient_max_retries", "model_protocol_max_retries",
+        "estimated_tokens", "estimated_cost_usd", "backpressure"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "selection_policy": {"$ref": "#/$defs/selectionPolicy"},
+        "service_tier": {"type": "null"},
+        "primary_route": {"$ref": "#/$defs/mechanicalRoute"},
+        "fallback_route": {"$ref": "#/$defs/mechanicalRoute"},
+        "fallback_condition": {"const": "permanent_unavailable_or_access_denied"},
+        "recursive_spawn_allowed": {"const": false},
+        "transient_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
+        "model_protocol_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
+        "estimated_tokens": {"$ref": "#/$defs/positiveInteger"},
+        "estimated_cost_usd": {"$ref": "#/$defs/nullablePositiveNumber"},
+        "backpressure": {"$ref": "#/$defs/backpressure"}
+      }
+    },
+    "policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pack", "stable_core", "one_shot_compute_worker"],
+      "properties": {
+        "pack": {"const": "math-research"},
+        "stable_core": {"const": "persistent_filesystem_controller"},
+        "one_shot_compute_worker": {"$ref": "#/$defs/mechanicalPolicy"}
+      }
+    }
+  }
+}

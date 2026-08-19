@@ -1,0 +1,50 @@
+{
+  "profile_schema_version": 1,
+  "name": "custom-compatible-gateway",
+  "extends": "codex-app-server-default",
+  "overrides": {
+    "providers": {
+      "research-gateway": {
+        "adapter": "openai_compatible",
+        "endpoint": "https://models.example.invalid/v1",
+        "profile": "research-gateway",
+        "credential": {
+          "kind": "environment",
+          "reference": "RESEARCH_GATEWAY_API_KEY"
+        },
+        "capabilities": {
+          "version": 1,
+          "api_style": "responses",
+          "structured_outputs": "json_text",
+          "reasoning": {
+            "parameter": "reasoning_effort",
+            "supported_efforts": ["low", "medium", "high"],
+            "mapping": {"xhigh": "high", "max": "high"}
+          },
+          "service_tier_parameter": "service_tier",
+          "service_tiers": ["default"],
+          "usage_mapping": {
+            "input_tokens": ["input_tokens"],
+            "cached_input_tokens": ["cached_input_tokens"],
+            "cache_write_input_tokens": [],
+            "output_tokens": ["output_tokens"],
+            "reasoning_output_tokens": ["reasoning_tokens"],
+            "total_tokens": ["total_tokens"]
+          },
+          "cost_path": "billing.cost_usd",
+          "mechanical_one_shot": false
+        }
+      }
+    },
+    "models": {
+      "explorer": {
+        "provider": "research-gateway",
+        "model": "gateway-model",
+        "effort": "xhigh",
+        "unsupported_effort": "map",
+        "service_tier": "default",
+        "output_mode": "json_text"
+      }
+    }
+  }
+}

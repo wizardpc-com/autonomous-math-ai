@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from .claim_graph import ClaimGraph
-from .config import load_config
+from .config import DEFAULT_PROTECTED, load_config
 from .policy import build_policy_manifest
 from .project import ProjectManifest
 from .resources import schema_resource
@@ -12,12 +13,83 @@ from .schema import preflight_output_schema_files
 from .storage import CanonicalGuard, ProjectLayout
 
 
-def validate_project(project_root: Path, *, workspace_root: Path | None = None) -> dict[str, Any]:
-    """Perform every local trust-boundary check without starting App Server."""
+STRICT_PROJECT_DIRECTORIES = (
+    "claims", "state", "proofs", "tasks", "experiments", "certificates",
+    "audit", "sources", "conversations", "artifacts", "autonomous",
+)
+_PLACEHOLDER_MARKERS = (
+    "AMR_PLACEHOLDER", "replace with the exact", "replace this neutral",
+    "todo: exact claim", "your conjecture here",
+)
+
+
+def _strict_project_checks(
+    root: Path,
+    manifest: ProjectManifest,
+    config: Any,
+    graph: ClaimGraph,
+) -> dict[str, Any]:
+    missing_dirs = [name for name in STRICT_PROJECT_DIRECTORIES if not (root / name).is_dir()]
+    if missing_dirs:
+        raise ValueError(f"strict initialization is missing directories: {missing_dirs}")
+    checklist = root / "INITIALIZATION_CHECKLIST.md"
+    if not checklist.is_file():
+        raise ValueError("strict initialization checklist is missing")
+    protected = set(manifest.protected_paths)
+    missing_protected = set(DEFAULT_PROTECTED) - protected
+    if missing_protected:
+        raise ValueError(f"manifest removes core protected paths: {sorted(missing_protected)}")
+    for relative in manifest.protected_paths:
+        if not manifest.resolve(relative).exists():
+            raise ValueError(f"protected path does not exist: {relative}")
+    configured_protected = set(config.raw["workspace"].get("protected_paths", []))
+    if configured_protected != protected:
+        raise ValueError("manifest and config protected_paths are inconsistent")
+    for role, paths in manifest.canonical_inputs.items():
+        if not paths:
+            raise ValueError(f"canonical_inputs.{role} must not be empty in strict mode")
+    claims_text = (root / "claims" / "CLAIMS.md").read_text(encoding="utf-8")
+    declared_ids = set(re.findall(r"`([A-Za-z][A-Za-z0-9_.:-]{0,99})`", claims_text))
+    graph_ids = set(graph.claims)
+    if manifest.final_claim_id not in declared_ids:
+        raise ValueError("final_claim_id is not declared in claims/CLAIMS.md")
+    if declared_ids != graph_ids:
+        raise ValueError(
+            "claim IDs differ between claims/CLAIMS.md and the claim graph: "
+            f"markdown={sorted(declared_ids)}, graph={sorted(graph_ids)}"
+        )
+    placeholder_files: list[str] = []
+    inspected = {
+        root / "claims" / "CLAIMS.md",
+        manifest.resolve(manifest.claim_graph),
+        *(manifest.resolve(item) for paths in manifest.canonical_inputs.values() for item in paths),
+    }
+    for path in sorted(inspected):
+        text = path.read_text(encoding="utf-8", errors="replace").casefold()
+        if any(marker.casefold() in text for marker in _PLACEHOLDER_MARKERS):
+            placeholder_files.append(path.relative_to(root).as_posix())
+    if placeholder_files:
+        raise ValueError(f"strict validation found placeholder mathematical content: {placeholder_files}")
+    return {
+        "strict": True,
+        "initialization_checklist": str(checklist),
+        "required_directories": list(STRICT_PROJECT_DIRECTORIES),
+    }
+
+
+def validate_project(
+    project_root: Path,
+    *,
+    workspace_root: Path | None = None,
+    strict: bool = False,
+    profile_path: Path | None = None,
+) -> dict[str, Any]:
+    """Perform every local trust-boundary check without starting any provider."""
     root = project_root.resolve()
     manifest = ProjectManifest.load(root)
     config = load_config(
         root, workspace_root=workspace_root, require_manifest=True,
+        profile_path=profile_path,
     )
     layout = ProjectLayout(root)
     graph = ClaimGraph.load(layout.claim_graph_path)
@@ -47,6 +119,9 @@ def validate_project(project_root: Path, *, workspace_root: Path | None = None) 
     policy = build_policy_manifest(config)
     guard = CanonicalGuard(root, config.protected_paths)
     protected = guard.snapshot()
+    strict_result = _strict_project_checks(root, manifest, config, graph) if strict else {
+        "strict": False,
+    }
     return {
         "valid": True,
         "project_id": manifest.project_id,
@@ -54,9 +129,15 @@ def validate_project(project_root: Path, *, workspace_root: Path | None = None) 
         "workspace_root": str(config.workspace_root),
         "output_protocol": 2,
         "schemas": [*sorted(schemas), "candidate_event.schema.json (local inbox)"],
+        "config_schema": "config.schema.json",
         "policy_manifest_sha256": policy["manifest_sha256"],
         "mechanical_primary": policy["one_shot_compute_worker"]["primary_route"],
         "mechanical_fallback": policy["one_shot_compute_worker"]["fallback_route"],
+        "config_schema_version": config.raw["schema_version"],
+        "config_profile": config.profile_name,
+        "providers": sorted(config.raw["providers"]),
+        "migrations_applied": list(config.migrations_applied),
         "protected_files": len(protected),
         "model_turns_started": 0,
+        **strict_result,
     }

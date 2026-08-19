@@ -434,6 +434,10 @@ def validate(
         missing = set(schema.get("required", [])) - set(instance)
         if missing:
             raise SchemaError(f"{path}: missing required fields {sorted(missing)}")
+        if len(instance) < schema.get("minProperties", 0):
+            raise SchemaError(f"{path}: too few properties")
+        if "maxProperties" in schema and len(instance) > schema["maxProperties"]:
+            raise SchemaError(f"{path}: too many properties")
         if schema.get("additionalProperties") is False:
             unknown = set(instance) - set(props)
             if unknown:
@@ -441,11 +445,20 @@ def validate(
         for key, value in instance.items():
             if key in props:
                 validate(value, props[key], f"{path}.{key}", _root_schema=root_schema)
+            elif isinstance(schema.get("additionalProperties"), dict):
+                validate(
+                    value, schema["additionalProperties"], f"{path}.{key}",
+                    _root_schema=root_schema,
+                )
     elif expected == "array":
         if len(instance) < schema.get("minItems", 0):
             raise SchemaError(f"{path}: too few items")
         if "maxItems" in schema and len(instance) > schema["maxItems"]:
             raise SchemaError(f"{path}: too many items")
+        if schema.get("uniqueItems") is True:
+            rendered = [json.dumps(value, sort_keys=True) for value in instance]
+            if len(rendered) != len(set(rendered)):
+                raise SchemaError(f"{path}: array items must be unique")
         item_schema = schema.get("items")
         if item_schema:
             for index, value in enumerate(instance):

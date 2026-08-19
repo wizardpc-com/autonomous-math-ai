@@ -210,9 +210,10 @@ def build_status(
             continue
         for camel, snake in token_keys.items():
             token_totals[camel] += int(usage.get(snake, 0) or 0)
+    mechanical_token_totals = {camel: 0 for camel in token_keys}
     for usage in mechanical_usage:
         for camel, snake in token_keys.items():
-            token_totals[camel] += int(usage.get(snake, 0) or 0)
+            mechanical_token_totals[camel] += int(usage.get(snake, 0) or 0)
     last = records[-1] if records else {}
     live_path = run_dir / "LIVE_EVENTS.jsonl"
     live_records = (
@@ -245,6 +246,7 @@ def build_status(
         },
         "active_jobs": active_jobs,
         "token_usage": token_totals,
+        "mechanical_token_usage": mechanical_token_totals,
         "token_telemetry": {
             "observed": sum(value == "observed" for value in completed_telemetry_by_job.values()),
             "synthetic": sum(value == "synthetic" for value in completed_telemetry_by_job.values()),
@@ -255,7 +257,10 @@ def build_status(
         },
         "token_usage_is_lower_bound": any(
             value == "unknown" for value in completed_telemetry_by_job.values()
-        ) or any(value in {"unknown", "partial"} for value in mechanical_telemetry),
+        ),
+        "mechanical_token_usage_is_lower_bound": any(
+            value in {"unknown", "partial"} for value in mechanical_telemetry
+        ),
         "rate_limits": last_rates,
         "problems": problems[-10:],
         "live_event_count": len(live_records),
@@ -378,12 +383,14 @@ def format_event(event: dict[str, Any]) -> str:
                 ("status", turn.get("status")),
             ]
     elif kind == "RUN_STARTED":
+        mechanical_cap = payload.get("max_mechanical_subworkers")
         fields = [
             ("hours", payload.get("hours")), ("budget", payload.get("global_budget")),
+            ("mechanical_budget", payload.get("mechanical_budget")),
             ("director", payload.get("max_director", 1)),
             ("research", payload.get("max_research_workers", payload.get("max_research"))),
             ("audit", payload.get("max_audit")),
-            ("mechanical", payload.get("max_mechanical_subworkers")),
+            ("mechanical", "unbounded" if mechanical_cap is None else mechanical_cap),
         ]
     elif kind == "RUN_STOPPED":
         fields = [("reason", payload.get("reason"))]
@@ -402,6 +409,7 @@ def format_event(event: dict[str, Any]) -> str:
 
 def format_status(status: dict[str, Any]) -> str:
     usage = status["token_usage"]
+    mechanical_usage = status.get("mechanical_token_usage") or {}
     lines = [
         f"run: {status['run_id']}",
         (
@@ -421,6 +429,17 @@ def format_status(status: dict[str, Any]) -> str:
             ("tokens (observed lower bound): " if status.get("token_usage_is_lower_bound") else "tokens: ")
             + f"total={usage['totalTokens']} input={usage['inputTokens']} "
             f"cached={usage['cachedInputTokens']} output={usage['outputTokens']}"
+        ),
+        (
+            (
+                "mechanical tokens (observed lower bound): "
+                if status.get("mechanical_token_usage_is_lower_bound")
+                else "mechanical tokens: "
+            )
+            + f"total={mechanical_usage.get('totalTokens', 0)} "
+            f"input={mechanical_usage.get('inputTokens', 0)} "
+            f"cached={mechanical_usage.get('cachedInputTokens', 0)} "
+            f"output={mechanical_usage.get('outputTokens', 0)}"
         ),
         (
             "token telemetry: "
@@ -768,11 +787,13 @@ def format_chat_lifecycle_event(event: dict[str, Any]) -> str | None:
         return f"{_local_clock(event.get('timestamp'))} [系统｜{nature}]"
 
     if kind == "RUN_STARTED":
+        mechanical_cap = payload.get("max_mechanical_subworkers")
+        mechanical_label = "unbounded（受资源/预算背压）" if mechanical_cap is None else mechanical_cap
         return (
             f"{prefix('运行')} 自主研究已启动：Director {payload.get('max_director', 1)}，"
             f"研究席位 {payload.get('max_research_workers', payload.get('max_research'))}，"
             f"审计席位 {payload.get('max_audit')}，机械子工席位 "
-            f"{payload.get('max_mechanical_subworkers', 0)}"
+            f"{mechanical_label}"
         )
     if kind == "MECHANICAL_SUBTASK_REQUESTED":
         return (
@@ -782,12 +803,15 @@ def format_chat_lifecycle_event(event: dict[str, Any]) -> str | None:
     if kind == "MECHANICAL_SUBTASK_STARTED":
         return (
             f"{prefix('机械外包')} {_compact(payload.get('subtask_id'), 60)} 已启动："
-            f"Spark/high/null（attempt {payload.get('attempt')}）"
+            f"{payload.get('provider') or '-'}:{payload.get('model') or '-'} / "
+            f"{payload.get('reasoning_effort') or '-'} / null"
+            f"（attempt {payload.get('attempt')}）"
         )
     if kind == "MECHANICAL_SUBTASK_FALLBACK":
         return (
-            f"{prefix('机械回退')} Spark 被明确判定永久 unavailable/access denied；"
-            "切换到 Luna/medium/null"
+            f"{prefix('机械回退')} {payload.get('from_provider') or '-'}:"
+            f"{payload.get('from_model') or '-'} 被明确判定永久 unavailable/access denied；"
+            f"切换到 {payload.get('to_provider') or '-'}:{payload.get('to_model') or '-'}"
         )
     if kind == "MECHANICAL_ROUTE_UNAVAILABLE":
         return (
@@ -1626,11 +1650,13 @@ class _MonitorDashboardState:
         self.stop_reason: str | None = None
         self.started_at: datetime | None = None
         self.global_budget: int | None = None
+        self.mechanical_budget: int | None = None
         self.max_director = 0
         self.max_research_workers = 0
         self.max_research = 0
         self.max_audit = 0
-        self.max_mechanical_subworkers = 0
+        self.max_mechanical_subworkers: int | None = 0
+        self.mechanical_effective_resource_cap = 0
         self.event_count = 0
         self.live_event_count = 0
         self.active_jobs: dict[str, dict[str, Any]] = {}
@@ -1640,6 +1666,7 @@ class _MonitorDashboardState:
         self.thread_to_job: dict[str, str] = {}
         self.thread_tokens: dict[str, int] = {}
         self.completed_usage: dict[str, tuple[str, int]] = {}
+        self.completed_mechanical_tokens = 0
         self.rate_used: Any = None
         self.active_tools: dict[str, tuple[str, str]] = {}
         self.task_names: dict[str, str] = {}
@@ -1656,14 +1683,20 @@ class _MonitorDashboardState:
         if kind == "RUN_STARTED":
             self.started_at = _parse_timestamp(event.get("timestamp"))
             self.global_budget = payload.get("global_budget")
+            self.mechanical_budget = payload.get("mechanical_budget")
             self.max_director = int(payload.get("max_director") or 1)
             self.max_research_workers = int(
                 payload.get("max_research_workers", payload.get("max_research")) or 0
             )
             self.max_research = self.max_research_workers
             self.max_audit = int(payload.get("max_audit") or 0)
-            self.max_mechanical_subworkers = int(
-                payload.get("max_mechanical_subworkers") or 0
+            raw_mechanical_cap = payload.get("max_mechanical_subworkers")
+            self.max_mechanical_subworkers = (
+                None if "max_mechanical_subworkers" in payload and raw_mechanical_cap is None
+                else int(raw_mechanical_cap or 0)
+            )
+            self.mechanical_effective_resource_cap = int(
+                payload.get("mechanical_effective_resource_cap") or 0
             )
         elif kind == "TASK_ACCEPTED":
             task = payload.get("task") or {}
@@ -1735,6 +1768,11 @@ class _MonitorDashboardState:
             self.job_records[job_id]["end_time"] = event.get("timestamp")
             self.active_jobs.pop(job_id, None)
         elif kind in {"MECHANICAL_SUBTASK_COMPLETED", "MECHANICAL_SUBTASK_FAILED"}:
+            if not payload.get("cache_reused"):
+                usage = payload.get("token_usage") or {}
+                self.completed_mechanical_tokens += int(
+                    usage.get("total_tokens") or 0
+                )
             parent = str(payload.get("parent_job_id") or "")
             subtask = str(payload.get("subtask_id") or "")
             for job_id, record in list(self.active_jobs.items()):
@@ -1801,6 +1839,10 @@ class _MonitorDashboardState:
             if not resolved_thread or resolved_thread not in self.thread_tokens:
                 total += usage
         return total
+
+    @property
+    def mechanical_tokens(self) -> int:
+        return self.completed_mechanical_tokens
 
     @staticmethod
     def _thread_group(role: str) -> str:
@@ -2081,25 +2123,39 @@ class _MonitorDashboardState:
             "FINALIZING": "生成报告中",
         }.get(self.state, "运行中")
         budget = _token_text(self.global_budget) if self.global_budget is not None else "未设上限"
+        mechanical_budget = (
+            _token_text(self.mechanical_budget)
+            if self.mechanical_budget is not None else "未设上限"
+        )
         rate = f"｜Rate {self.rate_used}%" if self.rate_used is not None else ""
         # Role caps are independent; an incremental Director can run beside
         # research and audit after a meaningful state change.
         capacity = (
             self.max_director + self.max_research_workers + self.max_audit
-            + self.max_mechanical_subworkers
+            + (
+                self.mechanical_effective_resource_cap
+                if self.max_mechanical_subworkers is None
+                else self.max_mechanical_subworkers
+            )
         )
         active = len(self.active_jobs)
         occupancy = self._slot_occupancy()
         first = "┏━ 固定状态面板｜AUTONOMOUS MATH AI ━"
         second = (
             f"状态 {status}｜Run {self.run_id}｜运行 {elapsed}｜"
-            f"Token {_token_text(self.total_tokens)}/{budget}{rate}"
+            f"Token 主角色 {_token_text(self.total_tokens)}/{budget}｜"
+            f"机械 {_token_text(self.mechanical_tokens)}/{mechanical_budget}{rate}"
+        )
+        mechanical_limit = (
+            "∞(资源背压 " + str(self.mechanical_effective_resource_cap or "-") + ")"
+            if self.max_mechanical_subworkers is None
+            else str(self.max_mechanical_subworkers or "-")
         )
         third = (
             f"槽位占用｜主管 {occupancy['director']}/{self.max_director or '-'}｜"
             f"研究 {occupancy['research']}/{self.max_research_workers or '-'}｜"
             f"审计 {occupancy['audit']}/{self.max_audit or '-'}｜"
-            f"机械 {occupancy['mechanical']}/{self.max_mechanical_subworkers or '-'}｜"
+            f"机械 {occupancy['mechanical']}/{mechanical_limit}｜"
             f"总计 {active}/{capacity or '-'}"
         )
         grouped = self._active_thread_cards(now, display_width=display_width)

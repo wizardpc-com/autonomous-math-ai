@@ -76,6 +76,11 @@ or priority service.
 Mechanical results are evidence for the parent role, never an automatic proof
 or audit verdict.
 
+“Unbounded” mechanical concurrency removes only a configured seat count. It
+does not bypass the broker's separate token/cost governor, resource capacity,
+provider rate limits, queue depth, dispatch batch, timeout, recovery, or
+operator stop. Mechanical workers remain one layer deep.
+
 ## Human and external inputs
 
 Human steering and ingested local assets are append-only inputs. Steering can
