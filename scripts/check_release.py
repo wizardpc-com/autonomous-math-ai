@@ -19,7 +19,6 @@ FORBIDDEN_MARKERS = (
     "E:" + "\\math-ai-research",
     "projects" + "/",
     "tools" + ".autonomous_math_research",
-    "." + "agents",
 )
 FORBIDDEN_TOKENS = (
     "R" + "23",
@@ -34,6 +33,7 @@ FORBIDDEN_TOKEN_PATTERN = re.compile(
     + r")(?![A-Za-z0-9])"
 )
 FORBIDDEN_PARTS = {"runs", "outcomes", "_runtime", "__pycache__"}
+FORBIDDEN_ARCHIVE_ROOTS = {".agents"}
 SECRET_FILE_NAMES = {
     ".env",
     "credentials",
@@ -103,6 +103,8 @@ def _check_member(archive: Path, name: str, payload: bytes) -> list[str]:
         issues.append("unsafe archive path")
     if lowered_parts & FORBIDDEN_PARTS:
         issues.append("generated runtime directory")
+    if member.parts and member.parts[0].lower() in FORBIDDEN_ARCHIVE_ROOTS:
+        issues.append("repository-only discovery adapter")
     if member.name.lower() in SECRET_FILE_NAMES or member.suffix.lower() in SECRET_SUFFIXES:
         issues.append("credential-like filename")
     normalized_name = member.as_posix()

@@ -153,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     new_experiment.add_argument("experiment_args", nargs=argparse.REMAINDER)
 
+    detect_tools = sub.add_parser(
+        "detect-tools", help="write a project-local mathematical tool inventory",
+    )
+    detect_tools.add_argument("--project-root", type=Path, required=True)
+    detect_tools.add_argument("--output", type=Path)
+
     probe = sub.add_parser("probe", help="inspect local schema and live App Server capabilities")
     probe.add_argument("--project", type=Path, required=True)
     probe.add_argument("--out", type=Path)
@@ -541,6 +547,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runpy.run_path(str(runner), run_name="__main__")
             finally:
                 sys.argv = previous
+        return 0
+    if args.command == "detect-tools":
+        with policy_resource("scripts/detect_math_tools.py") as runner:
+            previous_argv = sys.argv
+            previous_root = os.environ.get("MATH_WORKER_REPOSITORY_ROOT")
+            project_root = args.project_root.resolve()
+            output = (
+                args.output.resolve()
+                if args.output is not None
+                else project_root / ".tooling" / "math-tools.json"
+            )
+            os.environ["MATH_WORKER_REPOSITORY_ROOT"] = str(project_root)
+            sys.argv = [str(runner), "--output", str(output)]
+            try:
+                runpy.run_path(str(runner), run_name="__main__")
+            finally:
+                sys.argv = previous_argv
+                if previous_root is None:
+                    os.environ.pop("MATH_WORKER_REPOSITORY_ROOT", None)
+                else:
+                    os.environ["MATH_WORKER_REPOSITORY_ROOT"] = previous_root
         return 0
     if args.command == "run":
         try:

@@ -6,6 +6,20 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Repository-local Codex discovery entry for the bundled `math-research`
+  policy pack.
+- `amr detect-tools --project-root` for writing a tool inventory into the
+  selected research project rather than the harness checkout.
+- Conjecture-neutral catalog, evidence, lifecycle, policy, and mechanical
+  worker regression suites migrated from the former monorepo integration.
+
+### Changed
+
+- The harness now lives in its own source checkout and research repositories
+  integrate exclusively through the installed `amr` CLI and project manifest.
+
 ### Planned
 
 - Broader backend adapters and additional deterministic verifier integrations.

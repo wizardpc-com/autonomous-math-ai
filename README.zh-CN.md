@@ -38,6 +38,14 @@ python -m pip install autonomous-math-ai
 发行名是 `autonomous-math-ai`，Python namespace 保持
 `autonomous_math_research`，命令行入口保持 `amr`。
 
+## 仓库边界
+
+本仓库只保存通用 harness、中性模板、policy 资源与测试。数学命题、项目
+prompt、claim/task graph、实验、审计、run、outcome 和 artifact 必须保存在
+由 `--project` 指定的独立研究仓库中。`.agents/skills/math-research/` 只是
+Codex 发现入口，引用同一份 package policy，不包含第二套 engine 或任何具体
+研究状态。
+
 ## 零额度开始
 
 ```console
@@ -45,6 +53,7 @@ amr init ./research-target
 amr validate --project ./research-target
 amr run --project ./research-target --dry-run
 amr run --project ./research-target --mock --hours 0.01
+amr detect-tools --project-root ./research-target
 ```
 
 这些命令不会启动真实模型。真实运行需要单独配置 Codex App Server，并应在确认模型、

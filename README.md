@@ -57,6 +57,17 @@ python -m pip install .
 The distribution name is `autonomous-math-ai`, the import namespace remains
 `autonomous_math_research`, and the command-line entry point is `amr`.
 
+## Repository separation
+
+This repository contains only the generic harness, neutral templates, policy
+resources, and tests. Mathematical statements, project prompts, claim/task
+graphs, experiments, audits, runs, outcomes, and artifacts belong in a separate
+research repository selected with `--project`.
+
+The optional `.agents/skills/math-research/` entry is only a Codex discovery
+adapter. Its links resolve to the same packaged policy resources; it does not
+carry a second engine or any research-project state.
+
 ## Quick start
 
 Create and validate a neutral project without starting a model:
@@ -71,6 +82,7 @@ Exercise the full controller lifecycle with deterministic mock agents:
 
 ```console
 amr run --project ./research-target --mock --hours 0.01
+amr detect-tools --project-root ./research-target
 ```
 
 These commands are zero-model checks. A live run requires a separately

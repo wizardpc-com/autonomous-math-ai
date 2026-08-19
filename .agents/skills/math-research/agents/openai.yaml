@@ -1,0 +1,4 @@
+interface:
+  display_name: "Math Research"
+  short_description: "Run local-first mathematics with exact verification"
+  default_prompt: "Use $math-research to falsify cheaply, compute exactly, preserve reproducible evidence, and independently audit important results."
