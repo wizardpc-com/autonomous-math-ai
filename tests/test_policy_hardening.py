@@ -232,7 +232,9 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, "ERROR")
         self.assertEqual(outcome.observed_service_tier, "priority")
         self.assertIn("turn/completed", outcome.error or "")
-        self.assertEqual(client.goal_calls, 1)
+        # Autonomous jobs never arm an App Server goal: native goal
+        # continuations would escape controller turn ownership.
+        self.assertEqual(client.goal_calls, 0)
         self.assertEqual(client.turn_calls, 1)
 
     async def test_thread_model_mismatch_stops_before_goal_and_turn(self) -> None:

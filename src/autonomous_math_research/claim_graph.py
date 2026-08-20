@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    CandidateEvent, Claim, EvidenceLevel, MathStatus, TrustStatus, evidence_rank, utc_now,
+    CandidateEvent, Claim, EvidenceLevel, MathStatus, ObligationStatus,
+    ProofObligation, TrustStatus, evidence_rank, stable_hash, utc_now,
 )
 from .storage import atomic_write_json
 
@@ -14,13 +15,14 @@ class ClaimGraph:
     def __init__(self, claims: dict[str, Claim], path: Path | None = None):
         self.claims = claims
         self.path = path
+        self._ensure_proof_obligations()
         self._rebuild_dependents()
 
     @classmethod
     def load(cls, path: Path) -> "ClaimGraph":
         raw = json.loads(path.read_text(encoding="utf-8"))
         version = int(raw.get("schema_version", 1))
-        if version not in {1, 2}:
+        if version not in {1, 2, 3}:
             raise ValueError(f"unsupported claim graph schema_version: {version}")
         claims = {item["claim_id"]: Claim.from_dict(item) for item in raw["claims"]}
         return cls(claims, path)
@@ -35,7 +37,60 @@ class ClaimGraph:
         for claim in self.claims.values():
             claim.downstream_dependents.sort()
 
+    @staticmethod
+    def _obligation_id(claim_id: str, statement: str) -> str:
+        digest = stable_hash({
+            "claim_id": claim_id,
+            "statement": " ".join(statement.split()),
+        })[:20].upper()
+        return f"{claim_id}::OBL::{digest}"
+
+    def _ensure_claim_obligations(self, claim: Claim) -> None:
+        if claim.proof_obligations:
+            return
+        statements = [item for item in claim.current_gaps if str(item).strip()]
+        if not statements:
+            statements = [claim.statement]
+        trusted_terminal = claim.trust_status in {
+            TrustStatus.CANONICAL_TRUSTED,
+            TrustStatus.AUDITED_NIGHTLY,
+            TrustStatus.FORMALLY_VERIFIED,
+        }
+        if trusted_terminal and claim.math_status == MathStatus.PROVED:
+            status = ObligationStatus.DISCHARGED
+        elif trusted_terminal and claim.math_status == MathStatus.REFUTED:
+            status = ObligationStatus.REFUTED
+        else:
+            status = ObligationStatus.OPEN
+        claim.proof_obligations = [
+            ProofObligation(
+                obligation_id=self._obligation_id(claim.claim_id, statement),
+                statement=statement,
+                status=status,
+                dependencies=list(claim.dependencies),
+                evidence_paths=(
+                    list(claim.evidence_paths)
+                    if status in {ObligationStatus.DISCHARGED, ObligationStatus.REFUTED}
+                    else []
+                ),
+                created_at=claim.last_meaningful_progress,
+                updated_at=claim.last_meaningful_progress,
+            )
+            for statement in statements
+        ]
+
+    def _ensure_proof_obligations(self) -> None:
+        for claim in self.claims.values():
+            self._ensure_claim_obligations(claim)
+
     def validate(self) -> None:
+        all_obligations = {
+            obligation.obligation_id
+            for claim in self.claims.values()
+            for obligation in claim.proof_obligations
+        }
+        if sum(len(claim.proof_obligations) for claim in self.claims.values()) != len(all_obligations):
+            raise ValueError("proof obligation ids must be globally unique")
         for claim in self.claims.values():
             missing = set(claim.dependencies) - set(self.claims)
             if missing:
@@ -46,6 +101,16 @@ class ClaimGraph:
                 if claim.parent_claim_id not in self.claims:
                     raise ValueError(
                         f"{claim.claim_id} has missing parent claim: {claim.parent_claim_id}"
+                    )
+            for obligation in claim.proof_obligations:
+                ProofObligation.from_dict(obligation.to_dict())
+                missing_obligation_dependencies = set(obligation.dependencies) - (
+                    set(self.claims) | all_obligations
+                )
+                if missing_obligation_dependencies:
+                    raise ValueError(
+                        f"{obligation.obligation_id} has missing dependencies: "
+                        f"{sorted(missing_obligation_dependencies)}"
                     )
         visiting: set[str] = set()
         visited: set[str] = set()
@@ -80,10 +145,11 @@ class ClaimGraph:
                 "gaps": claim.current_gaps,
                 "priority": claim.priority,
                 "evidence_paths": claim.evidence_paths,
+                "proof_frontier": self.proof_frontier(claim.claim_id),
             }
             if claim.trust_status in {TrustStatus.CANONICAL_TRUSTED, TrustStatus.AUDITED_NIGHTLY, TrustStatus.FORMALLY_VERIFIED}:
                 trusted.append(row)
-            if claim.math_status == MathStatus.FAILED:
+            if claim.math_status == MathStatus.REFUTED:
                 rejected.append(row)
             if claim.math_status in {MathStatus.OPEN, MathStatus.PLAUSIBLE, MathStatus.REDUCED_TO}:
                 frontier.append(row)
@@ -94,6 +160,55 @@ class ClaimGraph:
             "active_tasks": active_tasks,
             "recent_changes": recent[-20:],
             "budget": budget,
+        }
+
+    def proof_frontier(self, claim_id: str) -> dict[str, Any]:
+        """Return the canonical remaining/next view for one claim.
+
+        The frontier is derived from ClaimGraph obligations, not persisted as a
+        second mutable proof-state file.  A blocked obligation remains visible
+        but is not preferred while a dependency-ready OPEN obligation exists.
+        """
+        claim = self.claims[claim_id]
+        status_by_id = {
+            obligation.obligation_id: obligation.status
+            for item in self.claims.values()
+            for obligation in item.proof_obligations
+        }
+        remaining = [
+            obligation for obligation in claim.proof_obligations
+            if obligation.status in {ObligationStatus.OPEN, ObligationStatus.BLOCKED}
+        ]
+
+        def ready(obligation: ProofObligation) -> bool:
+            for dependency in obligation.dependencies:
+                if dependency in self.claims:
+                    dependency_claim = self.claims[dependency]
+                    if not (
+                        dependency_claim.math_status == MathStatus.PROVED
+                        and dependency_claim.trust_status in {
+                            TrustStatus.CANONICAL_TRUSTED,
+                            TrustStatus.AUDITED_NIGHTLY,
+                            TrustStatus.FORMALLY_VERIFIED,
+                        }
+                    ):
+                        return False
+                elif status_by_id.get(dependency) != ObligationStatus.DISCHARGED:
+                    return False
+            return obligation.status == ObligationStatus.OPEN
+
+        ready_open = [item for item in remaining if ready(item)]
+        ordered = sorted(remaining, key=lambda item: item.obligation_id)
+        next_item = min(ready_open, key=lambda item: item.obligation_id) if ready_open else (
+            ordered[0] if ordered else None
+        )
+        return {
+            "claim_id": claim_id,
+            "obligations": [item.to_dict() for item in sorted(
+                claim.proof_obligations, key=lambda item: item.obligation_id,
+            )],
+            "remaining_obligation_ids": [item.obligation_id for item in ordered],
+            "next_obligation_id": next_item.obligation_id if next_item else None,
         }
 
     def mark_candidate(self, event: CandidateEvent) -> None:
@@ -118,6 +233,7 @@ class ClaimGraph:
                 evidence_level=EvidenceLevel.E0_SPECULATIVE,
             )
             self.claims[event.claim_id] = claim
+            self._ensure_claim_obligations(claim)
         elif " ".join(claim.statement.split()) != " ".join(event.exact_statement.split()):
             raise ValueError(
                 f"candidate statement does not match existing claim {event.claim_id}; "
@@ -151,18 +267,30 @@ class ClaimGraph:
         if evidence_rank(verified_evidence_level) > evidence_rank(claim.evidence_level):
             claim.evidence_level = verified_evidence_level
         claim.evidence_paths = sorted(set(claim.evidence_paths + event.artifact_paths))
+        terminal_obligation_status: str | None = None
         if event.type in {"COUNTEREXAMPLE", "KEY_REFUTATION"}:
-            claim.math_status = MathStatus.FAILED
+            claim.math_status = MathStatus.REFUTED
             claim.known_counterexamples = sorted(set(claim.known_counterexamples + event.artifact_paths))
+            terminal_obligation_status = ObligationStatus.REFUTED
         elif event.type in {"THEOREM_CANDIDATE", "KEY_LEMMA", "EQUIVALENCE"}:
             claim.math_status = MathStatus.PROVED
+            terminal_obligation_status = ObligationStatus.DISCHARGED
         elif event.type == "REDUCTION":
-            if claim.math_status not in {MathStatus.PROVED, MathStatus.FAILED}:
+            if claim.math_status not in {MathStatus.PROVED, MathStatus.REFUTED}:
                 claim.math_status = MathStatus.REDUCED_TO
         else:
-            if claim.math_status not in {MathStatus.PROVED, MathStatus.FAILED, MathStatus.REDUCED_TO}:
+            if claim.math_status not in {MathStatus.PROVED, MathStatus.REFUTED, MathStatus.REDUCED_TO}:
                 claim.math_status = MathStatus.COMPUTATION_ONLY
-        claim.current_gaps = []
+        if terminal_obligation_status is not None:
+            now = utc_now()
+            for obligation in claim.proof_obligations:
+                if obligation.status in {ObligationStatus.OPEN, ObligationStatus.BLOCKED}:
+                    obligation.status = terminal_obligation_status
+                    obligation.evidence_paths = sorted(set(
+                        obligation.evidence_paths + event.artifact_paths
+                    ))
+                    obligation.updated_at = now
+            claim.current_gaps = []
         claim.last_meaningful_progress = utc_now()
 
     def apply_audit_reject(self, event: CandidateEvent, reason: str) -> None:
@@ -176,7 +304,7 @@ class ClaimGraph:
         blocked: dict[str, list[str]] = {}
         failed = {
             claim_id for claim_id, claim in self.claims.items()
-            if claim.math_status == MathStatus.FAILED
+            if claim.math_status == MathStatus.REFUTED
             and claim.trust_status in {TrustStatus.CANONICAL_TRUSTED, TrustStatus.AUDITED_NIGHTLY, TrustStatus.FORMALLY_VERIFIED}
         }
         changed = True
@@ -198,7 +326,7 @@ class ClaimGraph:
         self._rebuild_dependents()
         self.validate()
         atomic_write_json(target, {
-            "schema_version": 2,
+            "schema_version": 3,
             "updated_at": utc_now(),
             "claims": [self.claims[key].to_dict() for key in sorted(self.claims)],
         })

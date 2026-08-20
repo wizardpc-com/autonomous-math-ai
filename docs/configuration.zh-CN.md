@@ -22,6 +22,13 @@ v9 新增 `campaign.hours`（默认 12）和 `campaign.epoch_hours`（默认 2�
 未传对应参数时读取项目值；显式 `--hours`、`--epoch-hours` 保持最高优先级。
 `config summary` 会脱敏输出项目、campaign、并发、预算、逐角色路由和机械路由摘要。
 
+`engine` 还声明同线程研究 continuation：`research_max_turns` 默认 4；
+`reasoning_health_short_tokens` 默认 600；
+`reasoning_health_repeated_token_tolerance` 默认 2；
+`reasoning_health_retry_limit` 默认 2。它们只控制诊断、有限重试和 provider 明确支持时的
+`xhigh -> max` 升级，不能改变数学状态、trust、evidence 或 audit 结论。harness 不设置
+App Server active goal；per-thread token 限额继续由 controller 根据 telemetry 执行。
+
 新项目主角色默认额度为 5 亿 token；机械子工独立额度为 15 亿。机械席位上限默认
 `null`，只表示没有静态数量上限，broker 仍受预算、系统资源、rate limit、队列、
 dispatch batch、超时和 operator stop 约束。策略可选 `preferred`、`balanced`、

@@ -27,6 +27,11 @@ AI 辅助数学研究。它负责研究任务、反证搜索、独立审计、�
 - **表示兼容检查**：显式记录 branch、localization、saturation、normalization、content、
   exceptional factors 和 combination scope，禁止未经审计的跨表示组合。
 - **统一协议预检**：mock 与真实 App Server 路径使用同一 Structured Outputs gate。
+- **Controller 管理 continuation**：困难任务可在同一 thread 内进行有界多 turn；单个
+  turn 结束或模型自报 `PROOF` 不等于逻辑任务结束；token telemetry 缺失或
+  controller 预算耗尽时禁止继续，并 fail-closed。
+- **Canonical proof frontier**：稳定 proof obligation 直接保存在 `ClaimGraph` 中，
+  只有通过审计的 canonical 进展才能闭合 obligation 或重置 stagnation。
 
 ## 安装
 

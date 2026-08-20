@@ -16,7 +16,7 @@ from .app_server import (
     redact_auth_material,
 )
 from .backend import (
-    AppServerBackend, CandidateSink, CodexBackend, _classify_failure,
+    AppServerBackend, CandidateSink, CodexBackend, TurnController, _classify_failure,
 )
 from .config import HarnessConfig
 from .models import JobOutcome, ResearchTask, TokenUsage
@@ -183,6 +183,10 @@ class OpenAICompatibleBackend:
     def set_economy_mode(self, enabled: bool) -> None:
         del enabled
 
+    def supports_same_thread_continuation(self, role: str) -> bool:
+        del role
+        return False
+
     async def start(self) -> None:
         return None
 
@@ -261,8 +265,9 @@ class OpenAICompatibleBackend:
         token_budget: int | None,
         candidate_sink: CandidateSink,
         skill_path: Path | None = None,
+        turn_controller: TurnController | None = None,
     ) -> JobOutcome:
-        del workspace, writable_roots, token_budget, candidate_sink, skill_path
+        del workspace, writable_roots, token_budget, candidate_sink, skill_path, turn_controller
         route = self.config.route_for(task.role)
         model, effort = self._model_for(task.role)
         usage = TokenUsage()
@@ -421,6 +426,12 @@ class ProviderRouterBackend:
     def set_economy_mode(self, enabled: bool) -> None:
         for adapter in self.adapters.values():
             adapter.set_economy_mode(enabled)
+
+    def supports_same_thread_continuation(self, role: str) -> bool:
+        provider_name = str(self.config.route_for(role)["provider"])
+        adapter = self.adapters[provider_name]
+        checker = getattr(adapter, "supports_same_thread_continuation", None)
+        return bool(callable(checker) and checker(role))
 
     async def start(self) -> None:
         await asyncio.gather(*(adapter.start() for adapter in self.adapters.values()))

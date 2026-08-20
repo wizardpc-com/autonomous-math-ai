@@ -66,7 +66,9 @@
         "poll_interval_seconds", "max_consecutive_controller_errors",
         "error_rate_threshold", "error_rate_min_jobs", "max_retries",
         "transient_protocol_max_retries", "model_protocol_max_retries",
-        "director_max_retries", "director_debounce_seconds"
+        "director_max_retries", "director_debounce_seconds",
+        "research_max_turns", "reasoning_health_short_tokens",
+        "reasoning_health_repeated_token_tolerance", "reasoning_health_retry_limit"
       ],
       "properties": {
         "poll_interval_seconds": {"$ref": "#/$defs/positiveNumber"},
@@ -77,7 +79,11 @@
         "transient_protocol_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
         "model_protocol_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
         "director_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
-        "director_debounce_seconds": {"type": "number", "minimum": 0}
+        "director_debounce_seconds": {"type": "number", "minimum": 0},
+        "research_max_turns": {"$ref": "#/$defs/positiveInteger"},
+        "reasoning_health_short_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+        "reasoning_health_repeated_token_tolerance": {"type": "integer", "minimum": 2},
+        "reasoning_health_retry_limit": {"$ref": "#/$defs/nonNegativeInteger"}
       }
     },
     "scheduler": {

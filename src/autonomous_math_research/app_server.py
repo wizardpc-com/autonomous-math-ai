@@ -100,6 +100,66 @@ class StructuredOutputProtocolError(AppServerError):
     """The completed model message was not exactly one JSON object."""
 
 
+class UnmanagedContinuationError(AppServerError):
+    """App Server started a turn that the controller did not request."""
+
+
+class TurnOwnershipRegistry:
+    """Correlate explicit controller turns and expose native continuations."""
+
+    def __init__(self) -> None:
+        self._open_threads: set[str] = set()
+        self._owned_ids: dict[str, set[str]] = {}
+        self._started_count: dict[str, int] = {}
+        self.unmanaged_continuations: list[dict[str, str]] = []
+
+    def begin_controller_turn(self, thread_id: str) -> None:
+        if any(item["thread_id"] == thread_id for item in self.unmanaged_continuations):
+            raise UnmanagedContinuationError(
+                f"thread {thread_id} has an unmanaged continuation"
+            )
+        if thread_id in self._open_threads:
+            raise UnmanagedContinuationError(
+                f"thread {thread_id} already has a controller-owned turn"
+            )
+        self._open_threads.add(thread_id)
+        self._owned_ids[thread_id] = set()
+        self._started_count[thread_id] = 0
+
+    def observe_started(self, thread_id: str, turn_id: str) -> bool:
+        if thread_id in self._open_threads and self._started_count.get(thread_id, 0) == 0:
+            self._started_count[thread_id] = 1
+            if turn_id:
+                self._owned_ids.setdefault(thread_id, set()).add(turn_id)
+            return True
+        self.unmanaged_continuations.append({
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+        })
+        return False
+
+    def bind_response(self, thread_id: str, turn_id: str) -> None:
+        if thread_id not in self._open_threads:
+            raise UnmanagedContinuationError(
+                f"turn/start response for unowned thread {thread_id}"
+            )
+        if turn_id:
+            self._owned_ids.setdefault(thread_id, set()).add(turn_id)
+
+    def observe_completed(self, thread_id: str, turn_id: str) -> bool:
+        if thread_id not in self._open_threads:
+            return False
+        owned = self._owned_ids.setdefault(thread_id, set())
+        if turn_id:
+            owned.add(turn_id)
+        return True
+
+    def finish_controller_turn(self, thread_id: str) -> None:
+        self._open_threads.discard(thread_id)
+        self._owned_ids.pop(thread_id, None)
+        self._started_count.pop(thread_id, None)
+
+
 class AppServerRequestError(AppServerError):
     """A JSON-RPC request was rejected by App Server.
 
@@ -288,8 +348,26 @@ class AppServerClient:
         self._token_usage: dict[str, TokenUsage] = {}
         self._thread_token_usage: dict[str, TokenUsage] = {}
         self._model_reroutes_by_thread: dict[str, list[dict[str, Any]]] = {}
+        self.turn_ownership = TurnOwnershipRegistry()
         self.stderr_lines: list[str] = []
         self.initialize_result: dict[str, Any] | None = None
+
+    async def _interrupt_unmanaged_turn(self, thread_id: str, turn_id: str) -> None:
+        """Best-effort containment after a native turn escapes ownership."""
+        try:
+            await self.interrupt(thread_id, turn_id)
+        except Exception as exc:  # The controller has already failed closed.
+            if self.notification_handler:
+                result = self.notification_handler({
+                    "method": "amr/unmanagedContinuationInterruptFailed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "errorType": type(exc).__name__,
+                    },
+                })
+                if asyncio.iscoroutine(result):
+                    await result
 
     async def __aenter__(self) -> "AppServerClient":
         await self.start()
@@ -453,6 +531,25 @@ class AppServerClient:
         if method == "turn/started":
             turn = params.get("turn") or {}
             notification_turn_id = str(turn.get("id") or "")
+            if thread_id and notification_turn_id and not self.turn_ownership.observe_started(
+                thread_id, notification_turn_id,
+            ):
+                if self.process is not None:
+                    asyncio.create_task(
+                        self._interrupt_unmanaged_turn(thread_id, notification_turn_id)
+                    )
+                if self.notification_handler:
+                    result = self.notification_handler({
+                        "method": "amr/unmanagedContinuation",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": notification_turn_id,
+                            "action": "interrupt_and_fail_closed",
+                        },
+                    })
+                    if asyncio.iscoroutine(result):
+                        asyncio.create_task(result)
+                return
             if thread_id and notification_turn_id:
                 self._notification_turn_by_thread[thread_id] = notification_turn_id
                 response_turn_id = self._response_turn_by_thread.get(thread_id)
@@ -481,6 +578,8 @@ class AppServerClient:
         elif method == "turn/completed":
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id", ""))
+            if thread_id and not self.turn_ownership.observe_completed(thread_id, turn_id):
+                return
             if thread_id and turn_id:
                 self._notification_turn_by_thread[thread_id] = turn_id
             # A tool-using turn can emit several completed agentMessage items:
@@ -580,9 +679,15 @@ class AppServerClient:
         }
         self._notification_turn_by_thread.pop(thread_id, None)
         self._model_reroutes_by_thread.pop(thread_id, None)
-        response = await self.request("turn/start", params)
+        self.turn_ownership.begin_controller_turn(thread_id)
+        try:
+            response = await self.request("turn/start", params)
+        except Exception:
+            self.turn_ownership.finish_controller_turn(thread_id)
+            raise
         turn = response["turn"]
         response_turn_id = str(turn["id"])
+        self.turn_ownership.bind_response(thread_id, response_turn_id)
         self._response_turn_by_thread[thread_id] = response_turn_id
         # Officially the turn/start response id and streamed turn id are the
         # same.  Codex 0.147.0 on Windows has been observed returning a rollout
@@ -623,6 +728,7 @@ class AppServerClient:
             self._turn_waiters.pop(turn_id, None)
             self._thread_turn_waiters.pop(thread_id, None)
             self._turn_started_callbacks.pop(thread_id, None)
+            self.turn_ownership.finish_controller_turn(thread_id)
         terminal_turn = ((completed or {}).get("turn") or {})
         completed_turn_id = str(
             terminal_turn.get("id")

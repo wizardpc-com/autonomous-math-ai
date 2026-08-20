@@ -15,6 +15,8 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 - `storage/` owns atomic persistence, portable artifact references, steering,
   and local asset ingest.
 - `mechanical/` owns the controller-brokered one-shot worker boundary.
+- `research_job.py` owns strict logical-job termination and same-thread turn
+  continuation policy; `reasoning_health.py` supplies diagnostic-only signals.
 - `provider_backend.py` routes roles to transport adapters; provider transport
   never owns mathematical role semantics or canonical-state authority.
 - `provider_config.py` normalizes capability, effort, tier, usage, cost, and
@@ -65,6 +67,42 @@ BOOTSTRAP → RUNNING → DRAINING_* → SEALED
 Once dispatch leaves `RUNNING`, a continuation cannot reopen the same epoch.
 New information becomes a constraint for a later epoch. A crash resume remains
 within the same epoch; campaign continuation creates a new one.
+
+### Controller-owned research turns
+
+A research job is a logical proof task, not one model turn. Prover, falsifier,
+and explorer jobs may run several explicitly requested turns in one Codex
+thread. Each turn is bound to the job and appended as
+`RESEARCH_TURN_COMPLETED`; a further turn requires a controller
+`CONTINUE` directive. Director and audit jobs remain single-turn.
+
+The harness does not arm an App Server `thread/goal` for autonomous jobs.
+Per-thread limits are enforced from token telemetry, avoiding a race in which
+an active native goal could start a continuation outside controller ownership.
+Missing token telemetry or an exhausted controller-owned thread budget blocks
+the next turn fail-closed.
+Any unowned `turn/started` is interrupted and stops the run fail-closed. A
+model's `PROOF` or `COUNTEREXAMPLE` label does not end a logical job: termination
+requires a validated candidate entering the audit frontier, controller-verified
+canonical progress, a concrete execution blocker, or a configured turn bound.
+
+Crash recovery never guesses how far an interrupted proof got. It preserves
+completed-turn events, interrupts the stale remote turn, and requeues the exact
+task under the existing bounded retry policy.
+
+### Canonical proof frontier
+
+Proof obligations live inside each canonical `ClaimGraph` claim (schema v3).
+They have stable content-derived ids, status, dependencies, and evidence paths.
+`proof_frontier` derives `remaining_obligation_ids` and `next_obligation_id`
+from that graph; there is no parallel `proof_state`. Legacy v1/v2 graphs gain a
+deterministic root/gap obligation on load. Only an audited canonical transition
+can discharge or refute an obligation.
+
+Status domains are intentionally separate: `MathStatus` describes the claim
+(`REFUTED` is the code name for the legacy wire value `FAILED`), `TrustStatus`
+describes review state, `EvidenceLevel` describes what was checked, and
+`ExecutionStatus` describes process/transport completion.
 
 ## Failure taxonomy
 

@@ -190,6 +190,15 @@ class HarnessConfig:
             ),
             "migrations_applied": list(self.migrations_applied),
             "campaign": dict(self.raw["campaign"]),
+            "research_continuation": {
+                key: self.raw["engine"][key]
+                for key in (
+                    "research_max_turns",
+                    "reasoning_health_short_tokens",
+                    "reasoning_health_repeated_token_tolerance",
+                    "reasoning_health_retry_limit",
+                )
+            },
             "scheduler": {
                 key: self.raw["scheduler"][key]
                 for key in (
@@ -382,6 +391,16 @@ def _validate_config(raw: dict[str, Any]) -> None:
             raise ValueError(f"engine {key} must be non-negative")
     if float(raw["engine"].get("director_debounce_seconds", 0.2)) < 0:
         raise ValueError("engine director_debounce_seconds must be non-negative")
+    if int(raw["engine"].get("research_max_turns", 1)) < 1:
+        raise ValueError("engine research_max_turns must be positive")
+    if int(raw["engine"].get("reasoning_health_short_tokens", 0)) < 0:
+        raise ValueError("engine reasoning_health_short_tokens must be non-negative")
+    if int(raw["engine"].get("reasoning_health_repeated_token_tolerance", 2)) < 2:
+        raise ValueError(
+            "engine reasoning_health_repeated_token_tolerance must be at least 2"
+        )
+    if int(raw["engine"].get("reasoning_health_retry_limit", 0)) < 0:
+        raise ValueError("engine reasoning_health_retry_limit must be non-negative")
     fraction = float(raw["scheduler"]["independent_exploration_fraction"])
     if not 0 <= fraction <= 1:
         raise ValueError("independent_exploration_fraction must be between 0 and 1")

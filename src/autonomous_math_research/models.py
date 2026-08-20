@@ -26,6 +26,10 @@ class MathStatus(StrEnum):
     PROVED = "PROVED"
     REDUCED_TO = "REDUCED_TO"
     PLAUSIBLE = "PLAUSIBLE"
+    # The persisted v1/v2 wire value is FAILED.  REFUTED is the preferred
+    # name in controller code so mathematical falsity is not confused with an
+    # execution failure; FAILED remains a compatibility alias.
+    REFUTED = "FAILED"
     FAILED = "FAILED"
     OPEN = "OPEN"
     COMPUTATION_ONLY = "COMPUTATION_ONLY"
@@ -49,6 +53,24 @@ class EvidenceLevel(StrEnum):
     E3_REDUNDANT_EXACT = "E3_REDUNDANT_EXACT"
     E4_CERTIFIED = "E4_CERTIFIED"
     E5_FORMAL = "E5_FORMAL"
+
+
+class ExecutionStatus(StrEnum):
+    """Transport/controller lifecycle status, never a mathematical verdict."""
+
+    COMPLETED = "COMPLETED"
+    INCOMPLETE = "INCOMPLETE"
+    FAILED = "FAILED"
+    ERROR = "ERROR"
+    INTERRUPTED = "INTERRUPTED"
+    CANCELLED = "CANCELLED"
+
+
+class ObligationStatus(StrEnum):
+    OPEN = "OPEN"
+    BLOCKED = "BLOCKED"
+    DISCHARGED = "DISCHARGED"
+    REFUTED = "REFUTED"
 
 
 EVIDENCE_RANK = {level.value: rank for rank, level in enumerate(EvidenceLevel)}
@@ -451,6 +473,42 @@ class AuditResult:
 
 
 @dataclass(slots=True)
+class ProofObligation:
+    obligation_id: str
+    statement: str
+    status: str
+    dependencies: list[str]
+    evidence_paths: list[str]
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProofObligation":
+        allowed = {field.name for field in cls.__dataclass_fields__.values()}
+        unknown = set(data) - allowed
+        if unknown:
+            raise ValueError(f"unknown proof obligation fields: {sorted(unknown)}")
+        required = allowed - {"created_at", "updated_at"}
+        missing = required - set(data)
+        if missing:
+            raise ValueError(f"missing proof obligation fields: {sorted(missing)}")
+        normalized = dict(data)
+        normalized.setdefault("created_at", None)
+        normalized.setdefault("updated_at", None)
+        value = cls(**normalized)
+        if value.status not in {item.value for item in ObligationStatus}:
+            raise ValueError(f"invalid proof obligation status: {value.status}")
+        if not value.obligation_id.strip() or not value.statement.strip():
+            raise ValueError("proof obligation id and statement must be non-empty")
+        if len(value.dependencies) != len(set(value.dependencies)):
+            raise ValueError(f"duplicate proof obligation dependencies: {value.obligation_id}")
+        return value
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class Claim:
     claim_id: str
     statement: str
@@ -468,12 +526,17 @@ class Claim:
     parent_claim_id: str | None = None
     source_status: str | None = None
     evidence_level: str = EvidenceLevel.E0_SPECULATIVE
+    proof_obligations: list[ProofObligation] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Claim":
         normalized = dict(data)
         normalized.setdefault("parent_claim_id", None)
         normalized.setdefault("evidence_level", infer_evidence_level(normalized.get("source_status")))
+        normalized["proof_obligations"] = [
+            item if isinstance(item, ProofObligation) else ProofObligation.from_dict(item)
+            for item in normalized.get("proof_obligations", [])
+        ]
         obj = cls(**normalized)
         if obj.math_status not in {x.value for x in MathStatus}:
             raise ValueError(f"invalid math status for {obj.claim_id}")
@@ -540,6 +603,11 @@ class JobOutcome:
     server_error: dict[str, Any] | None = None
     terminal_event: dict[str, Any] | None = None
     raw_output: str | None = None
+    turn_history: list[dict[str, Any]] = field(default_factory=list)
+    canonical_progress: bool = False
+    candidate_accepted: bool = False
+    logical_stop_reason: str | None = None
+    continuation_budget_stop_reason: str | None = None
 
     @property
     def succeeded(self) -> bool:

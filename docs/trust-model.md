@@ -13,9 +13,24 @@ separates generation, evidence, audit, and trust.
 - A candidate event records provenance but is not an audit verdict.
 - A fresh audit verdict remains subject to deterministic and canonical gates.
 - Only an explicit trusted-state transition changes a canonical claim.
+- A role's self-reported `PROOF`, `COUNTEREXAMPLE`, or `COMPLETED` value is not
+  controller-verified state progress and does not reset stagnation.
 
 Evidence levels communicate what was actually checked. They do not silently
 upgrade when a related or narrower subclaim receives stronger evidence.
+
+Canonical `ClaimGraph` proof obligations remain open until the required audit
+and canonical gates close them. Finite computation can attach scoped evidence,
+but it neither closes a universal obligation nor proves a general statement.
+
+## Reasoning health is not correctness
+
+`ReasoningHealthMonitor` observes only operational symptoms such as an
+unexpectedly short reasoning-token count or the same count repeated across
+turns. A signal may request a bounded diagnostic retry or an explicit
+`xhigh -> max` continuation when the provider declares `max` support. Unknown
+telemetry stays unknown. These signals never set mathematical status, trust,
+evidence level, audit verdict, or canonical progress.
 
 ## Falsification-first
 
