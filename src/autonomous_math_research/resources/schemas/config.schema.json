@@ -1,18 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://autonomous-math-ai.invalid/schemas/config-v8.json",
-  "title": "Autonomous Math AI effective configuration v8",
+  "$id": "https://autonomous-math-ai.invalid/schemas/config-v9.json",
+  "title": "Autonomous Math AI effective configuration v9",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "profile", "project", "engine", "scheduler",
+    "schema_version", "profile", "project", "campaign", "engine", "scheduler",
     "budgets", "providers", "models", "audit", "stagnation",
     "rate_limits", "observability", "timeouts", "workspace", "policy"
   ],
   "properties": {
-    "schema_version": {"const": 8},
+    "schema_version": {"const": 9},
     "profile": {"type": "string", "minLength": 1},
     "project": {"$ref": "#/$defs/project"},
+    "campaign": {"$ref": "#/$defs/campaign"},
     "engine": {"$ref": "#/$defs/engine"},
     "scheduler": {"$ref": "#/$defs/scheduler"},
     "budgets": {"$ref": "#/$defs/budgets"},
@@ -49,6 +50,14 @@
       "properties": {
         "name": {"type": "string", "minLength": 1},
         "final_conjecture_claim_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "campaign": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hours", "epoch_hours"],
+      "properties": {
+        "hours": {"$ref": "#/$defs/positiveNumber"},
+        "epoch_hours": {"$ref": "#/$defs/positiveNumber"}
       }
     },
     "engine": {

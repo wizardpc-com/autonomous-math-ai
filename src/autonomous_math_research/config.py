@@ -79,6 +79,14 @@ class HarnessConfig:
         return int(value) if value is not None else None
 
     @property
+    def campaign_hours(self) -> float:
+        return float(self.raw["campaign"]["hours"])
+
+    @property
+    def epoch_hours(self) -> float:
+        return float(self.raw["campaign"]["epoch_hours"])
+
+    @property
     def project_name(self) -> str:
         if self.manifest is not None:
             return self.manifest.project_id
@@ -160,6 +168,60 @@ class HarnessConfig:
             "model_turns_started": 0,
         }
 
+    def summarized(self) -> dict[str, Any]:
+        budgets = self.raw["budgets"]
+        worker = self.raw["policy"]["one_shot_compute_worker"]
+        role_fields = (
+            "provider", "model", "effort", "service_tier", "timeout_seconds",
+            "max_concurrency", "token_limit", "cost_limit_usd",
+        )
+        route_fields = (
+            "provider", "model", "effort", "service_tier", "endpoint", "profile",
+        )
+        return {
+            "valid": True,
+            "config_schema_version": CONFIG_SCHEMA_VERSION,
+            "profile": self.profile_name,
+            "project": self.project_name,
+            "final_claim_id": self.final_conjecture_claim_id,
+            "project_config": str(self.config_path),
+            "user_profile": (
+                str(self.user_profile_path) if self.user_profile_path is not None else None
+            ),
+            "migrations_applied": list(self.migrations_applied),
+            "campaign": dict(self.raw["campaign"]),
+            "scheduler": {
+                key: self.raw["scheduler"][key]
+                for key in (
+                    "max_director", "max_research_workers", "max_audit",
+                    "max_mechanical_subworkers", "independent_exploration_fraction",
+                )
+            },
+            "budgets": {
+                key: budgets.get(key)
+                for key in (
+                    "global_tokens", "mechanical_tokens", "global_cost_usd",
+                    "mechanical_cost_usd", "soft_fraction", "hard_fraction",
+                )
+            },
+            "roles": {
+                role: {key: route.get(key) for key in role_fields}
+                for role, route in sorted(self.raw["models"].items())
+            },
+            "mechanical": {
+                "enabled": worker["enabled"],
+                "selection_policy": worker["selection_policy"],
+                "primary_route": {
+                    key: worker["primary_route"].get(key) for key in route_fields
+                },
+                "fallback_route": {
+                    key: worker["fallback_route"].get(key) for key in route_fields
+                },
+                "backpressure": worker["backpressure"],
+            },
+            "model_turns_started": 0,
+        }
+
 
 def load_config(
     project_root: Path,
@@ -238,7 +300,7 @@ def load_config(
 
 def _validate_config(raw: dict[str, Any]) -> None:
     for section in (
-        "scheduler", "budgets", "providers", "models", "audit",
+        "campaign", "scheduler", "budgets", "providers", "models", "audit",
         "stagnation", "workspace", "policy",
     ):
         if section not in raw:
@@ -261,6 +323,13 @@ def _validate_config(raw: dict[str, Any]) -> None:
         raise ValueError(
             f"effective configuration must use schema v{CONFIG_SCHEMA_VERSION}"
         )
+    campaign = raw["campaign"]
+    campaign_hours = float(campaign["hours"])
+    epoch_hours = float(campaign["epoch_hours"])
+    if campaign_hours <= 0 or epoch_hours <= 0:
+        raise ValueError("campaign hours and epoch_hours must be positive")
+    if epoch_hours > campaign_hours:
+        raise ValueError("campaign epoch_hours must not exceed campaign hours")
     if schema_version >= 3:
         required_concurrency = {
             "max_director", "max_research_workers", "max_audit",

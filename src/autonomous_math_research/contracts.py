@@ -75,6 +75,7 @@ MODEL_PROTOCOL_FAILURES = frozenset({
     "model_output_protocol",
     "model_output_validation",
     "role_semantic_validation",
+    "director_no_runnable_work",
     # compatibility with older event names and controller-local validators
     "output_protocol",
     "output_validation",

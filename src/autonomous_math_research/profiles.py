@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_VERSION = 9
 PROFILE_SCHEMA_VERSION = 1
 BUILTIN_PROFILE_NAME = "codex-app-server-default"
 DEFAULT_GLOBAL_TOKENS = 500_000_000
@@ -160,6 +160,10 @@ def builtin_profile(project_id: str, final_claim_id: str) -> dict[str, Any]:
         "project": {
             "name": project_id,
             "final_conjecture_claim_id": final_claim_id,
+        },
+        "campaign": {
+            "hours": 12.0,
+            "epoch_hours": 2.0,
         },
         "engine": {
             "poll_interval_seconds": 0.1,
@@ -341,10 +345,19 @@ def migrate_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     version = int(value.get("schema_version", 0))
     migrations: list[str] = []
     if version == 7:
-        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        value["schema_version"] = 8
         value["profile"] = BUILTIN_PROFILE_NAME
         _augment_role_routes(value)
         migrations.append("7->8")
+        version = 8
+    if version == 8:
+        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        value["campaign"] = {
+            "hours": 12.0,
+            "epoch_hours": 2.0,
+        }
+        _augment_role_routes(value)
+        migrations.append("8->9")
         return value, migrations
     if version == CONFIG_SCHEMA_VERSION:
         _augment_role_routes(value)

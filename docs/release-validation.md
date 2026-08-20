@@ -13,13 +13,15 @@ The suite covers arbitrary target roots, manifest-owned identity, nondefault
 runtime roots, package resource lookup, immutable campaign input, monotone
 lifecycle, generic mock execution, provider/capability normalization, effort
 mapping failures, secret redaction, strict initialization, unbounded mechanical
-backpressure, recursion prohibition, and conjecture-neutral release scanning.
+backpressure, recursion prohibition, workspace discovery, disposable launcher
+overrides, exact-run monitor routing, and conjecture-neutral release scanning.
 
 Also exercise the zero-model CLI surface:
 
 ```console
 amr config validate --project <temporary-target>
 amr config explain --project <temporary-target>
+amr config summary --project <temporary-target>
 amr validate --project <temporary-target> --strict
 ```
 

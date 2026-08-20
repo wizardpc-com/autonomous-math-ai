@@ -8,7 +8,7 @@ All paths are normalized POSIX paths relative to the project root.
   "schema_version": 1,
   "project_id": "example-project",
   "final_claim_id": "C_ROOT",
-  "config": "autonomous/config.json",
+  "config": "autonomous/config.yaml",
   "claim_graph": "autonomous/state/claim_graph.json",
   "trusted_state": "autonomous/state/nightly_trusted.json",
   "runtime_root": "autonomous",

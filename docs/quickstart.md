@@ -14,6 +14,21 @@ amr --help
 
 From a source checkout, use `python -m pip install .` instead.
 
+### Optional Windows double-click entry
+
+A source checkout includes [`../amr-launcher.cmd`](../amr-launcher.cmd). It is a
+generic bootstrap: do not add project paths or research settings to it. On first
+use, enter a workspace root. The launcher remembers only this root in the user
+LOCALAPPDATA directory and scans Git-visible `autonomous/project.json` files on
+every start. You can also use `amr launcher` from an installed package.
+
+The selected project's manifest points to its single persistent
+`autonomous/config.yaml`. Before dry-run, mock, or real execution, the launcher
+shows a redacted summary. Common numbered edits and allowed
+`dotted.path=JSON-value` inputs create a temporary profile; they never rewrite
+the project. A real run requires the exact phrase `RUN <project_id>`. Each run
+action also opens a separate monitor window pinned to the newly allocated run ID.
+
 ## 2. Create a neutral research target
 
 ```console
@@ -29,7 +44,7 @@ research-target/
 ├── INITIALIZATION_CHECKLIST.md
 ├── autonomous/
 │   ├── project.json
-│   ├── config.json
+│   ├── config.yaml
 │   ├── prompts/
 │   └── state/
 ├── claims/
@@ -55,6 +70,7 @@ policy but must not relax the trust protocol.
 amr validate --project ./research-target
 amr config validate --project ./research-target
 amr config explain --project ./research-target
+amr config summary --project ./research-target
 amr run --project ./research-target --dry-run
 ```
 

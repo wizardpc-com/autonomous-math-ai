@@ -97,6 +97,21 @@ provider and reuses the operator's Codex login. APIs are optional and require an
 explicit OpenAI-compatible or plugin provider selection.
 See [the quickstart](docs/quickstart.md) before enabling live execution.
 
+### Windows one-file launcher
+
+Double-click [`amr-launcher.cmd`](amr-launcher.cmd), or run `amr launcher` after
+installation. The generic launcher never contains a project name, project path,
+or research configuration. On first use it asks for a workspace root and stores
+only that choice in `%LOCALAPPDATA%\autonomous-math-ai\launcher.json`; every
+launch rescans Git-visible `autonomous/project.json` manifests.
+
+After choosing a project, the menu offers validation, strict validation,
+redacted configuration, dry-run, mock, and a separately confirmed real run.
+Persistent settings belong only in the manifest-selected
+`autonomous/config.yaml`. Menu edits are validated temporary overrides and are
+removed after the command. Starting dry-run, mock, or real also opens a separate
+monitor window pinned to that exact run. Keep credentials out of project files.
+
 ## Project contract
 
 Each research target owns a declarative `autonomous/project.json`, mathematical
@@ -125,6 +140,12 @@ Epoch transitions are monotone. On budget exhaustion, operator stop, or
 internal failure, the controller stops dispatching and drains healthy in-flight
 work before sealing. It does not turn an internal failure into queue exhaustion
 or silently discard pending candidates.
+
+The Director receives a controller-owned compatibility view for claim
+representations and audited bridges. If every proposed task fails semantic
+admission, route bookkeeping is retained and the controller requests one bounded
+repair plan. A second plan with no runnable research or audit work pauses the
+campaign cleanly; route updates alone never keep an empty execution queue alive.
 
 ## Controlled mechanical delegation
 

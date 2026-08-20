@@ -8,8 +8,8 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Configuration schema v8, built-in Codex default profile, explicit user
-  profiles, migrations, and redacted `amr config validate/explain`.
+- Configuration schema v9 with project campaign defaults, built-in Codex
+  profile, migrations, and redacted `amr config validate/explain/summary`.
 - Provider capability declarations, per-role provider/model routes, an optional
   OpenAI-compatible adapter, and third-party adapter entry points.
 - `amr init --project-id/--final-claim-id`, a complete neutral scaffold,
@@ -26,6 +26,14 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Codex App Server remains the default provider; API transports are opt-in.
+- A generic Windows launcher and `amr launcher` discover project manifests from
+  a remembered workspace, keep persistent settings in each project's config,
+  open a run-pinned monitor window, and provide validated disposable overrides
+  for dry-run, mock, and explicitly confirmed real runs.
+- Director snapshots now expose controller-owned representation compatibility
+  and latest route state. Plans whose tasks all fail semantic admission receive
+  one bounded repair turn, then pause cleanly instead of reaching an idle
+  controller invariant failure; route-only updates do not count as runnable work.
 - New-project token defaults are 500 million for main roles and 1.5 billion for
   mechanical workers; existing schema-v7 configs retain their pinned limits.
 - Mechanical delegation is preferred for finite, mechanically checkable work

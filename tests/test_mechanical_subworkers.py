@@ -1786,7 +1786,7 @@ class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
         bad.write_text(json.dumps(raw), encoding="utf-8")
         migrated = load_config(self.project, bad)
         self.assertIsNone(migrated.max_mechanical_subworkers)
-        self.assertEqual(migrated.migrations_applied, ("7->8",))
+        self.assertEqual(migrated.migrations_applied, ("7->8", "8->9"))
 
     def test_subprocess_runner_executes_run_local_pinned_sources(self) -> None:
         manifest_path = self.project / "autonomous/runs/pin-test/policy/MANIFEST.json"

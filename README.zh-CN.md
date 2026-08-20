@@ -72,6 +72,11 @@ campaign → epoch → job
 epoch 到期、预算耗尽、operator stop 或内部失败后，controller 停止派发新任务并等待
 健康在途任务自然结束，再封存状态。内部错误不会被伪装成“队列耗尽”。
 
+Director 会收到由 controller 生成的 claim 表示兼容性与已审计 bridge 摘要。若本轮全部
+任务均未通过语义准入，route 记录仍会保留，但 controller 只进行一次有界修复重规划；若
+第二次仍无可执行 research/audit 工作，则干净暂停 campaign。单独的 route update 不会让
+空执行队列继续运行。
+
 ## 机械子工
 
 研究和审计角色只能通过 controller 管理的 broker 请求有限机械任务。默认使用
@@ -95,5 +100,18 @@ CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超
 [配置文档](docs/configuration.zh-CN.md)、[Provider 文档](docs/providers.zh-CN.md)、
 [架构](docs/architecture.md)、[可信模型](docs/trust-model.md)和
 [安全策略](SECURITY.md)。
+
+### Windows 单文件启动器
+
+双击 [`amr-launcher.cmd`](amr-launcher.cmd)，或在安装后运行 `amr launcher`。这个通用
+入口不保存项目名称、项目路径或研究配置。首次使用时输入工作区根目录；入口只把该选择
+保存到 `%LOCALAPPDATA%\autonomous-math-ai\launcher.json`，以后每次重新扫描 Git 可见的
+`autonomous/project.json`。
+
+选择项目后可执行 validate、strict、脱敏配置查看、dry-run、mock，以及需要输入
+`RUN <project_id>` 的真实运行。持久设置只放在 manifest 指定的
+`autonomous/config.yaml`；菜单修改是经过完整预检的一次性临时覆盖，命令结束后删除。
+dry-run、mock 或 real 启动时还会同步打开精确绑定本次 run 的独立监视窗口。密钥只能
+使用凭据引用，不能写入入口或项目配置。
 
 本项目采用 [MIT License](LICENSE)。

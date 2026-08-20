@@ -99,7 +99,12 @@ def director_prompt(
         f"{render_contract_keys(DIRECTOR_PLAN_KEYS)}. The controller owns termination, "
         "pruning, candidate identity, and audit lease creation. audit_priorities may only "
         "reprioritize an existing fingerprint. Every spawn task must declare its complete "
-        "representation contract; do not emit output_contract or independent_exploration. "
+        "representation contract; use the controller-owned representation_compatibility "
+        "view in the compact snapshot before declaring dependencies. Reuse the exact known "
+        "contract for same-representation work. If no audited bridge exists, schedule a "
+        "bounded bridge-producing task without consuming the incompatible dependency first. "
+        "Route updates are durable bookkeeping but do not count as runnable queue work. "
+        "Do not emit output_contract or independent_exploration. "
         "Return the schema-valid Director JSON immediately."
     )
 

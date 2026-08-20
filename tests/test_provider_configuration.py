@@ -59,7 +59,8 @@ class ProviderConfigurationTests(unittest.TestCase):
 
     def test_default_profile_is_codex_and_new_budgets_are_separate(self) -> None:
         config = load_config(self.project)
-        self.assertEqual(config.raw["schema_version"], 8)
+        self.assertEqual(config.raw["schema_version"], 9)
+        self.assertEqual(config.raw["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
         self.assertEqual(config.profile_name, "codex-app-server-default")
         self.assertTrue(all(
             route["provider"] == "codex" for route in config.raw["models"].values()
@@ -141,6 +142,47 @@ class ProviderConfigurationTests(unittest.TestCase):
         serialized = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("test-secret-never-read", serialized)
         self.assertIn("OPENAI_API_KEY", serialized)
+
+    def test_config_summary_and_v8_campaign_migration_are_zero_model(self) -> None:
+        config_path = self.project / "autonomous" / "config.yaml"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["schema_version"] = 8
+        raw.pop("campaign", None)
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        config = load_config(self.project)
+        self.assertEqual(config.migrations_applied, ("8->9",))
+        self.assertEqual(config.campaign_hours, 12.0)
+        self.assertEqual(config.epoch_hours, 2.0)
+
+        code, payload = self._cli([
+            "config", "summary", "--project", str(self.project),
+        ])
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["config_schema_version"], 9)
+        self.assertEqual(payload["campaign"]["epoch_hours"], 2.0)
+        self.assertEqual(payload["model_turns_started"], 0)
+
+        code, payload = self._cli([
+            "config", "migrate", "--project", str(self.project), "--write",
+        ])
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["written"])
+        persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["schema_version"], 9)
+        self.assertEqual(persisted["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
+        self.assertEqual(payload["model_turns_started"], 0)
+
+    def test_campaign_epoch_must_not_exceed_campaign_hours(self) -> None:
+        profile = {
+            "profile_schema_version": 1,
+            "name": "bad-campaign",
+            "extends": "codex-app-server-default",
+            "overrides": {"campaign": {"hours": 1, "epoch_hours": 2}},
+        }
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            load_config(self.project, profile_path=self._profile(profile))
 
     def test_provider_capabilities_reject_unsupported_structured_mode(self) -> None:
         raw = json.loads(
