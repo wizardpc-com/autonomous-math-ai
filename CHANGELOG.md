@@ -22,6 +22,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selected research project rather than the harness checkout.
 - Conjecture-neutral catalog, evidence, lifecycle, policy, and mechanical
   worker regression suites migrated from the former monorepo integration.
+- Controller-owned same-thread multi-turn research jobs, turn ownership
+  detection, canonical `ClaimGraph` proof obligations/frontiers, and a
+  diagnostic-only reasoning health monitor.
 
 ### Changed
 
@@ -40,6 +43,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while remaining one-shot, nonrecursive, and outside canonical trust.
 - The harness now lives in its own source checkout and research repositories
   integrate exclusively through the installed `amr` CLI and project manifest.
+- App Server active goals are no longer armed for autonomous jobs; token limits
+  remain controller-enforced, unowned native continuations fail closed, and
+  only controller-verified canonical progress resets stagnation.
 
 ### Planned
 

@@ -40,6 +40,12 @@ mechanical delegation without treating model output as mathematical truth.
   incompatible mathematical representations fail closed.
 - **Protocol preflight:** mock and live App Server execution use the same
   Structured Outputs compatibility checks.
+- **Controller-owned continuation:** a hard research task can use bounded,
+  explicit same-thread turns; a completed turn or self-reported proof does not
+  by itself complete the logical task. Missing token telemetry or an exhausted
+  controller budget blocks further continuation fail-closed.
+- **Canonical proof frontier:** stable proof obligations live in `ClaimGraph`,
+  and only audited canonical progress can close them or reset stagnation.
 
 ## Installation
 

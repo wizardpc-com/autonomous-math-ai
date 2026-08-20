@@ -3,26 +3,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-MEANINGFUL = {
-    "PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION",
-    "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE",
-}
-
-
 @dataclass(slots=True)
 class StagnationTracker:
     threshold: int
     attempts: dict[str, list[str]] = field(default_factory=dict)
 
-    def record(self, claim_id: str, outcome: str) -> bool:
+    def record(
+        self,
+        claim_id: str,
+        outcome: str,
+        *,
+        canonical_progress: bool = False,
+    ) -> bool:
         history = self.attempts.setdefault(claim_id, [])
         history.append(outcome)
-        if outcome in MEANINGFUL:
+        if canonical_progress:
             history.clear()
             return False
         if len(history) > self.threshold:
             del history[:-self.threshold]
-        return len(history) >= self.threshold and all(item not in MEANINGFUL for item in history[-self.threshold:])
+        return len(history) >= self.threshold
 
     def diversification_constraint(self, claim_id: str, dominant_route: str) -> dict[str, str]:
         return {

@@ -25,6 +25,17 @@ concurrency, budgets, each role route, and mechanical routing. Schema v9 adds
 the corresponding CLI flags are absent, `amr run` uses these project values;
 explicit `--hours` and `--epoch-hours` remain highest priority.
 
+The `engine` section also controls controller-owned research continuation:
+
+- `research_max_turns` (default `4`) bounds turns in one logical research job;
+- `reasoning_health_short_tokens` (default `600`) is a diagnostic threshold;
+- `reasoning_health_repeated_token_tolerance` (default `2`) detects repeated
+  counts;
+- `reasoning_health_retry_limit` (default `2`) bounds diagnostic retry/escalation.
+
+These settings never relax audit or canonical gates. App Server goals are not
+armed; per-thread token limits remain controller-enforced from telemetry.
+
 ## Role routes
 
 Each entry under `models` independently declares:

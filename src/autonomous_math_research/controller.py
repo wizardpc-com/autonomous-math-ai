@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from .app_server import redact_auth_material
 from .audit_gate import AuditGate
-from .backend import AppServerBackend, CodexBackend, MockCodexBackend
+from .backend import AppServerBackend, CodexBackend, MockCodexBackend, TurnDirective
 from .claim_graph import ClaimGraph
 from .config import HarnessConfig, default_max_audit
 from .contracts import (
@@ -65,6 +65,8 @@ from .provider_backend import ProviderRouterBackend
 from .provider_config import mapped_reasoning_effort, validate_service_tier
 from .reporting import write_report
 from .representation import RepresentationContract, require_compatible_representations
+from .reasoning_health import ReasoningHealthMonitor
+from .research_job import ResearchTurnPolicy
 from .resources import schema_resource
 from .schema import (
     OutputSchemaCompatibilityError, load_schema, preflight_output_schema_files,
@@ -595,6 +597,17 @@ class AutonomousController:
             rate_stop_percent=float(config.raw["rate_limits"].get("stop_percent", 98)),
         )
         self.stagnation = StagnationTracker(int(config.raw["stagnation"]["attempt_threshold"]))
+        engine_config = config.raw["engine"]
+        self.research_turn_policy = ResearchTurnPolicy(
+            max_turns=int(engine_config["research_max_turns"]),
+        )
+        self.reasoning_health = ReasoningHealthMonitor(
+            short_reasoning_tokens=int(engine_config["reasoning_health_short_tokens"]),
+            repeated_token_tolerance=int(
+                engine_config["reasoning_health_repeated_token_tolerance"]
+            ),
+            retry_limit=int(engine_config["reasoning_health_retry_limit"]),
+        )
         self.workspace = WorkspaceManager(
             config.workspace_root or config.project_root, self.run_dir,
         )
@@ -1005,7 +1018,7 @@ class AutonomousController:
 
     def _begin_finalization_if_resolved(self, source: str) -> bool:
         claim = self._final_claim()
-        if claim is None or claim.math_status not in {MathStatus.PROVED, MathStatus.FAILED}:
+        if claim is None or claim.math_status not in {MathStatus.PROVED, MathStatus.REFUTED}:
             return False
         if claim.trust_status not in {
             TrustStatus.AUDITED_NIGHTLY,
@@ -1014,7 +1027,7 @@ class AutonomousController:
         }:
             return False
         self.final_conjecture_proved = claim.math_status == MathStatus.PROVED
-        self.final_conjecture_refuted = claim.math_status == MathStatus.FAILED
+        self.final_conjecture_refuted = claim.math_status == MathStatus.REFUTED
         if self._internal_failure:
             self.store.append("FINAL_CONJECTURE_RESOLVED_AFTER_INTERNAL_FAILURE", {
                 "claim_id": self.final_conjecture_claim_id,
@@ -1821,6 +1834,19 @@ class AutonomousController:
     async def _trace_notification(self, message: dict[str, Any]) -> None:
         method = str(message.get("method", ""))
         params = message.get("params") or {}
+        if method in {
+            "amr/unmanagedContinuation",
+            "amr/unmanagedContinuationInterruptFailed",
+        }:
+            reason = "App Server started a continuation outside controller ownership"
+            self._internal_failure = True
+            self.stop_for_review = reason
+            self.store.append("UNMANAGED_CONTINUATION_DETECTED", {
+                "thread_id": params.get("threadId"),
+                "turn_id": params.get("turnId"),
+                "action": "interrupt_and_fail_closed",
+                "interrupt_error_type": params.get("errorType"),
+            })
         if method == "model/rerouted":
             thread_id = str(params.get("threadId") or "")
             identity = self._live_identity(thread_id)
@@ -1885,6 +1911,7 @@ class AutonomousController:
         if method in {
             "thread/started", "turn/started", "turn/completed", "thread/tokenUsage/updated",
             "account/rateLimits/updated", "thread/goal/updated", "model/rerouted", "warning",
+            "amr/unmanagedContinuation", "amr/unmanagedContinuationInterruptFailed",
         }:
             self.store.append("APP_SERVER_NOTIFICATION", {
                 "method": method,
@@ -2168,6 +2195,144 @@ class AutonomousController:
             return int(estimates[role])
         return int(estimates.get(cost_tier, estimates.get("MEDIUM", 50000)))
 
+    def _canonical_progress_marker(self, claim_id: str) -> str:
+        claim = self.graph.claims.get(claim_id)
+        if claim is None:
+            return "missing"
+        return stable_hash({
+            "math_status": claim.math_status,
+            "trust_status": claim.trust_status,
+            "evidence_level": claim.evidence_level,
+            "evidence_paths": sorted(claim.evidence_paths),
+            "known_counterexamples": sorted(claim.known_counterexamples),
+            "proof_frontier": self.graph.proof_frontier(claim_id),
+        })
+
+    def _task_has_accepted_candidate(self, task_id: str) -> bool:
+        for fingerprint in self.inbox.accepted:
+            path = self.inbox.candidate_root / f"{fingerprint}.json"
+            if not path.is_file():
+                continue
+            try:
+                candidate = CandidateEvent.from_dict(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if candidate.producer_task_id == task_id:
+                return True
+        return False
+
+    def _max_effort_supported(self, role: str) -> bool:
+        provider = self.config.provider_for(role)
+        supported = (
+            provider.get("capabilities", {}).get("reasoning", {})
+            .get("supported_efforts", [])
+        )
+        return "max" in supported
+
+    async def _control_research_turn(
+        self,
+        *,
+        job_id: str,
+        task: ResearchTask,
+        canonical_before: str,
+        outcome: JobOutcome,
+        turn_index: int,
+    ) -> TurnDirective:
+        if outcome.thread_id and outcome.turn_id:
+            binding = (str(outcome.thread_id), str(outcome.turn_id))
+            previous = self._bound_jobs.get(job_id)
+            if previous != binding:
+                self._bound_jobs[job_id] = binding
+                self.store.append(
+                    "JOB_BOUND" if previous is None else "JOB_REBOUND",
+                    {
+                        "job_id": job_id,
+                        "thread_id": binding[0],
+                        "turn_id": binding[1],
+                        **(
+                            {"previous_turn_id": previous[1]}
+                            if previous is not None else {}
+                        ),
+                    },
+                )
+        # Pull worker-file evidence into the controller before deciding whether
+        # a role's completed turn also completed the logical task.
+        await self._poll_filesystem_candidates()
+        await self._process_candidate_queue()
+        candidate_accepted = self._task_has_accepted_candidate(task.task_id)
+        canonical_progress = (
+            self._canonical_progress_marker(task.target_claim) != canonical_before
+            and self.graph.claims.get(task.target_claim) is not None
+            and self.graph.claims[task.target_claim].trust_status in {
+                TrustStatus.CANONICAL_TRUSTED,
+                TrustStatus.AUDITED_NIGHTLY,
+                TrustStatus.FORMALLY_VERIFIED,
+            }
+        )
+        outcome.candidate_accepted = candidate_accepted
+        outcome.canonical_progress = canonical_progress
+        health = self.reasoning_health.observe(
+            job_id=job_id,
+            turn_index=turn_index,
+            effort=str(outcome.reasoning_effort or ""),
+            usage=outcome.token_usage,
+            telemetry=outcome.token_telemetry,
+            max_effort_supported=self._max_effort_supported(task.role),
+        )
+        directive = self.research_turn_policy.decide(
+            result=outcome.result,
+            turn_index=turn_index,
+            candidate_accepted=candidate_accepted,
+            canonical_progress=canonical_progress,
+            health_signal=health,
+            budget_stop_reason=outcome.continuation_budget_stop_reason,
+        )
+        self.store.append("RESEARCH_TURN_COMPLETED", {
+            "job_id": job_id,
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "thread_id": outcome.thread_id,
+            "turn_id": outcome.turn_id,
+            "turn_index": turn_index,
+            "execution_status": "COMPLETED",
+            "role_reported_result_type": outcome.result.get("result_type"),
+            "role_reported_status": outcome.result.get("status"),
+            "candidate_accepted": candidate_accepted,
+            "canonical_progress": canonical_progress,
+            "reasoning_health": health.to_dict(),
+            "controller_directive": (
+                "CONTINUE" if directive.continue_same_thread else "STOP"
+            ),
+            "controller_reason": directive.reason,
+            "next_effort": directive.effort_override,
+            "token_usage": outcome.token_usage.to_dict(),
+            "token_telemetry": outcome.token_telemetry,
+        })
+        if directive.continue_same_thread:
+            self.store.append("RESEARCH_TURN_CONTINUATION_REQUESTED", {
+                "job_id": job_id,
+                "task_id": task.task_id,
+                "claim_id": task.target_claim,
+                "completed_turn_id": outcome.turn_id,
+                "next_turn_index": turn_index + 1,
+                "same_thread": True,
+                "reason": directive.reason,
+                "effort_override": directive.effort_override,
+            })
+        else:
+            self.store.append("RESEARCH_LOGICAL_JOB_TERMINAL", {
+                "job_id": job_id,
+                "task_id": task.task_id,
+                "claim_id": task.target_claim,
+                "turn_count": turn_index,
+                "reason": directive.reason,
+                "candidate_accepted": candidate_accepted,
+                "canonical_progress": canonical_progress,
+            })
+        return directive
+
     def recover(self) -> None:
         records = self.store.replay()
         last_director_success_sequence = max(
@@ -2258,7 +2423,11 @@ class AutonomousController:
                         payload.get("useful"), payload.get("cost_usd"),
                     )
                 if payload.get("claim_id") and payload.get("role") in {Role.PROVER, Role.FALSIFIER, Role.EXPLORER}:
-                    self.stagnation.record(payload["claim_id"], str((payload.get("result") or {}).get("result_type", "NO_PROGRESS")))
+                    self.stagnation.record(
+                        payload["claim_id"],
+                        str((payload.get("result") or {}).get("result_type", "NO_PROGRESS")),
+                        canonical_progress=bool(payload.get("canonical_progress", False)),
+                    )
             elif event["kind"] == "JOB_CANCELLED":
                 payload = event["payload"]
                 self.completed_jobs.append(payload)
@@ -3979,6 +4148,18 @@ class AutonomousController:
                 f"token reservation rejected after scheduler admission: {task.role} {estimated_tokens}"
             )
         timeout = self._task_timeout(task.role)
+        continuation_checker = getattr(
+            self.backend, "supports_same_thread_continuation", None,
+        )
+        same_thread_research = bool(
+            kind == "research"
+            and callable(continuation_checker)
+            and continuation_checker(task.role)
+        )
+        logical_timeout = timeout * (
+            self.research_turn_policy.max_turns if same_thread_research else 1
+        )
+        canonical_before = self._canonical_progress_marker(task.target_claim)
         broker_client_sha256: str | None = None
         broker_config_sha256: str | None = None
         if task.role in MECHANICAL_PARENT_ROLES:
@@ -4006,12 +4187,32 @@ class AutonomousController:
             self.governor.release(job_id)
             raise RuntimeError("mechanical broker command marker was not resolved")
         try:
+            backend_kwargs: dict[str, Any] = {
+                "job_id": job_id,
+                "task": task,
+                "prompt": prompt,
+                "output_schema": schema,
+                "workspace": workspace,
+                "writable_roots": writable,
+                "timeout": timeout,
+                "token_budget": self._server_thread_budget(task.role),
+                "candidate_sink": lambda event, assigned=task: self._candidate_sink(
+                    event, assigned
+                ),
+                "skill_path": Path(self._policy_view(task.role)["skill_snapshot"]),
+            }
+            if same_thread_research:
+                backend_kwargs["turn_controller"] = (
+                    lambda outcome, turn_index: self._control_research_turn(
+                        job_id=job_id,
+                        task=task,
+                        canonical_before=canonical_before,
+                        outcome=outcome,
+                        turn_index=turn_index,
+                    )
+                )
             future = asyncio.create_task(self.backend.run_job(
-                job_id=job_id, task=task, prompt=prompt, output_schema=schema,
-                workspace=workspace, writable_roots=writable, timeout=timeout,
-                token_budget=self._server_thread_budget(task.role),
-                candidate_sink=lambda event, assigned=task: self._candidate_sink(event, assigned),
-                skill_path=Path(self._policy_view(task.role)["skill_snapshot"]),
+                **backend_kwargs,
             ))
         except Exception:
             self.governor.release(job_id)
@@ -4022,7 +4223,7 @@ class AutonomousController:
             json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
         )
         self.active[job_id] = ActiveJob(
-            job_id, task, future, time.monotonic(), timeout, kind,
+            job_id, task, future, time.monotonic(), logical_timeout, kind,
             str(workspace), started_at, workspace_metadata,
             selected_model, selected_effort,
             selected_provider, selected_profile,
@@ -4031,7 +4232,12 @@ class AutonomousController:
         )
         self.store.append("JOB_STARTED", {
             "job_id": job_id, "task_id": task.task_id, "role": task.role,
-            "claim_id": task.target_claim, "workspace": str(workspace), "timeout": timeout,
+            "claim_id": task.target_claim, "workspace": str(workspace),
+            "timeout": logical_timeout, "per_turn_timeout": timeout,
+            "same_thread_multi_turn": same_thread_research,
+            "max_turns": (
+                self.research_turn_policy.max_turns if same_thread_research else 1
+            ),
             "start_time": started_at, "workspace_metadata": workspace_metadata,
             "estimated_token_reservation": estimated_tokens,
             "model": selected_model, "reasoning_effort": selected_effort,
@@ -6098,6 +6304,11 @@ class AutonomousController:
                 event.representation_contract.to_dict()
             )
             self.graph.save()
+            self.stagnation.record(
+                event.claim_id,
+                f"AUDITED_{event.type}",
+                canonical_progress=True,
+            )
             if self.persist_shared_state:
                 atomic_write_json(self.layout.trusted_state_path, {
                     "schema_version": 3,
@@ -6170,7 +6381,7 @@ class AutonomousController:
         candidate_proves = event.type in {"THEOREM_CANDIDATE", "KEY_LEMMA", "EQUIVALENCE"}
         if claim.math_status == MathStatus.PROVED and candidate_refutes:
             return "audited counterexample conflicts with an already trusted proof"
-        if claim.math_status == MathStatus.FAILED and candidate_proves:
+        if claim.math_status == MathStatus.REFUTED and candidate_proves:
             return "audited proof conflicts with an already trusted refutation"
         return None
 
@@ -6258,10 +6469,7 @@ class AutonomousController:
             )
             return
         result_type = str(outcome.result.get("result_type", "NO_PROGRESS"))
-        meaningful = result_type in {
-            "PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION",
-            "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE",
-        }
+        meaningful = bool(outcome.canonical_progress or outcome.candidate_accepted)
         self.route_ledger.append(
             route_id=task.route_family,
             representation_id=task.representation_id,
@@ -6280,10 +6488,17 @@ class AutonomousController:
             "claim_id": task.target_claim,
             "role": task.role,
             "result_type": result_type,
+            "candidate_accepted": outcome.candidate_accepted,
+            "canonical_progress": outcome.canonical_progress,
+            "logical_stop_reason": outcome.logical_stop_reason,
             "main_finding": _bounded_value(outcome.result.get("main_finding")),
         })
         self._replan_after_wave = True
-        if self.stagnation.record(outcome.claim_id, result_type):
+        if self.stagnation.record(
+            outcome.claim_id,
+            result_type,
+            canonical_progress=bool(outcome.canonical_progress),
+        ):
             claim = self.graph.claims.get(outcome.claim_id)
             if claim:
                 penalty = float(self.config.raw["stagnation"].get("priority_penalty", 0.2))
@@ -6397,10 +6612,9 @@ class AutonomousController:
     def _is_useful(outcome: JobOutcome) -> bool:
         if not outcome.succeeded:
             return False
-        return str(outcome.result.get("result_type", "")) in {
-            "PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION",
-            "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE",
-        } or outcome.role in {Role.DIRECTOR, Role.AUDITOR, Role.EVALUATOR_AUDITOR}
+        if outcome.role in {Role.DIRECTOR, Role.AUDITOR, Role.EVALUATOR_AUDITOR}:
+            return True
+        return bool(outcome.canonical_progress or outcome.candidate_accepted)
 
     def _error_rate_exceeded(self) -> bool:
         fatal_kinds = set(LOCAL_STRUCTURAL_FAILURES) | {

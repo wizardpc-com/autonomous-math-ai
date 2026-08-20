@@ -175,6 +175,10 @@ def builtin_profile(project_id: str, final_claim_id: str) -> dict[str, Any]:
             "model_protocol_max_retries": 1,
             "director_max_retries": 1,
             "director_debounce_seconds": 2.0,
+            "research_max_turns": 4,
+            "reasoning_health_short_tokens": 600,
+            "reasoning_health_repeated_token_tolerance": 2,
+            "reasoning_health_retry_limit": 2,
         },
         "scheduler": {
             "max_director": 1,
@@ -307,6 +311,14 @@ def _augment_role_routes(config: dict[str, Any]) -> None:
         str(config.get("project", {}).get("final_conjecture_claim_id") or "C_ROOT"),
     )
     config.setdefault("providers", deepcopy(defaults["providers"]))
+    engine = config.setdefault("engine", {})
+    for key in (
+        "research_max_turns",
+        "reasoning_health_short_tokens",
+        "reasoning_health_repeated_token_tolerance",
+        "reasoning_health_retry_limit",
+    ):
+        engine.setdefault(key, defaults["engine"][key])
     for role, route in list(config.get("models", {}).items()):
         base = deepcopy(defaults["models"].get(role) or defaults["models"]["explorer"])
         if isinstance(route, dict):

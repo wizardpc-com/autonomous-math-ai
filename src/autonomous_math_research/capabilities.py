@@ -11,7 +11,6 @@ from uuid import uuid4
 
 REQUIRED_METHODS = [
     "thread/start", "thread/resume", "thread/fork",
-    "thread/goal/set", "thread/goal/get", "thread/goal/clear",
     "turn/start", "turn/steer", "turn/interrupt",
     "permissionProfile/list", "account/rateLimits/read", "account/usage/read",
 ]

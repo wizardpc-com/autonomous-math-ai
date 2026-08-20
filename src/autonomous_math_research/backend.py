@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Protocol
@@ -10,7 +11,8 @@ from uuid import uuid4
 from .app_server import (
     AppServerClient, AppServerError, AppServerRequestError, AppServerTurnFailed,
     AppServerTurnTimeout, ModelRoutePolicyError, ServiceTierPolicyError,
-    StructuredOutputProtocolError, attest_model_route, attest_no_service_tier,
+    StructuredOutputProtocolError, UnmanagedContinuationError,
+    attest_model_route, attest_no_service_tier,
     parse_structured_message, redact_auth_material,
 )
 from .config import HarnessConfig
@@ -22,6 +24,31 @@ from .schema import (
 
 
 CandidateSink = Callable[[CandidateEvent], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class TurnDirective:
+    continue_same_thread: bool
+    reason: str
+    next_prompt: str | None = None
+    effort_override: str | None = None
+
+    @classmethod
+    def stop(cls, reason: str) -> "TurnDirective":
+        return cls(False, reason)
+
+    @classmethod
+    def continue_with(
+        cls,
+        prompt: str,
+        *,
+        reason: str = "controller requested same-thread continuation",
+        effort_override: str | None = None,
+    ) -> "TurnDirective":
+        return cls(True, reason, prompt, effort_override)
+
+
+TurnController = Callable[[JobOutcome, int], Awaitable[TurnDirective]]
 
 
 def _server_error_details(raw: dict[str, Any]) -> dict[str, Any]:
@@ -67,6 +94,8 @@ def _classify_failure(exc: Exception) -> tuple[str, bool, dict[str, Any] | None]
         }
     if isinstance(exc, ServiceTierPolicyError):
         return "service_tier_policy", False, None
+    if isinstance(exc, UnmanagedContinuationError):
+        return "unmanaged_continuation", False, None
     if isinstance(exc, ModelRoutePolicyError):
         return "model_route_policy", False, {
             "phase": exc.phase,
@@ -126,10 +155,12 @@ class CodexBackend(Protocol):
         token_budget: int | None,
         candidate_sink: CandidateSink,
         skill_path: Path | None = None,
+        turn_controller: TurnController | None = None,
     ) -> JobOutcome: ...
     async def cancel(self, job_id: str) -> bool: ...
     async def rate_limits(self) -> dict[str, Any] | None: ...
     def set_economy_mode(self, enabled: bool) -> None: ...
+    def supports_same_thread_continuation(self, role: str) -> bool: ...
 
 
 class AppServerBackend:
@@ -155,6 +186,9 @@ class AppServerBackend:
         route = self.config.route_for(role)
         return str(route["model"]), str(route["mapped_effort"])
 
+    def supports_same_thread_continuation(self, role: str) -> bool:
+        return role in {"prover", "falsifier", "explorer"}
+
     async def start(self) -> None:
         await self.client.start()
 
@@ -174,6 +208,7 @@ class AppServerBackend:
         token_budget: int | None,
         candidate_sink: CandidateSink,
         skill_path: Path | None = None,
+        turn_controller: TurnController | None = None,
     ) -> JobOutcome:
         del candidate_sink  # Real workers submit early candidates through the filesystem helper.
         route_config = self.config.route_for(task.role)
@@ -196,6 +231,7 @@ class AppServerBackend:
         usage = TokenUsage()
         token_telemetry = "unknown"
         raw_output = ""
+        turn_history: list[dict[str, Any]] = []
         try:
             validate_output_schema_compatibility(
                 output_schema, schema_path=f"{task.output_contract} ({task.role})",
@@ -209,48 +245,119 @@ class AppServerBackend:
             # tier override cannot consume research tokens under a forbidden mode.
             observed_tier = attest_no_service_tier(thread, "thread/start")
             attest_model_route(thread, "thread/start", model)
-            if token_budget:
-                await self.client.set_goal(thread_id, task.exact_objective, token_budget)
-            # start_turn returns only after completion; active cancellation becomes visible once
-            # turn/start has returned its id through notifications, so timeout is the primary guard.
-            completed, raw_output, usage, token_telemetry = await self.client.start_turn(
-                thread_id=thread_id,
-                prompt=prompt,
-                cwd=workspace,
-                model=model,
-                effort=effort,
-                output_schema=output_schema,
-                writable_roots=writable_roots,
-                timeout=timeout,
-                skill_path=skill_path,
-                on_started=lambda turn_id: self.active.__setitem__(job_id, (thread_id, turn_id)),
-            )
-            turn = completed.get("turn") or {}
-            turn_id = turn.get("id")
-            turn_tier = attest_no_service_tier(turn, "turn/completed")
-            if turn_tier != "unobservable":
-                observed_tier = turn_tier
-            attest_model_route(turn, "turn/completed", model)
-            if str(turn.get("status") or "").lower() != "completed":
-                raise AppServerTurnFailed(
-                    turn,
-                    raw_output=raw_output,
-                    token_usage=usage,
-                    token_telemetry=token_telemetry,
+            # Never arm an App Server goal for autonomous work.  An active
+            # server goal may create native continuations outside controller
+            # ownership.  Per-thread budgets are enforced from observed token
+            # notifications by the deterministic controller instead.
+            current_prompt = prompt
+            current_effort = effort
+            turn_index = 0
+            final_outcome: JobOutcome | None = None
+            while True:
+                turn_index += 1
+                completed, raw_output, turn_usage, turn_telemetry = await self.client.start_turn(
+                    thread_id=thread_id,
+                    prompt=current_prompt,
+                    cwd=workspace,
+                    model=model,
+                    effort=current_effort,
+                    output_schema=output_schema,
+                    writable_roots=writable_roots,
+                    timeout=timeout,
+                    skill_path=skill_path,
+                    on_started=lambda active_turn_id: self.active.__setitem__(
+                        job_id, (thread_id, active_turn_id)
+                    ),
                 )
-            parsed = parse_structured_message(raw_output)
-            validate(parsed, output_schema)
-            return JobOutcome(
-                job_id=job_id, task_id=task.task_id, role=task.role, claim_id=task.target_claim,
-                status=str(turn.get("status", "completed")), result=parsed,
-                thread_id=thread_id, turn_id=turn_id, model=model, reasoning_effort=effort,
-                provider=self.provider_name,
-                provider_profile=route_config.get("profile"),
-                requested_service_tier=None, observed_service_tier=observed_tier,
-                token_usage=usage, token_telemetry=token_telemetry,
-                cost_usd=None, cost_telemetry="unknown",
-                artifact_paths=list(parsed.get("artifact_paths", [])),
-            )
+                turn = completed.get("turn") or {}
+                turn_id = str(turn.get("id") or "") or None
+                turn_tier = attest_no_service_tier(turn, "turn/completed")
+                if turn_tier != "unobservable":
+                    observed_tier = turn_tier
+                attest_model_route(turn, "turn/completed", model)
+                if str(turn.get("status") or "").lower() != "completed":
+                    raise AppServerTurnFailed(
+                        turn,
+                        raw_output=raw_output,
+                        token_usage=turn_usage,
+                        token_telemetry=turn_telemetry,
+                    )
+                parsed = parse_structured_message(raw_output)
+                validate(parsed, output_schema)
+                # App Server thread usage is cumulative. Keep the largest
+                # observed component rather than double-counting later turns.
+                for field_name in TokenUsage.__dataclass_fields__:
+                    setattr(
+                        usage,
+                        field_name,
+                        max(getattr(usage, field_name), getattr(turn_usage, field_name)),
+                    )
+                if turn_telemetry == "observed":
+                    token_telemetry = "observed"
+                partial = JobOutcome(
+                    job_id=job_id, task_id=task.task_id, role=task.role,
+                    claim_id=task.target_claim, status="completed", result=parsed,
+                    thread_id=thread_id, turn_id=turn_id, model=model,
+                    reasoning_effort=current_effort, provider=self.provider_name,
+                    provider_profile=route_config.get("profile"),
+                    requested_service_tier=None,
+                    observed_service_tier=observed_tier,
+                    token_usage=turn_usage, token_telemetry=turn_telemetry,
+                    cost_usd=None, cost_telemetry="unknown",
+                    artifact_paths=list(parsed.get("artifact_paths", [])),
+                )
+                if token_budget is not None:
+                    if turn_telemetry != "observed":
+                        partial.continuation_budget_stop_reason = (
+                            "token telemetry unavailable; bounded continuation stopped fail-closed"
+                        )
+                    elif turn_usage.total_tokens >= token_budget:
+                        partial.continuation_budget_stop_reason = (
+                            "controller token budget reached"
+                        )
+                history_row = {
+                    "turn_index": turn_index,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "effort": current_effort,
+                    "result_type": parsed.get("result_type"),
+                    "role_reported_status": parsed.get("status"),
+                    "reasoning_output_tokens": turn_usage.reasoning_output_tokens,
+                    "total_tokens": turn_usage.total_tokens,
+                    "token_telemetry": turn_telemetry,
+                }
+                turn_history.append(history_row)
+                directive = (
+                    await turn_controller(partial, turn_index)
+                    if turn_controller is not None
+                    else TurnDirective.stop("single-turn backend compatibility mode")
+                )
+                if (
+                    directive.continue_same_thread
+                    and partial.continuation_budget_stop_reason
+                ):
+                    directive = TurnDirective.stop(
+                        partial.continuation_budget_stop_reason
+                    )
+                history_row["controller_directive"] = (
+                    "CONTINUE" if directive.continue_same_thread else "STOP"
+                )
+                history_row["controller_reason"] = directive.reason
+                history_row["next_effort"] = directive.effort_override
+                final_outcome = partial
+                if not directive.continue_same_thread:
+                    break
+                if not directive.next_prompt:
+                    raise ValueError("same-thread continuation requires a non-empty next prompt")
+                current_prompt = directive.next_prompt
+                current_effort = directive.effort_override or current_effort
+            assert final_outcome is not None
+            final_outcome.token_usage = usage
+            final_outcome.token_telemetry = token_telemetry
+            final_outcome.turn_history = turn_history
+            final_outcome.reasoning_effort = effort
+            final_outcome.logical_stop_reason = turn_history[-1]["controller_reason"]
+            return final_outcome
         except Exception as exc:
             if isinstance(exc, ServiceTierPolicyError):
                 observed_tier = exc.observed_service_tier
@@ -286,6 +393,7 @@ class AppServerBackend:
                 error=str(redact_auth_material(str(exc))),
                 failure_kind=failure_kind, retryable=retryable, server_error=server_error,
                 terminal_event=terminal_event, raw_output=raw_output or None,
+                turn_history=turn_history,
             )
         finally:
             self.active.pop(job_id, None)
@@ -317,6 +425,10 @@ class MockCodexBackend:
     def set_economy_mode(self, enabled: bool) -> None:
         del enabled
 
+    def supports_same_thread_continuation(self, role: str) -> bool:
+        del role
+        return False
+
     async def start(self) -> None:
         self.started = True
 
@@ -336,8 +448,9 @@ class MockCodexBackend:
         token_budget: int | None,
         candidate_sink: CandidateSink,
         skill_path: Path | None = None,
+        turn_controller: TurnController | None = None,
     ) -> JobOutcome:
-        del prompt, workspace, writable_roots, timeout, token_budget, skill_path
+        del prompt, workspace, writable_roots, timeout, token_budget, skill_path, turn_controller
         usage = TokenUsage()
         thread_id: str | None = None
         turn_id: str | None = None
