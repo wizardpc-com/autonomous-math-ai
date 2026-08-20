@@ -97,6 +97,14 @@ Incremental Director work is coalesced and debounced behind a version watermark.
 The Director does not wait for all research and audit jobs to drain and cannot
 block their normal dispatch.
 
+Every Director snapshot includes a controller-owned representation compatibility
+view (claims grouped by representation id, known complete contracts, missing
+contract ids, and independently audited bridge pairs) plus latest route state.
+Route updates are durable bookkeeping, not runnable queue work. If semantic
+admission rejects every proposed task and no audit priority is applicable, the
+controller supplies the rejection reasons to one bounded repair turn; retry
+exhaustion pauses the epoch instead of falling through to idle queue failure.
+
 ## Durable storage
 
 Events and route records are append-only. Candidate artifacts are copied into

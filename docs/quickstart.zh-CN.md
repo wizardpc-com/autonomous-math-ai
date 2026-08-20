@@ -11,6 +11,18 @@ amr config explain --project ./research-target
 amr run --project ./research-target --dry-run
 ```
 
+## 可选：Windows 双击入口
+
+源码仓库根目录提供 [`../amr-launcher.cmd`](../amr-launcher.cmd)，安装后也可直接运行
+`amr launcher`。入口是通用 bootstrap，不要写入项目路径或研究配置。首次使用时输入
+工作区根目录；该选择只保存在用户 LOCALAPPDATA 中，以后每次启动重新扫描 Git 可见的
+`autonomous/project.json`。
+
+项目 manifest 指向唯一持久配置 `autonomous/config.yaml`。dry-run、mock、real 前会
+展示脱敏摘要；常用编号修改或 `dotted.path=JSON值` 高级输入只生成临时 profile，绝不
+写回项目。真实运行必须准确输入 `RUN <project_id>`。每种 run 操作还会同步打开一个精确
+绑定新 run ID 的独立监视窗口。
+
 `amr init` 会创建 README、AGENTS、初始化检查清单、claims、state、proofs、
 tasks、experiments、certificates、audit、sources、conversations、artifacts 和
 autonomous adapter。骨架中的 `AMR_PLACEHOLDER` 是有意保留的；准确填写命题、

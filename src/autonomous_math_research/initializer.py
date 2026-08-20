@@ -85,7 +85,7 @@ def initialize_project(
         raise ValueError("final_claim_id must be a portable claim identifier")
     manifest = {
         "schema_version": 1, "project_id": selected_project_id,
-        "final_claim_id": final_claim_id, "config": "autonomous/config.json",
+        "final_claim_id": final_claim_id, "config": "autonomous/config.yaml",
         "claim_graph": "autonomous/state/claim_graph.json",
         "trusted_state": "autonomous/state/nightly_trusted.json",
         "runtime_root": "autonomous", "prompt_root": "autonomous/prompts",
@@ -101,7 +101,7 @@ def initialize_project(
     }
     atomic_write_json(root / "autonomous" / "project.json", manifest)
     atomic_write_json(
-        root / "autonomous" / "config.json",
+        root / "autonomous" / "config.yaml",
         deepcopy(_config(selected_project_id, final_claim_id)),
     )
     atomic_write_json(root / "autonomous" / "state" / "claim_graph.json", {

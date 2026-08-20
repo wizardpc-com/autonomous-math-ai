@@ -24,7 +24,7 @@ from autonomous_math_research.lifecycle.state import (
     LifecyclePhase,
     MonotoneLifecycle,
 )
-from autonomous_math_research.models import CandidateEvent, ResearchTask
+from autonomous_math_research.models import CandidateEvent, JobOutcome, ResearchTask
 from autonomous_math_research.project import (
     ProjectManifest,
     discover_workspace_root,
@@ -264,6 +264,101 @@ class NextArchitectureTests(unittest.TestCase):
         second._pin_run_inputs(0.01, True)
         with self.assertRaisesRegex(ValueError, "pending research task is invalid"):
             second._import_previous_epoch_checkpoint()
+
+    def test_compact_snapshot_exposes_representation_compatibility(self) -> None:
+        config = load_config(self.project)
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="representation-view", campaign_id="campaign-1",
+        )
+        controller._pin_run_inputs(0.01, True)
+        snapshot = json.loads(
+            controller._write_compact_snapshot().read_text(encoding="utf-8")
+        )
+        compatibility = snapshot["representation_compatibility"]
+        legacy = RepresentationContract.legacy()
+        self.assertEqual(
+            compatibility["claims_by_representation_id"][legacy.representation_id],
+            ["C_ROOT"],
+        )
+        self.assertEqual(
+            compatibility["known_contracts"][legacy.representation_id],
+            legacy.to_dict(),
+        )
+        self.assertEqual(compatibility["contract_missing_for_ids"], [])
+        self.assertEqual(compatibility["audited_bridges"], [])
+        self.assertEqual(snapshot["route_state"], [])
+
+    def test_trusted_representation_contract_id_must_match_content(self) -> None:
+        trusted_path = self.project / "autonomous" / "state" / "nightly_trusted.json"
+        trusted = json.loads(trusted_path.read_text(encoding="utf-8"))
+        trusted["representation_contracts"] = {
+            "rep:not-the-content-hash": representation("specialized").to_dict(),
+        }
+        trusted_path.write_text(
+            json.dumps(trusted, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "id does not match its content"):
+            AutonomousController(
+                load_config(self.project), backend=MockCodexBackend(), mock=True,
+                run_id="bad-representation-state", campaign_id="campaign-1",
+            )
+
+    def test_rejected_tasks_with_route_updates_trigger_bounded_replan(self) -> None:
+        config = load_config(self.project)
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="repair-plan", campaign_id="campaign-1",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        task = research_task("incompatible", contract=representation("specialized"))
+        task.dependencies = ["C_ROOT"]
+        task_payload = task.to_dict()
+        task_payload.pop("output_contract")
+        plan = {
+            "assessment": "One bounded specialized route is proposed.",
+            "spawn": [task_payload],
+            "audit_priorities": [],
+            "route_updates": [{
+                "route_id": "route-note", "action": "PAUSE",
+                "reason": "record a durable route decision", "retry_condition": None,
+            }],
+            "short_rationale": "Exercise semantic admission repair.",
+        }
+        outcome = JobOutcome(
+            job_id="director-1", task_id="director-1", role="director",
+            claim_id="FRONTIER", status="completed", result=plan,
+        )
+
+        controller._accept_director_result(outcome)
+
+        events = controller.store.replay()
+        self.assertEqual(controller.pending_research, [])
+        self.assertTrue(controller.director_needed)
+        self.assertIsNone(controller.scheduler_stop_reason)
+        self.assertEqual(controller.director_retry_counts["model_protocol"], 1)
+        self.assertIn("TASK_REJECTED", [item["kind"] for item in events])
+        self.assertIn("DIRECTOR_PLAN_REPAIR_REQUIRED", [item["kind"] for item in events])
+        self.assertIn("DIRECTOR_RETRY_QUEUED", [item["kind"] for item in events])
+        self.assertEqual(controller.director_constraints[0]["action"], "REPAIR_PLAN")
+        self.assertEqual(
+            controller.director_constraints[0]["rejected_tasks"][0]["task_id"],
+            "incompatible",
+        )
+        self.assertFalse(controller.route_ledger.route_is_retryable("route-note", set()))
+
+        controller.director_needed = False
+        controller._accept_director_result(outcome)
+
+        self.assertFalse(controller._internal_failure)
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        self.assertIn("director failed after bounded retries", controller.scheduler_stop_reason)
+        self.assertIn(
+            "DIRECTOR_FAILURE_ISOLATED",
+            [item["kind"] for item in controller.store.replay()],
+        )
 
     def test_core_capsule_and_research_map_are_noncanonical_and_bounded(self) -> None:
         graph = ClaimGraph.load(self.runtime / "state" / "claim_graph.json")

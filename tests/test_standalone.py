@@ -64,6 +64,41 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertEqual(result["jobs_started"], 0)
         self.assertFalse(result["internal_failure"])
 
+    def test_run_uses_project_campaign_defaults_and_cli_overrides_them(self) -> None:
+        self._init()
+        config_path = self.project / "autonomous" / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["campaign"] = {"hours": 3.0, "epoch_hours": 0.5}
+        config_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, result = self._cli([
+            "run", "--project", str(self.project), "--mock", "--dry-run",
+        ])
+        self.assertEqual(code, 0, result)
+        manifest = json.loads(
+            (ProjectLayout(self.project).run_dir(result["run_id"]) / "RUN_MANIFEST.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["campaign"]["campaign_hours"], 3.0)
+        self.assertEqual(manifest["campaign"]["epoch_hours"], 0.5)
+        self.assertEqual(manifest["execution"]["limits"]["duration_seconds"], 1800.0)
+
+        code, result = self._cli([
+            "run", "--project", str(self.project), "--mock", "--dry-run",
+            "--hours", "4", "--epoch-hours", "1.5",
+        ])
+        self.assertEqual(code, 0, result)
+        manifest = json.loads(
+            (ProjectLayout(self.project).run_dir(result["run_id"]) / "RUN_MANIFEST.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["campaign"]["campaign_hours"], 4.0)
+        self.assertEqual(manifest["campaign"]["epoch_hours"], 1.5)
+        self.assertEqual(manifest["execution"]["limits"]["duration_seconds"], 5400.0)
+
     def test_manifest_identity_and_nondefault_runtime_are_authoritative(self) -> None:
         self._init()
         manifest_path = self.project / "autonomous" / "project.json"
@@ -75,7 +110,7 @@ class StandalonePackageTests(unittest.TestCase):
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        config_path = self.project / "autonomous" / "config.json"
+        config_path = self.project / "autonomous" / "config.yaml"
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["project"]["name"] = "declared-project"
         config_path.write_text(
@@ -249,6 +284,7 @@ class StandalonePackageTests(unittest.TestCase):
             package_root / "CODE_OF_CONDUCT.md",
             package_root / "SECURITY.md",
             package_root / "CITATION.cff",
+            package_root / "amr-launcher.cmd",
         ]
         release_paths = [
             *standalone_files,
@@ -291,6 +327,21 @@ class StandalonePackageTests(unittest.TestCase):
             if path.is_file() and path.suffix == ".py"
         )
         self.assertNotIn("." + "agents", source_text)
+
+    def test_windows_launcher_is_single_file_and_safe_by_default(self) -> None:
+        package_root = Path(__file__).resolve().parents[1]
+        launcher = package_root / "amr-launcher.cmd"
+        text = launcher.read_text(encoding="utf-8")
+        manifest = (package_root / "MANIFEST.in").read_text(encoding="utf-8")
+
+        self.assertIn("include amr-launcher.cmd", manifest)
+        self.assertNotIn("AMR_PROJECT_ROOT=", text)
+        self.assertNotIn("AMR_PROFILE=", text)
+        self.assertIn('set "AMR_HARNESS_ROOT=%~dp0."', text)
+        self.assertIn('if not defined AMR_REFRESH_HARNESS set "AMR_REFRESH_HARNESS=1"', text)
+        self.assertIn('"%AMR_EXE%" launcher %*', text)
+        self.assertNotRegex(text, r"sk-[A-Za-z0-9_-]{16,}")
+        self.assertNotIn("OPENAI_API_KEY=", text)
 
 
 if __name__ == "__main__":

@@ -7,18 +7,20 @@ import os
 import runpy
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Sequence
 
 from ..app_server import AppServerClient
 from ..catalog import rebuild_catalog
 from ..capabilities import inspect_generated_schema
-from ..config import default_max_audit, load_config
+from ..config import CONFIG_SCHEMA_VERSION, default_max_audit, load_config
 from ..controller import (
     AutonomousController, build_mock_full_cycle_backend,
 )
 from ..eventing import CandidateInbox
 from ..initializer import initialize_project
+from ..launcher import run_launcher
 from ..lifecycle.campaign import (
     CampaignStore, DEFAULT_CAMPAIGN_HOURS, DEFAULT_EPOCH_HOURS,
 )
@@ -60,11 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="validate or explain effective configuration")
     config_sub = config.add_subparsers(dest="config_command", required=True)
-    for name in ("validate", "explain"):
+    for name in ("validate", "explain", "summary", "migrate"):
         command = config_sub.add_parser(name)
         command.add_argument("--project", type=Path, required=True)
         command.add_argument("--profile", type=Path)
         command.add_argument("--workspace-root", type=Path)
+        if name == "migrate":
+            command.add_argument("--write", action="store_true")
 
     run = sub.add_parser("run", help="run or validate the autonomous controller")
     run.add_argument("--project", type=Path, required=True)
@@ -74,11 +78,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--hours", type=float,
-        help=f"campaign time limit in hours (default: {DEFAULT_CAMPAIGN_HOURS:g})",
+        help=(
+            "campaign time limit in hours (default: project campaign.hours, "
+            f"built-in {DEFAULT_CAMPAIGN_HOURS:g})"
+        ),
     )
     run.add_argument(
-        "--epoch-hours", type=float, default=DEFAULT_EPOCH_HOURS,
-        help=f"maximum duration of this epoch (default: {DEFAULT_EPOCH_HOURS:g})",
+        "--epoch-hours", type=float,
+        help=(
+            "maximum duration of this epoch (default: project campaign.epoch_hours, "
+            f"built-in {DEFAULT_EPOCH_HOURS:g})"
+        ),
     )
     run.add_argument(
         "--max-director", type=int,
@@ -112,6 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--mock", action="store_true")
     run.add_argument("--resume", nargs="?", const="latest")
+    run.add_argument("--run-id", help=argparse.SUPPRESS)
     run.add_argument("--campaign-id", help=argparse.SUPPRESS)
     run.add_argument("--previous-epoch-id", help=argparse.SUPPRESS)
     run.add_argument(
@@ -122,6 +133,18 @@ def build_parser() -> argparse.ArgumentParser:
             "claim-id protocol; cannot be combined with --resume"
         ),
     )
+
+    launcher = sub.add_parser(
+        "launcher", help="open the unified interactive project launcher",
+    )
+    launcher.add_argument(
+        "action", nargs="?",
+        choices=("validate", "strict", "config", "dry-run", "mock", "real"),
+    )
+    launcher.add_argument("--workspace-root", type=Path)
+    launcher.add_argument("--project", type=Path)
+    launcher.add_argument("--profile", type=Path)
+    launcher.add_argument("--state-file", type=Path, help=argparse.SUPPRESS)
 
     emit = sub.add_parser("emit-event", help="append one validated candidate event")
     emit.add_argument("--project", type=Path, required=True)
@@ -199,6 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     watch = sub.add_parser("watch", help="follow a run's append-only lifecycle events")
     watch.add_argument("--project", type=Path, required=True)
     watch.add_argument("--run", default="latest")
+    watch.add_argument(
+        "--wait-seconds", type=float, default=0.0,
+        help="wait briefly for an explicitly named run to be created",
+    )
     watch.add_argument("--tail", type=int, default=20)
     watch.add_argument("--poll-seconds", type=float, default=0.5)
     watch.add_argument(
@@ -306,8 +333,10 @@ def _mechanical_cap_override(value: str | int | None) -> int | str | None:
 
 async def _run_command(args: argparse.Namespace) -> int:
     project = _resolve_run_project(args)
-    run_id = None
+    run_id = args.run_id
     resume = bool(args.resume)
+    if resume and args.run_id:
+        raise ValueError("--run-id cannot be combined with --resume")
     if resume and args.recover_candidates_from:
         raise ValueError("--resume cannot be combined with --recover-candidates-from")
     if args.resume:
@@ -336,6 +365,15 @@ async def _run_command(args: argparse.Namespace) -> int:
         project, config_path, workspace_root=args.workspace_root,
         require_manifest=True, profile_path=args.profile,
     )
+    campaign_hours = (
+        float(args.hours) if args.hours is not None else config.campaign_hours
+    )
+    epoch_hours = (
+        float(args.epoch_hours) if args.epoch_hours is not None else config.epoch_hours
+    )
+    if campaign_hours <= 0 or epoch_hours <= 0:
+        raise ValueError("campaign and epoch hours must be positive")
+    epoch_hours = min(epoch_hours, campaign_hours)
     max_audit_override = _resolve_max_audit_override(
         args.max_research_workers, args.max_audit,
     )
@@ -378,12 +416,8 @@ async def _run_command(args: argparse.Namespace) -> int:
         recover_candidates_from=args.recover_candidates_from,
         campaign_id=args.campaign_id,
         previous_epoch_id=args.previous_epoch_id,
-        campaign_hours=(args.hours or DEFAULT_CAMPAIGN_HOURS),
-        epoch_hours=args.epoch_hours,
-    )
-    epoch_hours = min(
-        float(args.epoch_hours),
-        float(args.hours or DEFAULT_CAMPAIGN_HOURS),
+        campaign_hours=campaign_hours,
+        epoch_hours=epoch_hours,
     )
     result = await controller.run(epoch_hours, dry_run=args.dry_run)
     print(json.dumps({
@@ -486,6 +520,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "config":
         try:
+            if args.config_command == "migrate" and args.profile is not None:
+                raise ValueError("config migrate cannot persist an explicit user profile")
             config = load_config(
                 args.project.resolve(), workspace_root=args.workspace_root,
                 require_manifest=True, profile_path=args.profile,
@@ -499,7 +535,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "model_turns_started": 0,
             }, ensure_ascii=False, indent=2))
             return 2
-        payload = explanation if args.config_command == "explain" else {
+        if args.config_command == "migrate":
+            changed = bool(config.migrations_applied)
+            if args.write and changed:
+                atomic_write_json(config.config_path, config.raw)
+            payload = {
+                "valid": True,
+                "project": config.project_name,
+                "project_config": str(config.config_path),
+                "from_migrations": list(config.migrations_applied),
+                "target_schema_version": CONFIG_SCHEMA_VERSION,
+                "changed": changed,
+                "written": bool(args.write and changed),
+                "model_turns_started": 0,
+            }
+        elif args.config_command == "summary":
+            payload = config.summarized()
+        elif args.config_command == "explain":
+            payload = explanation
+        else:
+            payload = {
             "valid": True,
             "config_schema_version": explanation["config_schema_version"],
             "profile": explanation["profile"],
@@ -510,9 +565,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "roles": sorted(config.raw["models"]),
             "effective_config": explanation["effective_config"],
             "model_turns_started": 0,
-        }
+            }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "launcher":
+        try:
+            return run_launcher(
+                workspace_root=args.workspace_root,
+                project_root=args.project,
+                action=args.action,
+                profile_path=args.profile,
+                state_path=args.state_file,
+            )
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(f"launcher error: {exc}")
+            return 2
     if args.command == "emit-event":
         data = json.loads(args.file.read_text(encoding="utf-8"))
         project = args.project.resolve()
@@ -676,6 +743,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         }, ensure_ascii=False))
         return 0
     if args.command == "watch":
+        if args.wait_seconds < 0:
+            raise ValueError("--wait-seconds must be non-negative")
+        if args.wait_seconds and args.run == "latest":
+            raise ValueError("--wait-seconds requires an explicit --run id")
+        if args.wait_seconds:
+            deadline = time.monotonic() + args.wait_seconds
+            run_path = ProjectLayout(args.project.resolve()).run_dir(args.run)
+            while not (run_path / "EVENTS.jsonl").is_file():
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"timed out waiting for run: {args.run}")
+                time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
         run_dir = resolve_run(args.project, args.run)
         try:
             return watch_run(

@@ -1,8 +1,12 @@
 {
-  "schema_version": 8,
+  "schema_version": 9,
   "profile": "codex-app-server-default",
   "project": {
     "name": "minimal-math-project",
     "final_conjecture_claim_id": "C_ROOT"
+  },
+  "campaign": {
+    "hours": 12.0,
+    "epoch_hours": 2.0
   }
 }

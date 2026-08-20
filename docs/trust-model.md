@@ -53,6 +53,11 @@ may be combined directly. Different hashes fail closed unless a dedicated
 model nor human steering can declare compatibility directly. Legacy records map
 to `LEGACY_UNSPECIFIED` and require the same bridge.
 
+The compact Director snapshot exposes the controller's claim-to-representation
+mapping, complete known contracts, and audited bridge pairs. Merely knowing a
+contract does not make it compatible. Persisted contract ids are recomputed from
+their content on load and a mismatch fails before model dispatch.
+
 ## Structured output boundary
 
 Output Protocol v2 minimizes role-owned fields. Director, worker, auditor, and

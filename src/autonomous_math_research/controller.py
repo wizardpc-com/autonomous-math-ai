@@ -421,15 +421,34 @@ class AutonomousController:
         self.live_store = EventStore(self.run_dir / "LIVE_EVENTS.jsonl", self.run_id)
         self.graph = ClaimGraph.load(self.layout.claim_graph_path)
         self.graph.validate()
-        legacy_representation_id = RepresentationContract.legacy().representation_id
+        legacy_representation = RepresentationContract.legacy()
+        legacy_representation_id = legacy_representation.representation_id
         self.claim_representations: dict[str, str] = {
             claim_id: legacy_representation_id for claim_id in self.graph.claims
+        }
+        self.representation_contracts: dict[str, dict[str, Any]] = {
+            legacy_representation_id: legacy_representation.to_dict(),
         }
         self.audited_representation_bridges: set[tuple[str, str]] = set()
         if self.layout.trusted_state_path.is_file():
             trusted = json.loads(
                 self.layout.trusted_state_path.read_text(encoding="utf-8")
             )
+            for representation_id, raw_contract in dict(
+                trusted.get("representation_contracts") or {}
+            ).items():
+                if (
+                    not isinstance(representation_id, str)
+                    or not representation_id.startswith("rep:")
+                ):
+                    raise ValueError("trusted representation contract id is invalid")
+                contract = RepresentationContract.from_dict(raw_contract)
+                if contract.representation_id != representation_id:
+                    raise ValueError(
+                        "trusted representation contract id does not match its content: "
+                        f"{representation_id}"
+                    )
+                self.representation_contracts[representation_id] = contract.to_dict()
             for claim_id, representation_id in dict(
                 trusted.get("claim_representations") or {}
             ).items():
@@ -3571,7 +3590,10 @@ class AutonomousController:
                     and not self.pending_research and not self.pending_audits
                     and not self.director_needed
                 ):
-                    stopped_reason = "controller invariant failed: idle without an explicit Director stop"
+                    stopped_reason = (
+                        "controller invariant failed: idle without a scheduler stop "
+                        "or pending Director replan"
+                    )
                     self._internal_failure = True
                     self.store.append("CONTROLLER_INVARIANT_FAILED", {
                         "reason": stopped_reason,
@@ -3705,6 +3727,21 @@ class AutonomousController:
         snapshot["pending_audits"] = [
             task.to_dict() for task in self.pending_audits
         ]
+        snapshot["representation_compatibility"] = self._representation_compatibility_view()
+        latest_routes: dict[str, dict[str, Any]] = {}
+        for record in self.route_ledger.records():
+            route_id = str(record.get("route_id") or "")
+            if route_id:
+                latest_routes[route_id] = {
+                    key: record.get(key)
+                    for key in (
+                        "route_id", "representation_id", "method_tags", "status",
+                        "failure_class", "retry_condition", "evidence_refs", "source",
+                    )
+                }
+        snapshot["route_state"] = [
+            latest_routes[key] for key in sorted(latest_routes)
+        ]
         snapshot["research_policy"] = self._policy_view(Role.DIRECTOR)
         path = self.run_dir / "state" / "compact_snapshot.json"
         atomic_write_json(path, snapshot)
@@ -3727,6 +3764,33 @@ class AutonomousController:
             representations=self.claim_representations,
         )
         return path
+
+    def _representation_compatibility_view(self) -> dict[str, Any]:
+        claims_by_representation: dict[str, list[str]] = {}
+        for claim_id, representation_id in sorted(self.claim_representations.items()):
+            claims_by_representation.setdefault(representation_id, []).append(claim_id)
+        known_ids = set(self.representation_contracts)
+        referenced_ids = set(claims_by_representation)
+        return {
+            "dispatch_rule": (
+                "Every task dependency must use the exact same representation contract, "
+                "or the representation-id pair must already appear in audited_bridges. "
+                "A new cross-representation route must first produce a dedicated "
+                "REPRESENTATION_BRIDGE candidate and pass fresh independent audit."
+            ),
+            "claims_by_representation_id": {
+                key: value for key, value in sorted(claims_by_representation.items())
+            },
+            "known_contracts": {
+                key: self.representation_contracts[key]
+                for key in sorted(self.representation_contracts)
+            },
+            "contract_missing_for_ids": sorted(referenced_ids - known_ids),
+            "audited_bridges": [
+                list(pair) for pair in sorted(self.audited_representation_bridges)
+            ],
+            "known_contract_does_not_imply_compatibility": True,
+        }
 
     def _request_replan_when_cycle_idle(self) -> None:
         if not self._replan_after_wave or self.director_needed or self.scheduler_stop_reason:
@@ -5550,13 +5614,17 @@ class AutonomousController:
             })
 
         accepted_tasks: list[ResearchTask] = []
+        rejected_tasks: list[dict[str, str]] = []
         for task in plan.spawn:
             task_error = self._validate_director_task(task)
             if task_error:
-                self.store.append("TASK_REJECTED", {
+                rejection = {
                     "task_id": task.task_id,
+                    "representation_id": task.representation_id,
                     "reason": task_error,
-                })
+                }
+                rejected_tasks.append(rejection)
+                self.store.append("TASK_REJECTED", rejection)
                 continue
             if task.fingerprint in self.seen_task_fingerprints:
                 self.store.append("TASK_DEDUPLICATED", {
@@ -5599,16 +5667,22 @@ class AutonomousController:
             })
             route_representation = next(
                 (
-                    task.representation_id for task in plan.spawn
+                    task.representation_id for task in accepted_tasks
                     if task.route_family == str(update["route_id"])
                 ),
                 RepresentationContract.legacy().representation_id,
             )
+            route_status = {
+                "OPEN": "ACTIVE",
+                "PAUSE": "PAUSED",
+                "RESUME": "ACTIVE",
+                "RETRY": "ACTIVE",
+            }[str(update["action"])]
             self.route_ledger.append(
                 route_id=str(update["route_id"]),
                 representation_id=route_representation,
                 method_tags=[],
-                status=str(update["action"]),
+                status=route_status,
                 failure_class=None,
                 retry_condition=update.get("retry_condition"),
                 evidence_refs=[],
@@ -5616,6 +5690,9 @@ class AutonomousController:
             )
 
         for task in accepted_tasks:
+            self.representation_contracts.setdefault(
+                task.representation_id, task.representation_contract.to_dict(),
+            )
             self.seen_task_fingerprints.add(task.fingerprint)
             self.pending_research.append(task)
             self.store.append("TASK_ACCEPTED", {
@@ -5625,8 +5702,6 @@ class AutonomousController:
                 "task": task.to_dict(),
             })
 
-        self.director_retry_count = 0
-        self.director_retry_counts.clear()
         self._director_applied_version = max(
             self._director_applied_version, self._director_snapshot_version,
         )
@@ -5643,25 +5718,35 @@ class AutonomousController:
         })
         self.director_constraints.clear()
 
-        actionable = bool(accepted_tasks or prioritized or plan.route_updates)
+        runnable = bool(accepted_tasks or prioritized)
+        if not runnable:
+            repair_constraint: dict[str, Any] = {
+                "action": "REPAIR_PLAN",
+                "claim_id": self.final_conjecture_claim_id or "FRONTIER",
+                "reason": (
+                    "the previous Director plan left no runnable research or audit work; "
+                    "route updates were recorded but do not keep the execution queue alive"
+                ),
+                "source": "director_no_runnable_work",
+                "route_updates_applied": len(plan.route_updates),
+                "rejected_tasks": rejected_tasks,
+            }
+            self.director_constraints.append(repair_constraint)
+            self.store.append("DIRECTOR_PLAN_REPAIR_REQUIRED", repair_constraint)
+        else:
+            self.director_retry_count = 0
+            self.director_retry_counts.clear()
         if stale:
             self._request_director(
                 "Director plan was safely rebased but a newer coalesced watermark exists",
                 meaningful_change=False,
                 immediate=False,
             )
-        elif not actionable:
-            self.director_constraints.append({
-                "action": "DIVERSIFY",
-                "claim_id": self.final_conjecture_claim_id or "FRONTIER",
-                "forbidden_route": None,
-                "reason": "the previous v2 plan contained no currently actionable work",
-                "source": "director_no_actionable_work",
-            })
-            self._request_director(
-                "v2 plan produced no current action",
-                meaningful_change=False,
-                immediate=False,
+        elif not runnable:
+            self._queue_director_retry(
+                "director_no_runnable_work",
+                retryable=True,
+                source="director_semantic_gate",
             )
         else:
             self._replan_after_wave = False
@@ -6009,10 +6094,13 @@ class AutonomousController:
                 })
             else:
                 self.claim_representations[event.claim_id] = event.representation_id
+            self.representation_contracts[event.representation_id] = (
+                event.representation_contract.to_dict()
+            )
             self.graph.save()
             if self.persist_shared_state:
                 atomic_write_json(self.layout.trusted_state_path, {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "updated_at": utc_now(), "source_run": self.run_id,
                     "claim_graph": (
                         "project://" + self.active_graph_path.resolve()
@@ -6020,6 +6108,10 @@ class AutonomousController:
                     ),
                     "policy_manifest_sha256": self.policy_manifest["manifest_sha256"],
                     "claim_representations": dict(sorted(self.claim_representations.items())),
+                    "representation_contracts": {
+                        key: self.representation_contracts[key]
+                        for key in sorted(self.representation_contracts)
+                    },
                     "audited_representation_bridges": [
                         list(pair) for pair in sorted(self.audited_representation_bridges)
                     ],

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "project_id": "minimal-math-project",
   "final_claim_id": "C_ROOT",
-  "config": "autonomous/config.json",
+  "config": "autonomous/config.yaml",
   "claim_graph": "autonomous/state/claim_graph.json",
   "trusted_state": "autonomous/state/nightly_trusted.json",
   "runtime_root": "autonomous",

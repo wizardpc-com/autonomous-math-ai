@@ -62,7 +62,7 @@ class RouteLedger:
             return True
         latest = records[-1]
         condition = latest.get("retry_condition")
-        if latest.get("status") not in {"FAILED", "PAUSED"}:
+        if latest.get("status") not in {"FAILED", "PAUSED", "PAUSE"}:
             return True
         return bool(condition and condition in satisfied_conditions)
 
