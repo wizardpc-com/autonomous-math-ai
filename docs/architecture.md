@@ -86,6 +86,15 @@ model's `PROOF` or `COUNTEREXAMPLE` label does not end a logical job: terminatio
 requires a validated candidate entering the audit frontier, controller-verified
 canonical progress, a concrete execution blocker, or a configured turn bound.
 
+Turn completion is correlated by both turn id and thread because some App
+Server versions expose different response and stream ids. A completion buffered
+before the `turn/start` response is consumed exactly once across both indexes;
+delivered or duplicate notifications are never carried into the next turn.
+Repeated `turn/started` for the same owned id is idempotent, while a distinct
+start or completion id remains an unmanaged continuation and fails closed.
+Cancellation and a failed `turn/start` response attempt to interrupt any remote
+turn already observed before releasing controller ownership.
+
 Crash recovery never guesses how far an interrupted proof got. It preserves
 completed-turn events, interrupts the stale remote turn, and requeues the exact
 task under the existing bounded retry policy.
@@ -135,6 +144,13 @@ Incremental Director work is coalesced and debounced behind a version watermark.
 The Director does not wait for all research and audit jobs to drain and cannot
 block their normal dispatch.
 
+A task id is a stable binding to one task fingerprint within an epoch. The
+controller rejects changed task content that reuses an accepted id and has a
+final dispatch-time guard against concurrently active duplicate ids. Each job
+attempt receives a job-id-qualified workspace, so sequential retries and even
+defense-in-depth test bypasses cannot overwrite another attempt's sealed
+mechanical broker configuration.
+
 Every Director snapshot includes a controller-owned representation compatibility
 view (claims grouped by representation id, known complete contracts, missing
 contract ids, and independently audited bridge pairs) plus latest route state.
@@ -149,6 +165,14 @@ Events and route records are append-only. Candidate artifacts are copied into
 content-addressed bundles before audit. Durable references use `project://`,
 `campaign://`, or `epoch://` URIs, so evidence does not depend on a machine's
 absolute path.
+
+Director `required_files` accepts those durable URIs as well as legacy
+project-relative or project-contained absolute paths. The controller resolves
+and rechecks each reference before dispatch, then supplies the research worker
+with an internal read-path mapping while preserving the portable reference in
+the task and event history. `ResearchTask.dependencies` names existing
+`ClaimGraph` claims only; task-to-task sequencing is expressed by a later
+Director wave rather than by placing task ids in that field.
 
 `CORE_CAPSULE` is a bounded rebuildable snapshot, `RESEARCH_MAP` is a derived
 human-readable view, and `ROUTE_LEDGER` records failed approaches and explicit

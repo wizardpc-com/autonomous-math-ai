@@ -78,6 +78,7 @@ from .storage import (
     read_jsonl,
 )
 from .storage import ArtifactStore
+from .storage.artifacts import PORTABLE_SCHEMES, resolve_portable_uri
 from .token_governor import TokenGovernor
 from .workspace import WorkspaceManager
 
@@ -647,6 +648,7 @@ class AutonomousController:
         )
         self.completed_jobs: list[dict[str, Any]] = []
         self.seen_task_fingerprints: set[str] = set()
+        self.task_fingerprints_by_id: dict[str, str] = {}
         self.candidate_queue: asyncio.Queue[CandidateEvent] = asyncio.Queue()
         self.recent_changes: list[dict[str, Any]] = []
         self.director_needed = True
@@ -2391,11 +2393,15 @@ class AutonomousController:
         accepted: dict[str, ResearchTask] = {}
         for event in records:
             if event["kind"] == "TASK_ACCEPTED":
-                self.seen_task_fingerprints.add(event["payload"]["fingerprint"])
+                fingerprint = str(event["payload"]["fingerprint"])
+                self.seen_task_fingerprints.add(fingerprint)
                 task_payload = event["payload"].get("task")
                 if task_payload:
                     task = ResearchTask.from_dict(task_payload)
-                    accepted[task.task_id] = task
+                    bound = self.task_fingerprints_by_id.get(task.task_id)
+                    if bound in {None, fingerprint}:
+                        self.task_fingerprints_by_id[task.task_id] = fingerprint
+                        accepted[task.task_id] = task
             elif event["kind"] == "CANDIDATE_PROCESSED":
                 fingerprint = event["payload"]["fingerprint"]
                 self.inbox.processed.add(fingerprint)
@@ -4058,7 +4064,10 @@ class AutonomousController:
             estimated_cost_tier="MEDIUM", required_files=[str(snapshot)],
             stop_conditions=["return one schema-valid plan"], output_contract="director_plan.schema.json",
         )
-        workspace, writable, metadata = self.workspace.create_job_workspace(task.task_id)
+        job_id = self._new_job_id()
+        workspace, writable, metadata = self.workspace.create_job_workspace(
+            task.task_id, job_id=job_id,
+        )
         packet = self.workspace.write_task_packet(workspace, {
             "task": task.to_dict(), "snapshot": str(snapshot), "constraints": self.director_constraints,
             "output_protocol_version": OUTPUT_PROTOCOL_VERSION,
@@ -4092,8 +4101,14 @@ class AutonomousController:
             })
         self._start_job(
             task, prompt, self._schema("director_plan.schema.json"), workspace, writable,
-            "director", estimated_tokens=estimated,
+            "director", estimated_tokens=estimated, job_id=job_id,
         )
+
+    def _new_job_id(self) -> str:
+        while True:
+            job_id = f"job-{uuid4().hex[:16]}"
+            if job_id not in self.active:
+                return job_id
 
     def _start_job(
         self,
@@ -4105,6 +4120,7 @@ class AutonomousController:
         kind: str,
         *,
         estimated_tokens: int,
+        job_id: str | None = None,
     ) -> str:
         validate_output_schema_compatibility(
             schema, schema_path=f"{task.output_contract} ({task.role}, controller)",
@@ -4116,6 +4132,23 @@ class AutonomousController:
         }
         if kind not in kind_caps:
             raise RuntimeError(f"unknown model job kind: {kind}")
+        job_id = job_id or self._new_job_id()
+        if job_id in self.active:
+            raise RuntimeError(f"job_id {job_id!r} is already active")
+        duplicate = next(
+            (
+                (active_job_id, active)
+                for active_job_id, active in self.active.items()
+                if active.task.task_id == task.task_id
+            ),
+            None,
+        )
+        if duplicate is not None:
+            active_job_id, active = duplicate
+            raise RuntimeError(
+                f"task_id {task.task_id!r} is already active as "
+                f"{active.kind} job {active_job_id}"
+            )
         active_for_kind = sum(item.kind == kind for item in self.active.values())
         if active_for_kind >= kind_caps[kind]:
             raise RuntimeError(f"{kind} concurrency limit reached before model dispatch")
@@ -4126,7 +4159,6 @@ class AutonomousController:
             raise RuntimeError(
                 f"{task.role} role concurrency limit reached before model dispatch"
             )
-        job_id = f"job-{uuid4().hex[:16]}"
         if self.mock:
             selected_model, selected_effort = "mock-no-fast", "mock"
             selected_provider, selected_profile, selected_tier = "mock", None, None
@@ -5370,7 +5402,10 @@ class AutonomousController:
                     observed=observed_hashes,
                 )
                 continue
-            workspace, writable, metadata = self.workspace.create_job_workspace(task.task_id)
+            job_id = self._new_job_id()
+            workspace, writable, metadata = self.workspace.create_job_workspace(
+                task.task_id, job_id=job_id,
+            )
             sealed_bundle_files = self.artifact_store.materialize(
                 event.artifact_paths, workspace,
             )
@@ -5399,7 +5434,7 @@ class AutonomousController:
             )
             audit_job_id = self._start_job(
                 task, prompt, self._audit_output_schema(event), workspace, writable,
-                "audit", estimated_tokens=estimated,
+                "audit", estimated_tokens=estimated, job_id=job_id,
             )
             self.audit_leases.activate(
                 str(task.metadata["audit_lease_id"]), audit_job_id,
@@ -5511,6 +5546,30 @@ class AutonomousController:
                 ),
             )
             self.pending_research.remove(task)
+            try:
+                required_file_access = self._required_file_access(task)
+            except ValueError as exc:
+                reason = _sanitize_live_text(exc)
+                rejection = {
+                    "task_id": task.task_id,
+                    "representation_id": task.representation_id,
+                    "reason": reason,
+                    "phase": "dispatch",
+                }
+                self.store.append("TASK_REJECTED", rejection)
+                self.director_constraints.append({
+                    "action": "REPAIR_TASK_INPUTS",
+                    "claim_id": task.target_claim,
+                    "task_id": task.task_id,
+                    "reason": reason,
+                    "source": "required_file_dispatch",
+                })
+                self._request_director(
+                    "accepted task required file became unavailable",
+                    meaningful_change=False,
+                    immediate=True,
+                )
+                continue
             estimated = self._estimated_tokens(task.role, task.estimated_cost_tier)
             if not self.governor.may_start(task.role, estimated):
                 budget_blocked += 1
@@ -5520,7 +5579,10 @@ class AutonomousController:
                 )
                 deferred.append(task)
                 continue
-            workspace, writable, metadata = self.workspace.create_job_workspace(task.task_id, task.modifies_code)
+            job_id = self._new_job_id()
+            workspace, writable, metadata = self.workspace.create_job_workspace(
+                task.task_id, task.modifies_code, job_id=job_id,
+            )
             # The worker may submit a single validated event file, but cannot
             # write the controller-owned ledger, candidates, audits, or state.
             job_inbox = self._task_inbox(task.task_id)
@@ -5530,6 +5592,7 @@ class AutonomousController:
                 "task": task.to_dict(), "workspace": metadata,
                 "canonical_project": str(self.config.project_root),
                 "nightly_claim_graph": str(self.active_graph_path),
+                "required_file_access": required_file_access,
                 "candidate_protocol": {
                     "assigned_claim_id": task.target_claim,
                     "allow_derived_claims": bool(
@@ -5560,7 +5623,7 @@ class AutonomousController:
             )
             self._start_job(
                 task, prompt, self._schema("worker_result.schema.json"), workspace, writable,
-                "research", estimated_tokens=estimated,
+                "research", estimated_tokens=estimated, job_id=job_id,
             )
             self.route_dispatch_counts[task.route_family] = (
                 self.route_dispatch_counts.get(task.route_family, 0) + 1
@@ -5821,6 +5884,7 @@ class AutonomousController:
 
         accepted_tasks: list[ResearchTask] = []
         rejected_tasks: list[dict[str, str]] = []
+        provisional_task_bindings = dict(self.task_fingerprints_by_id)
         for task in plan.spawn:
             task_error = self._validate_director_task(task)
             if task_error:
@@ -5832,6 +5896,27 @@ class AutonomousController:
                 rejected_tasks.append(rejection)
                 self.store.append("TASK_REJECTED", rejection)
                 continue
+            bound_fingerprint = provisional_task_bindings.get(task.task_id)
+            if bound_fingerprint is not None:
+                if bound_fingerprint == task.fingerprint:
+                    self.store.append("TASK_DEDUPLICATED", {
+                        "task_id": task.task_id,
+                        "fingerprint": task.fingerprint,
+                        "reason": "stable task_id and fingerprint already accepted",
+                    })
+                else:
+                    rejection = {
+                        "task_id": task.task_id,
+                        "representation_id": task.representation_id,
+                        "reason": (
+                            f"task_id {task.task_id!r} is already bound to fingerprint "
+                            f"{bound_fingerprint}; use a new stable task_id for different "
+                            "task content"
+                        ),
+                    }
+                    rejected_tasks.append(rejection)
+                    self.store.append("TASK_REJECTED", rejection)
+                continue
             if task.fingerprint in self.seen_task_fingerprints:
                 self.store.append("TASK_DEDUPLICATED", {
                     "task_id": task.task_id,
@@ -5839,6 +5924,7 @@ class AutonomousController:
                 })
                 continue
             accepted_tasks.append(task)
+            provisional_task_bindings[task.task_id] = task.fingerprint
 
         prioritized = 0
         for item in plan.audit_priorities:
@@ -5900,6 +5986,7 @@ class AutonomousController:
                 task.representation_id, task.representation_contract.to_dict(),
             )
             self.seen_task_fingerprints.add(task.fingerprint)
+            self.task_fingerprints_by_id[task.task_id] = task.fingerprint
             self.pending_research.append(task)
             self.store.append("TASK_ACCEPTED", {
                 "task_id": task.task_id,
@@ -5999,7 +6086,11 @@ class AutonomousController:
             )
         unknown = set(task.dependencies) - set(self.graph.claims)
         if unknown:
-            return f"unknown claim dependencies: {sorted(unknown)}"
+            return (
+                f"unknown claim dependencies: {sorted(unknown)}; the dependencies field "
+                "accepts existing ClaimGraph claim ids, not task ids; schedule task "
+                "sequencing in a later Director wave"
+            )
         if set(task.metadata) != {"allow_derived_claims"}:
             return "research task metadata must contain exactly allow_derived_claims"
         if not all(isinstance(task.metadata[key], bool) for key in task.metadata):
@@ -6017,15 +6108,40 @@ class AutonomousController:
                     "representation mismatch with dependency requires an independently "
                     f"PASSed REPRESENTATION_BRIDGE: {dependency} {pair}"
                 )
-        project = self.config.project_root.resolve()
-        for raw in task.required_files:
-            path = Path(raw)
-            resolved = (project / path).resolve() if not path.is_absolute() else path.resolve()
-            if not resolved.is_relative_to(project):
-                return f"required file escapes project: {raw}"
-            if not resolved.exists():
-                return f"required file does not exist: {raw}"
+        try:
+            self._required_file_access(task)
+        except ValueError as exc:
+            return _sanitize_live_text(exc)
         return None
+
+    def _required_file_access(self, task: ResearchTask) -> list[dict[str, str]]:
+        return [
+            {"reference": raw, "path": str(self._resolve_required_file(raw))}
+            for raw in task.required_files
+        ]
+
+    def _resolve_required_file(self, raw: str) -> Path:
+        if not isinstance(raw, str) or not raw:
+            raise ValueError("required file reference must be a non-empty string")
+        project = self.config.project_root.resolve()
+        if raw.startswith(PORTABLE_SCHEMES):
+            try:
+                return resolve_portable_uri(
+                    project, self.layout.autonomous_root, raw,
+                )
+            except ValueError as exc:
+                raise ValueError(f"required file is unavailable: {raw}: {exc}") from exc
+        if "://" in raw:
+            raise ValueError(f"unsupported required file URI: {raw}")
+        path = Path(raw)
+        resolved = (
+            (project / path).resolve() if not path.is_absolute() else path.resolve()
+        )
+        if not resolved.is_relative_to(project):
+            raise ValueError(f"required file escapes project: {raw}")
+        if not resolved.is_file():
+            raise ValueError(f"required file is unavailable: {raw}")
+        return resolved
 
     def _accept_audit_result(
         self,

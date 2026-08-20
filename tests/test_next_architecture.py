@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import shutil
@@ -359,6 +360,207 @@ class NextArchitectureTests(unittest.TestCase):
             "DIRECTOR_FAILURE_ISOLATED",
             [item["kind"] for item in controller.store.replay()],
         )
+
+    def test_director_required_files_accept_portable_and_legacy_paths(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="required-file-admission", campaign_id="campaign-1",
+        )
+        campaign_file = self.runtime / "campaigns" / "campaign-1" / "input.txt"
+        campaign_file.parent.mkdir(parents=True, exist_ok=True)
+        campaign_file.write_text("campaign input\n", encoding="utf-8")
+        epoch_file = self.runtime / "runs" / "source-epoch" / "input.txt"
+        epoch_file.parent.mkdir(parents=True, exist_ok=True)
+        epoch_file.write_text("epoch input\n", encoding="utf-8")
+
+        references = [
+            "project://claims/CLAIMS.md",
+            "campaign://campaign-1/input.txt",
+            "epoch://source-epoch/input.txt",
+            "state/PROGRESS.md",
+            str((self.project / "claims" / "CLAIMS.md").resolve()),
+        ]
+        for index, reference in enumerate(references):
+            with self.subTest(reference=reference):
+                task = research_task(f"required-file-{index}")
+                task.required_files = [reference]
+                self.assertIsNone(controller._validate_director_task(task))
+
+    def test_director_required_files_fail_closed(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="required-file-rejection", campaign_id="campaign-1",
+        )
+        directory = self.project / "artifacts" / "directory-only"
+        directory.mkdir(parents=True)
+        outside = self.root / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        references = [
+            "project://claims/MISSING.md",
+            "project://../outside.txt",
+            "package://claims/CLAIMS.md",
+            "artifacts/directory-only",
+            str(outside.resolve()),
+        ]
+        for index, reference in enumerate(references):
+            with self.subTest(reference=reference):
+                task = research_task(f"invalid-required-file-{index}")
+                task.required_files = [reference]
+                self.assertIsNotNone(controller._validate_director_task(task))
+
+    def test_portable_required_files_produce_runnable_director_plan(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="portable-director-plan", campaign_id="campaign-1",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        task = research_task("portable-task")
+        task.required_files = [
+            "project://claims/CLAIMS.md",
+            "project://state/PROGRESS.md",
+        ]
+        task_payload = task.to_dict()
+        task_payload.pop("output_contract")
+        outcome = JobOutcome(
+            job_id="director-portable", task_id="director-portable",
+            role="director", claim_id="FRONTIER", status="completed",
+            result={
+                "assessment": "One bounded task is ready.",
+                "spawn": [task_payload],
+                "audit_priorities": [],
+                "route_updates": [],
+                "short_rationale": "Use the declared canonical inputs.",
+            },
+        )
+
+        controller._accept_director_result(outcome)
+
+        events = controller.store.replay()
+        self.assertEqual([item.task_id for item in controller.pending_research], ["portable-task"])
+        self.assertIn("TASK_ACCEPTED", [item["kind"] for item in events])
+        self.assertNotIn("DIRECTOR_PLAN_REPAIR_REQUIRED", [item["kind"] for item in events])
+
+    def test_director_cannot_rebind_an_existing_stable_task_id(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="stable-task-binding", campaign_id="campaign-1",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        original = research_task("stable-task")
+
+        def outcome_for(task: ResearchTask, suffix: str) -> JobOutcome:
+            task_payload = task.to_dict()
+            task_payload.pop("output_contract")
+            return JobOutcome(
+                job_id=f"director-{suffix}", task_id=f"director-{suffix}",
+                role="director", claim_id="FRONTIER", status="completed",
+                result={
+                    "assessment": "One bounded task is ready.",
+                    "spawn": [task_payload],
+                    "audit_priorities": [],
+                    "route_updates": [],
+                    "short_rationale": "Use one stable task binding.",
+                },
+            )
+
+        controller._accept_director_result(outcome_for(original, "first"))
+        rebound = research_task("stable-task")
+        rebound.exact_objective = "Perform a different bounded check."
+        self.assertNotEqual(original.fingerprint, rebound.fingerprint)
+
+        controller._accept_director_result(outcome_for(rebound, "second"))
+
+        self.assertEqual(controller.pending_research, [original])
+        self.assertEqual(
+            controller.task_fingerprints_by_id,
+            {original.task_id: original.fingerprint},
+        )
+        collisions = [
+            item for item in controller.store.replay()
+            if item["kind"] == "TASK_REJECTED"
+            and item["payload"].get("task_id") == original.task_id
+        ]
+        self.assertEqual(len(collisions), 1)
+        self.assertIn("already bound", collisions[0]["payload"]["reason"])
+        self.assertIn("new stable task_id", collisions[0]["payload"]["reason"])
+
+    def test_research_packet_maps_portable_required_files_to_readable_paths(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="required-file-packet", campaign_id="campaign-1",
+        )
+        controller._pin_run_inputs(0.01, True)
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        task = research_task("packet-task")
+        task.role = "prover"
+        task.required_files = ["project://claims/CLAIMS.md"]
+        controller.pending_research = [task]
+        controller._start_job = lambda *args, **kwargs: "job-packet"  # type: ignore[method-assign]
+
+        asyncio.run(controller._launch_research(capacity=1, allow_exploration=False))
+
+        packet_paths = list(
+            (controller.run_dir / "jobs").glob(
+                "packet-task--job-*/task_packet.json"
+            )
+        )
+        self.assertEqual(len(packet_paths), 1)
+        packet = json.loads(packet_paths[0].read_text(encoding="utf-8"))
+        self.assertEqual(packet["task"]["required_files"], ["project://claims/CLAIMS.md"])
+        self.assertEqual(packet["required_file_access"], [{
+            "reference": "project://claims/CLAIMS.md",
+            "path": str((self.project / "claims" / "CLAIMS.md").resolve()),
+        }])
+
+    def test_missing_required_file_at_dispatch_replans_without_starting_worker(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="required-file-disappeared", campaign_id="campaign-1",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        source = self.project / "artifacts" / "temporary-input.txt"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("temporary\n", encoding="utf-8")
+        task = research_task("disappeared-task")
+        task.role = "prover"
+        task.required_files = ["project://artifacts/temporary-input.txt"]
+        self.assertIsNone(controller._validate_director_task(task))
+        controller.pending_research = [task]
+        source.unlink()
+
+        def unexpected_start(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("worker must not start with a missing required file")
+
+        controller._start_job = unexpected_start  # type: ignore[method-assign]
+        asyncio.run(controller._launch_research(capacity=1, allow_exploration=False))
+
+        self.assertEqual(controller.pending_research, [])
+        self.assertTrue(controller.director_needed)
+        rejection = [
+            item for item in controller.store.replay()
+            if item["kind"] == "TASK_REJECTED"
+        ][-1]
+        self.assertEqual(rejection["payload"]["phase"], "dispatch")
+        self.assertIn("unavailable", rejection["payload"]["reason"])
+
+    def test_task_dependencies_are_claim_ids_not_task_ids(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="dependency-contract", campaign_id="campaign-1",
+        )
+        claim_dependency = research_task("claim-dependency")
+        claim_dependency.dependencies = ["C_ROOT"]
+        self.assertIsNone(controller._validate_director_task(claim_dependency))
+
+        task_dependency = research_task("task-dependency")
+        task_dependency.dependencies = ["earlier-task"]
+        error = controller._validate_director_task(task_dependency)
+        self.assertIsNotNone(error)
+        self.assertIn("ClaimGraph claim ids", error or "")
+        self.assertIn("not task ids", error or "")
 
     def test_core_capsule_and_research_map_are_noncanonical_and_bounded(self) -> None:
         graph = ClaimGraph.load(self.runtime / "state" / "claim_graph.json")

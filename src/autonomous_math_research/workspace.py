@@ -18,8 +18,19 @@ class WorkspaceManager:
         self.repository_root = repository_root.resolve()
         self.run_dir = run_dir.resolve()
 
-    def create_job_workspace(self, task_id: str, modifies_code: bool = False) -> tuple[Path, list[Path], dict[str, Any]]:
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+    def create_job_workspace(
+        self,
+        task_id: str,
+        modifies_code: bool = False,
+        *,
+        job_id: str | None = None,
+    ) -> tuple[Path, list[Path], dict[str, Any]]:
+        safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id)
+        safe_job = (
+            re.sub(r"[^A-Za-z0-9_.-]", "_", job_id)
+            if job_id is not None else None
+        )
+        safe = f"{safe_task}--{safe_job}" if safe_job else safe_task
         if modifies_code:
             path = self.run_dir / "worktrees" / safe
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -33,6 +44,8 @@ class WorkspaceManager:
             path = self.run_dir / "jobs" / safe
             path.mkdir(parents=True, exist_ok=True)
             metadata = {"kind": "isolated_output", "path": str(path), "commit": self._git_head(self.repository_root)}
+        if job_id is not None:
+            metadata.update({"task_id": task_id, "job_id": job_id})
         (path / "artifacts").mkdir(parents=True, exist_ok=True)
         atomic_write_json(path / "workspace.json", metadata)
         return path, [path], metadata

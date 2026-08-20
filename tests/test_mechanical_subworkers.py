@@ -1769,6 +1769,122 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             {problem["kind"] for problem in status["problems"]},
         )
 
+    async def test_duplicate_task_job_instances_keep_broker_configs_isolated(self) -> None:
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        controller.lifecycle.transition(
+            LifecyclePhase.RUNNING, reason="unit test duplicate task isolation",
+        )
+        task_id = "stable-duplicate-task"
+        workspaces: list[Path] = []
+        sealed_config_hashes: list[str] = []
+        for suffix in ("first", "second"):
+            job_id = f"job-{suffix}"
+            workspace, _writable, metadata = (
+                controller.workspace.create_job_workspace(
+                    task_id, job_id=job_id,
+                )
+            )
+            future = asyncio.create_task(asyncio.Event().wait())
+            self.parent_futures.append(future)
+            controller.active[job_id] = ActiveJob(
+                job_id,
+                parent_task(task_id, "prover"),
+                future,
+                time.monotonic(),
+                300,
+                "research",
+                str(workspace),
+                "2026-08-20T00:00:00Z",
+                metadata,
+            )
+            controller.workspace.install_mechanical_broker_client(
+                workspace,
+                parent_job_id=job_id,
+                parent_task_id=task_id,
+                parent_role="prover",
+                parent_timeout_seconds=300,
+                enabled=True,
+                broker_client_source=PACKAGE_SOURCE / "delegate_mechanical_task.py",
+                broker_client_sha256=file_digest(
+                    PACKAGE_SOURCE / "delegate_mechanical_task.py"
+                ),
+            )
+            active = controller.active[job_id]
+            active.broker_client_sha256 = file_digest(
+                workspace / "delegate_mechanical_task.py"
+            )
+            active.broker_config_sha256 = file_digest(
+                controller.workspace.mechanical_broker_config_path(workspace)
+            )
+            workspaces.append(workspace)
+            sealed_config_hashes.append(active.broker_config_sha256)
+
+        self.assertNotEqual(workspaces[0], workspaces[1])
+        self.assertNotEqual(
+            controller.workspace.mechanical_broker_config_path(workspaces[0]),
+            controller.workspace.mechanical_broker_config_path(workspaces[1]),
+        )
+        self.assertEqual(
+            file_digest(controller.workspace.mechanical_broker_config_path(workspaces[0])),
+            sealed_config_hashes[0],
+        )
+        self.assertEqual(
+            file_digest(controller.workspace.mechanical_broker_config_path(workspaces[1])),
+            sealed_config_hashes[1],
+        )
+
+        await controller._poll_mechanical_requests()
+
+        self.assertFalse(controller._internal_failure)
+        self.assertNotIn(
+            "MECHANICAL_BROKER_INTEGRITY_FAILURE",
+            [item["kind"] for item in controller.store.replay()],
+        )
+
+    async def test_start_job_rejects_an_already_active_task_id(self) -> None:
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        existing_job_id, _request_path, _response_path = self._activate_parent(
+            controller,
+            role="prover",
+            suffix="duplicate-start-existing",
+            parent_task_id="stable-active-task",
+        )
+        active = controller.active[existing_job_id]
+        original_config_hash = active.broker_config_sha256
+        new_job_id = "job-duplicate-start-new"
+        workspace, writable, _metadata = controller.workspace.create_job_workspace(
+            "stable-active-task", job_id=new_job_id,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "task_id .* already active"):
+            controller._start_job(
+                parent_task("stable-active-task", "prover"),
+                "bounded prompt",
+                controller._schema("worker_result.schema.json"),
+                workspace,
+                writable,
+                "research",
+                estimated_tokens=1,
+                job_id=new_job_id,
+            )
+
+        self.assertEqual(
+            file_digest(controller.workspace.mechanical_broker_config_path(
+                Path(active.workspace or "")
+            )),
+            original_config_hash,
+        )
+
 
 class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
     def test_top_level_roles_keep_their_strong_model_routes(self) -> None:

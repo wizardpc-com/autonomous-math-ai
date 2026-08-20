@@ -64,6 +64,32 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertEqual(result["jobs_started"], 0)
         self.assertFalse(result["internal_failure"])
 
+    def test_campaign_continue_forwards_a_complete_run_namespace(self) -> None:
+        self._init()
+        code, first = self._cli([
+            "run", "--project", str(self.project), "--dry-run",
+        ])
+        self.assertEqual(code, 0, first)
+
+        code, continued = self._cli([
+            "campaign", "continue", "--project", str(self.project),
+            "--campaign", first["campaign_id"], "--dry-run",
+        ])
+
+        self.assertEqual(code, 0, continued)
+        self.assertEqual(continued["campaign_id"], first["campaign_id"])
+        self.assertNotEqual(continued["run_id"], first["run_id"])
+        self.assertEqual(continued["jobs_started"], 0)
+        manifest = json.loads(
+            (
+                ProjectLayout(self.project).run_dir(continued["run_id"])
+                / "RUN_MANIFEST.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["campaign"]["previous_epoch_id"], first["epoch_id"],
+        )
+
     def test_run_uses_project_campaign_defaults_and_cli_overrides_them(self) -> None:
         self._init()
         config_path = self.project / "autonomous" / "config.yaml"

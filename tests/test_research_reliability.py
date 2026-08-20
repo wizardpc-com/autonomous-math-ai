@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import shutil
 import unittest
 from uuid import uuid4
 
-from autonomous_math_research.app_server import TurnOwnershipRegistry
+from autonomous_math_research.app_server import (
+    AppServerClient, AppServerRequestError, TurnOwnershipRegistry,
+)
 from autonomous_math_research.backend import AppServerBackend, TurnDirective
 from autonomous_math_research.claim_graph import ClaimGraph
 from autonomous_math_research.config import load_config
@@ -315,6 +318,341 @@ class TurnOwnershipTests(unittest.TestCase):
         self.assertEqual(
             registry.unmanaged_continuations,
             [{"thread_id": "thread-1", "turn_id": "native-turn-2"}],
+        )
+
+    def test_duplicate_started_notification_for_owned_turn_is_idempotent(self) -> None:
+        registry = TurnOwnershipRegistry()
+        registry.begin_controller_turn("thread-1")
+
+        self.assertTrue(registry.observe_started("thread-1", "turn-1"))
+        self.assertTrue(registry.observe_started("thread-1", "turn-1"))
+        self.assertEqual(registry.unmanaged_continuations, [])
+
+    def test_second_distinct_started_notification_is_unmanaged(self) -> None:
+        registry = TurnOwnershipRegistry()
+        registry.begin_controller_turn("thread-1")
+
+        self.assertTrue(registry.observe_started("thread-1", "turn-1"))
+        self.assertFalse(registry.observe_started("thread-1", "turn-2"))
+        self.assertEqual(
+            registry.unmanaged_continuations,
+            [{"thread_id": "thread-1", "turn_id": "turn-2"}],
+        )
+
+    def test_unknown_completion_cannot_rebind_started_owned_turn(self) -> None:
+        registry = TurnOwnershipRegistry()
+        registry.begin_controller_turn("thread-1")
+        self.assertTrue(registry.observe_started("thread-1", "turn-1"))
+
+        self.assertFalse(registry.observe_completed("thread-1", "turn-2"))
+
+
+class _CorrelatedTurnClient(AppServerClient):
+    def __init__(self, completion_orders: list[str], *, mismatched_response_ids: bool = False):
+        super().__init__(codex_executable="unused")
+        self.completion_orders = list(completion_orders)
+        self.mismatched_response_ids = mismatched_response_ids
+        self.turn_number = 0
+        self.traced: list[dict[str, object]] = []
+        self.notification_handler = self.traced.append
+
+    def _emit_completed_turn(self, thread_id: str, turn_id: str, number: int) -> None:
+        self._handle_notification({
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "inProgress"},
+            },
+        })
+        self._handle_notification({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {
+                    "id": f"message-{number}",
+                    "type": "agentMessage",
+                    "text": json.dumps({"turn": number}),
+                },
+            },
+        })
+        self._handle_notification({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "tokenUsage": {"total": {"totalTokens": number * 100}},
+            },
+        })
+        self._handle_notification({
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            },
+        })
+
+    async def request(  # type: ignore[override]
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 60,
+    ) -> object:
+        del timeout
+        if method != "turn/start":
+            raise AssertionError(f"unexpected request: {method}")
+        assert params is not None
+        self.turn_number += 1
+        number = self.turn_number
+        thread_id = str(params["threadId"])
+        turn_id = f"turn-{number}"
+        response_turn_id = f"response-{number}" if self.mismatched_response_ids else turn_id
+        order = self.completion_orders.pop(0)
+        if order == "before_response":
+            self._emit_completed_turn(thread_id, turn_id, number)
+        elif order == "after_response":
+            asyncio.get_running_loop().call_later(
+                0.01, self._emit_completed_turn, thread_id, turn_id, number,
+            )
+        elif order == "late_previous_before_response":
+            if number < 2:
+                raise AssertionError("late previous completion requires a prior turn")
+            previous_turn_id = f"turn-{number - 1}"
+            self._handle_notification({
+                "method": "turn/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": previous_turn_id, "status": "inProgress"},
+                },
+            })
+            self._handle_notification({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": previous_turn_id,
+                    "item": {
+                        "id": "late-message",
+                        "type": "agentMessage",
+                        "text": '{"turn": 999}',
+                    },
+                },
+            })
+            self._handle_notification({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": previous_turn_id,
+                    "tokenUsage": {"total": {"totalTokens": 99900}},
+                },
+            })
+            self._handle_notification({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": previous_turn_id, "status": "completed"},
+                },
+            })
+            asyncio.get_running_loop().call_later(
+                0.01, self._emit_completed_turn, thread_id, turn_id, number,
+            )
+        else:
+            raise AssertionError(f"unknown completion order: {order}")
+        return {"turn": {"id": response_turn_id, "status": "inProgress"}}
+
+
+class _FailedStartClient(AppServerClient):
+    def __init__(self):
+        super().__init__(codex_executable="unused")
+        self.interrupt_calls: list[tuple[str, str]] = []
+
+    async def request(  # type: ignore[override]
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 60,
+    ) -> object:
+        del timeout
+        if method != "turn/start":
+            raise AssertionError(f"unexpected request: {method}")
+        assert params is not None
+        thread_id = str(params["threadId"])
+        self._handle_notification({
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turn": {"id": "turn-started-before-error", "status": "inProgress"},
+            },
+        })
+        raise AppServerRequestError({"code": "request_failed", "message": "rejected"})
+
+    async def interrupt(self, thread_id: str, turn_id: str) -> object:
+        self.interrupt_calls.append((thread_id, turn_id))
+        return {}
+
+
+class _HangingTurnClient(AppServerClient):
+    def __init__(self):
+        super().__init__(codex_executable="unused")
+        self.started = asyncio.Event()
+        self.interrupt_calls: list[tuple[str, str]] = []
+
+    async def request(  # type: ignore[override]
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 60,
+    ) -> object:
+        del timeout
+        if method != "turn/start":
+            raise AssertionError(f"unexpected request: {method}")
+        assert params is not None
+        thread_id = str(params["threadId"])
+        self._handle_notification({
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turn": {"id": "turn-hanging", "status": "inProgress"},
+            },
+        })
+        self.started.set()
+        return {"turn": {"id": "turn-hanging", "status": "inProgress"}}
+
+    async def interrupt(self, thread_id: str, turn_id: str) -> object:
+        self.interrupt_calls.append((thread_id, turn_id))
+        return {}
+
+
+class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
+    async def _start_turn(
+        self, client: AppServerClient,
+    ) -> tuple[dict[str, object], str, TokenUsage, str]:
+        return await client.start_turn(
+            thread_id="thread-1",
+            prompt="continue",
+            cwd=Path.cwd(),
+            model="gpt-5.6-sol",
+            effort="high",
+            output_schema={
+                "type": "object",
+                "properties": {"turn": {"type": "integer"}},
+                "required": ["turn"],
+                "additionalProperties": False,
+            },
+            writable_roots=[Path.cwd()],
+            timeout=1,
+        )
+
+    async def test_normal_completion_is_not_reused_by_next_turn(self) -> None:
+        client = _CorrelatedTurnClient(["after_response", "after_response"])
+
+        first = await self._start_turn(client)
+        second = await self._start_turn(client)
+
+        self.assertEqual(first[0]["turn"]["id"], "turn-1")
+        self.assertEqual(first[1], '{"turn": 1}')
+        self.assertEqual(second[0]["turn"]["id"], "turn-2")
+        self.assertEqual(second[1], '{"turn": 2}')
+        self.assertEqual(second[2].total_tokens, 200)
+        self.assertNotIn("turn-1", client._messages)
+        self.assertEqual(client.turn_ownership.unmanaged_continuations, [])
+        self.assertEqual(client._completed_thread_turns, {})
+        self.assertEqual(client._completed_turns, {})
+
+    async def test_completion_before_response_clears_both_cache_indexes(self) -> None:
+        client = _CorrelatedTurnClient(["before_response", "after_response"])
+
+        first = await self._start_turn(client)
+        second = await self._start_turn(client)
+
+        self.assertEqual(first[0]["turn"]["id"], "turn-1")
+        self.assertEqual(second[0]["turn"]["id"], "turn-2")
+        self.assertEqual(second[1], '{"turn": 2}')
+        self.assertEqual(second[2].total_tokens, 200)
+        self.assertNotIn("turn-1", client._messages)
+        self.assertEqual(client.turn_ownership.unmanaged_continuations, [])
+        self.assertEqual(client._completed_thread_turns, {})
+        self.assertEqual(client._completed_turns, {})
+
+    async def test_mismatched_response_and_stream_ids_remain_correlated(self) -> None:
+        client = _CorrelatedTurnClient(
+            ["before_response", "after_response"],
+            mismatched_response_ids=True,
+        )
+
+        first = await self._start_turn(client)
+        second = await self._start_turn(client)
+
+        self.assertEqual(first[0]["turn"]["id"], "turn-1")
+        self.assertEqual(first[1], '{"turn": 1}')
+        self.assertEqual(second[0]["turn"]["id"], "turn-2")
+        self.assertEqual(second[1], '{"turn": 2}')
+        self.assertEqual(client.turn_ownership.unmanaged_continuations, [])
+
+    async def test_late_previous_notifications_cannot_bind_next_turn(self) -> None:
+        client = _CorrelatedTurnClient(
+            ["after_response", "late_previous_before_response"],
+        )
+
+        first = await self._start_turn(client)
+        second = await self._start_turn(client)
+
+        self.assertEqual(first[0]["turn"]["id"], "turn-1")
+        self.assertEqual(second[0]["turn"]["id"], "turn-2")
+        self.assertEqual(second[1], '{"turn": 2}')
+        self.assertEqual(second[2].total_tokens, 200)
+        self.assertNotIn("turn-1", client._messages)
+        self.assertEqual(client.turn_ownership.unmanaged_continuations, [])
+
+    async def test_started_turn_is_interrupted_when_start_request_fails(self) -> None:
+        client = _FailedStartClient()
+
+        with self.assertRaises(AppServerRequestError):
+            await self._start_turn(client)
+
+        self.assertEqual(
+            client.interrupt_calls,
+            [("thread-1", "turn-started-before-error")],
+        )
+        self.assertNotIn("thread-1", client.turn_ownership._open_threads)
+
+    async def test_cancelled_wait_interrupts_remote_turn_and_closes_ownership(self) -> None:
+        client = _HangingTurnClient()
+        task = asyncio.create_task(self._start_turn(client))
+        await client.started.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(client.interrupt_calls, [("thread-1", "turn-hanging")])
+        self.assertNotIn("thread-1", client.turn_ownership._open_threads)
+
+    async def test_unknown_completion_of_open_turn_fails_closed_immediately(self) -> None:
+        traced: list[dict[str, object]] = []
+        client = AppServerClient(codex_executable="unused", notification_handler=traced.append)
+        client.turn_ownership.begin_controller_turn("thread-1")
+        client._handle_notification({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-owned", "status": "inProgress"},
+            },
+        })
+        client._handle_notification({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-other", "status": "completed"},
+            },
+        })
+
+        self.assertIn(
+            "amr/unmanagedContinuation",
+            [str(item.get("method")) for item in traced],
+        )
+        self.assertEqual(
+            client.turn_ownership.unmanaged_continuations,
+            [{"thread_id": "thread-1", "turn_id": "turn-other"}],
         )
 
 

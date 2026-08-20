@@ -46,6 +46,21 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - App Server active goals are no longer armed for autonomous jobs; token limits
   remain controller-enforced, unowned native continuations fail closed, and
   only controller-verified canonical progress resets stagnation.
+- Director task admission now resolves portable `project://`, `campaign://`,
+  and `epoch://` required-file references, rechecks them before dispatch, and
+  gives workers an internal readable-path mapping without weakening durable
+  evidence references. Task dependencies are explicitly ClaimGraph claim ids.
+- Director task admission rejects attempts to bind one stable task id to
+  different task content.
+- Top-level job workspaces and mechanical broker control files are isolated by
+  controller job id, with a final active-task-id guard against concurrent
+  duplicate dispatch.
+- `amr campaign continue` now forwards the complete internal run namespace,
+  including the fresh-epoch run id default, instead of failing before preflight.
+- App Server completion correlation no longer leaves a thread-level copy of a
+  delivered turn that can be consumed by the next same-thread continuation.
+  Response/stream id aliases, repeated start notifications, request failure,
+  cancellation, and unknown completion ids now have explicit tested handling.
 
 ### Planned
 

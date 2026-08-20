@@ -46,3 +46,11 @@ amr status --project ./research-target --run latest
 真实运行前请检查每个角色的 provider/model/effort/tier/timeout/retry/concurrency/
 token/cost，确认 canonical inputs、protected paths、独立审计和机械子工背压。省略
 `--mock` 与 `--dry-run` 才会进入真实 provider。
+
+## 恢复与继续
+
+- `--resume` 只用于同一个尚未封存、因崩溃中断的 epoch。
+- `amr campaign continue` 从最近的封存 checkpoint 创建新 epoch。
+- 对已暂停并封存的 epoch，应先用独立的新 dry-run 验证升级后的 harness，再继续原
+  campaign；不要对它使用 `--resume`，也不要把 dry-run 写入原真实 campaign。
+- 历史失败 epoch 保持不可变，新 epoch 只导入仍未终止的 frontier。
