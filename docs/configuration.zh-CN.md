@@ -1,6 +1,6 @@
 # 配置与 profile
 
-配置 schema v10 的合并顺序是：内置 `codex-app-server-default`、manifest 指定的项目
+配置 schema v11 的合并顺序是：内置 `codex-app-server-default`、manifest 指定的项目
 `autonomous/config.yaml`、显式 `--profile`、可选的 launcher 一次性覆盖。最后执行核心可信边界校验，因此项目或
 用户 profile 都不能移除核心 protected paths、关闭 final claim 独立审计、替换持久
 controller、开放机械子工网络或启用 fast/priority/auto tier。
@@ -43,12 +43,16 @@ dispatch batch、超时和 operator stop 约束。策略可选 `preferred`、`ba
 
 token telemetry 分开记录总 input、cached input、uncached input、cache-write input、output
 和 reasoning output。provider 的 total token 继续作为预算权威值；评估单任务深度时应查看
-uncached/output/reasoning。`You've hit your usage limit` 等 provider 用量耗尽错误统一归类为
-`provider_quota_exhausted`：campaign 暂停，精确任务或非 canonical 检查点保留到下一 epoch，
-provider 提供的官方 reset 时间会被保存；它不计入数学失败、路线失败或 stagnation。
+uncached/output/reasoning。机械 Spark 遇到模型不可用、额度、传输或超时时，只会按固定策略
+切换一次到配置的 fallback（默认 Luna medium）。策略、权限、任务资格、schema、protocol 和
+artifact 错误不得触发 fallback。若 fallback 也出现 `You've hit your usage limit` 等用量耗尽，
+则归类为 `provider_quota_exhausted`：campaign 暂停，精确任务或非 canonical 检查点保留到下一
+epoch，provider 提供的官方 reset 时间会被保存；它不计入数学失败、路线失败或 stagnation。
+只要任一机械尝试缺少完整 token telemetry，监视面板就显示观测下界和未知次数，例如
+“机械 ≥0（1次用量未知）”，不能再把它理解为精确的零消耗。
 
 用户 profile 必须只含 `profile_schema_version`、`name`、`extends`、`overrides`，且
-不能改项目 ID。v7/v8/v9 项目配置会在内存中迁移到 v10；审核有效配置后可用
+不能改项目 ID。v7/v8/v9/v10 项目配置会在内存中迁移到 v11；审核有效配置后可用
 `amr config migrate --project PATH --write` 原子写回，且不会启动模型。launcher 的
 一次性覆盖只允许简单运行和路由字段；provider capability、credential、protected
 paths、audit/trust policy 等必须编辑项目配置并重新通过完整预检。示例见

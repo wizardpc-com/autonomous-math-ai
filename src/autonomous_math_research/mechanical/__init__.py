@@ -82,6 +82,12 @@ FALLBACK_MECHANICAL_ROUTE = {
     "reasoning_effort": "medium",
     "service_tier": None,
 }
+MECHANICAL_FALLBACK_FAILURE_KINDS = frozenset({
+    "model_unavailable",
+    "provider_quota_exhausted",
+    "transport_transient",
+    "timeout_transient",
+})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 _FORBIDDEN_TOOL_RE = re.compile(
@@ -101,6 +107,21 @@ _PROOF_DIRECTIVE_MARKERS = (
     "prove the", "prove that", "disprove", "construct a proof",
     "证明该", "证明此", "证明命题", "给出证明", "构造证明", "证伪命题",
 )
+
+
+def _contains_proof_directive(text: str, marker: str) -> bool:
+    start = 0
+    while True:
+        index = text.find(marker, start)
+        if index < 0:
+            return False
+        prefix = text[max(0, index - 24):index]
+        if not (
+            re.search(r"(?:does|do|did|will|would|can|could)\s+not\s+$", prefix)
+            or prefix.endswith(("不", "不能", "并非要", "并不"))
+        ):
+            return True
+        start = index + len(marker)
 
 
 class MechanicalTaskRejected(ValueError):
@@ -177,14 +198,18 @@ def validate_mechanical_task_packet(
     for raw in inputs:
         path = Path(raw)
         if path.is_absolute() or ".." in path.parts:
-            raise MechanicalTaskRejected(f"input file must be repository-relative: {raw}")
+            raise MechanicalTaskRejected(
+                f"input file must be parent-workspace-relative: {raw}"
+            )
         if _sensitive_repository_input(path):
             raise MechanicalTaskRejected(
                 f"input file is authentication/VCS metadata and is forbidden: {raw}"
             )
         resolved = (repository / path).resolve()
         if not resolved.is_relative_to(repository) or not resolved.is_file():
-            raise MechanicalTaskRejected(f"input file is missing or outside repository: {raw}")
+            raise MechanicalTaskRejected(
+                f"input file is missing or outside the parent workspace: {raw}"
+            )
     bounds = value["bounds"]
     if not isinstance(bounds, dict) or not bounds:
         raise MechanicalTaskRejected("bounds must be a non-empty finite-bound object")
@@ -241,7 +266,10 @@ def validate_mechanical_task_packet(
     marker = next((item for item in _JUDGMENT_MARKERS if item in all_text), None)
     if marker is None:
         marker = next(
-            (item for item in _PROOF_DIRECTIVE_MARKERS if item in directive_text),
+            (
+                item for item in _PROOF_DIRECTIVE_MARKERS
+                if _contains_proof_directive(directive_text, item)
+            ),
             None,
         )
     if marker:
@@ -344,12 +372,14 @@ class MechanicalExecution:
     error: str | None = None
     failure_kind: str | None = None
     retryable: bool = False
+    provider_reset_at: str | None = None
     unavailable_routes: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MechanicalRunner(Protocol):
     async def run(
         self, *, packet_path: Path, output_root: Path, timeout_seconds: int,
+        route: str = "primary",
     ) -> MechanicalExecution: ...
 
 
@@ -512,6 +542,7 @@ class SubprocessMechanicalRunner:
         self.schema_validator = package_root / "schema.py"
         self.contract_definitions = package_root / "contracts.py"
         self.expected_hashes: dict[Path, str] = {}
+        self.supports_explicit_route_selection = True
         self._unavailable_records: dict[tuple[str, str | None, None], dict[str, Any]] = {}
         self._load_read_only_status_seed()
 
@@ -761,6 +792,9 @@ class SubprocessMechanicalRunner:
                 worker_manifest["contract_definitions"]["sha256"]
             ),
         }
+        self.supports_explicit_route_selection = (
+            '"start_route"' in self.script.read_text(encoding="utf-8")
+        )
 
     @staticmethod
     def _digest(path: Path) -> str:
@@ -985,6 +1019,10 @@ class SubprocessMechanicalRunner:
             error=(str(failure.get("message")) if failure.get("message") else None),
             failure_kind=(str(failure.get("kind")) if failure.get("kind") else None),
             retryable=bool(failure.get("retryable", False)),
+            provider_reset_at=(
+                str(failure.get("provider_reset_at"))[:200]
+                if failure.get("provider_reset_at") is not None else None
+            ),
             unavailable_routes=unavailable_routes,
         )
 
@@ -1158,8 +1196,23 @@ class SubprocessMechanicalRunner:
 
     async def run(
         self, *, packet_path: Path, output_root: Path, timeout_seconds: int,
+        route: str = "primary",
     ) -> MechanicalExecution:
+        if route not in {"primary", "fallback"}:
+            raise MechanicalTaskRejected("mechanical route must be primary or fallback")
+        packet_path = packet_path.resolve()
         output_root = output_root.resolve()
+        attempt_root = output_root.parent
+        workspace_root = attempt_root.parent
+        if (
+            output_root != (workspace_root / "mechanical_subtasks" / "runs").resolve()
+            or packet_path.parent
+            != (workspace_root / "mechanical_subtasks" / "packets").resolve()
+            or not workspace_root.is_relative_to(self.repository_root)
+        ):
+            raise MechanicalTaskRejected(
+                "mechanical packet/output paths do not share a valid parent attempt workspace"
+            )
         output_root.mkdir(parents=True, exist_ok=True)
         if not output_root.is_relative_to(self.repository_root):
             raise MechanicalTaskRejected("mechanical output root escapes repository")
@@ -1173,7 +1226,7 @@ class SubprocessMechanicalRunner:
         command = [
             sys.executable,
             str(self.script),
-            str(packet_path.resolve()),
+            str(packet_path),
             "--output-root", str(output_root),
             "--timeout", str(int(timeout_seconds)),
             "--broker-managed",
@@ -1181,14 +1234,17 @@ class SubprocessMechanicalRunner:
         route_config_path = (
             output_root.parent / "route-configs" / f"{packet_path.stem}.json"
         )
-        atomic_write_json(route_config_path, {
-            "schema_version": 1,
+        selected_primary = self.primary_route
+        if route == "fallback" and not self.supports_explicit_route_selection:
+            selected_primary = self.fallback_route
+        route_config = {
+            "schema_version": 2 if self.supports_explicit_route_selection else 1,
             "primary_route": {
-                "provider": self.primary_route.get("provider"),
-                "model": self.primary_route["model"],
-                "reasoning_effort": self.primary_route["reasoning_effort"],
+                "provider": selected_primary.get("provider"),
+                "model": selected_primary["model"],
+                "reasoning_effort": selected_primary["reasoning_effort"],
                 "service_tier": None,
-                "profile": self.primary_route.get("profile"),
+                "profile": selected_primary.get("profile"),
             },
             "fallback_route": {
                 "provider": self.fallback_route.get("provider"),
@@ -1197,7 +1253,10 @@ class SubprocessMechanicalRunner:
                 "service_tier": None,
                 "profile": self.fallback_route.get("profile"),
             },
-        })
+        }
+        if self.supports_explicit_route_selection:
+            route_config["start_route"] = route
+        atomic_write_json(route_config_path, route_config)
         command.extend(["--route-config", str(route_config_path)])
         receipt_path = self.receipt_path(packet_path, output_root)
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1213,7 +1272,7 @@ class SubprocessMechanicalRunner:
             "MATH_WORKER_CONTRACT_DEFINITIONS_PATH",
         ):
             environment.pop(key, None)
-        environment["MATH_WORKER_REPOSITORY_ROOT"] = str(self.repository_root)
+        environment["MATH_WORKER_REPOSITORY_ROOT"] = str(workspace_root)
         environment["MATH_WORKER_SCHEMA_VALIDATOR_PATH"] = str(
             self.schema_validator.resolve()
         )
@@ -1227,7 +1286,7 @@ class SubprocessMechanicalRunner:
             subprocess_options["start_new_session"] = True
         process = await asyncio.create_subprocess_exec(
             *command,
-            cwd=str(self.repository_root),
+            cwd=str(workspace_root),
             env=environment,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,

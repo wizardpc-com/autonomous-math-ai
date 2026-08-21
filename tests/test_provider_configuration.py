@@ -59,7 +59,7 @@ class ProviderConfigurationTests(unittest.TestCase):
 
     def test_default_profile_is_codex_and_new_budgets_are_separate(self) -> None:
         config = load_config(self.project)
-        self.assertEqual(config.raw["schema_version"], 10)
+        self.assertEqual(config.raw["schema_version"], 11)
         self.assertEqual(config.raw["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
         self.assertEqual(config.profile_name, "codex-app-server-default")
         self.assertTrue(all(
@@ -70,6 +70,10 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertIsNone(config.max_mechanical_subworkers)
         self.assertFalse(
             config.raw["policy"]["one_shot_compute_worker"]["recursive_spawn_allowed"]
+        )
+        self.assertEqual(
+            config.raw["policy"]["one_shot_compute_worker"]["fallback_condition"],
+            "provider_execution_failure",
         )
         self.assertEqual(config.research_max_turns("prover"), 12)
         self.assertEqual(config.research_max_turns("falsifier"), 12)
@@ -159,7 +163,7 @@ class ProviderConfigurationTests(unittest.TestCase):
             json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
         config = load_config(self.project)
-        self.assertEqual(config.migrations_applied, ("8->9", "9->10"))
+        self.assertEqual(config.migrations_applied, ("8->9", "9->10", "10->11"))
         self.assertEqual(config.campaign_hours, 12.0)
         self.assertEqual(config.epoch_hours, 2.0)
 
@@ -167,8 +171,12 @@ class ProviderConfigurationTests(unittest.TestCase):
             "config", "summary", "--project", str(self.project),
         ])
         self.assertEqual(code, 0, payload)
-        self.assertEqual(payload["config_schema_version"], 10)
+        self.assertEqual(payload["config_schema_version"], 11)
         self.assertEqual(payload["campaign"]["epoch_hours"], 2.0)
+        self.assertEqual(
+            payload["mechanical"]["fallback_condition"],
+            "provider_execution_failure",
+        )
         self.assertEqual(payload["model_turns_started"], 0)
 
         code, payload = self._cli([
@@ -177,7 +185,7 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["written"])
         persisted = json.loads(config_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 10)
+        self.assertEqual(persisted["schema_version"], 11)
         self.assertEqual(persisted["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
         self.assertEqual(payload["model_turns_started"], 0)
 
@@ -191,6 +199,30 @@ class ProviderConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not exceed"):
             load_config(self.project, profile_path=self._profile(profile))
 
+    def test_v10_mechanical_fallback_policy_migrates_without_changing_routes(self) -> None:
+        config_path = self.project / "autonomous" / "config.yaml"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["schema_version"] = 10
+        worker = raw["policy"]["one_shot_compute_worker"]
+        worker["fallback_condition"] = "permanent_unavailable_or_access_denied"
+        before_routes = (worker["primary_route"], worker["fallback_route"])
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        migrated = load_config(self.project)
+
+        effective_worker = migrated.raw["policy"]["one_shot_compute_worker"]
+        self.assertEqual(migrated.migrations_applied, ("10->11",))
+        self.assertEqual(
+            effective_worker["fallback_condition"], "provider_execution_failure"
+        )
+        self.assertEqual(
+            (effective_worker["primary_route"], effective_worker["fallback_route"]),
+            before_routes,
+        )
+
     def test_v9_scalar_turn_limit_migrates_and_per_role_override_validates(self) -> None:
         config_path = self.project / "autonomous" / "config.yaml"
         raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -200,7 +232,7 @@ class ProviderConfigurationTests(unittest.TestCase):
             json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
         migrated = load_config(self.project)
-        self.assertEqual(migrated.migrations_applied, ("9->10",))
+        self.assertEqual(migrated.migrations_applied, ("9->10", "10->11"))
         self.assertEqual(migrated.raw["engine"]["research_max_turns"], {
             "prover": 7, "falsifier": 7, "explorer": 7,
         })

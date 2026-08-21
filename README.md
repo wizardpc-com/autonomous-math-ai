@@ -160,10 +160,11 @@ campaign cleanly; route updates alone never keep an empty execution queue alive.
 Research and audit roles may request simple, finite, mechanically checkable
 work through the controller-managed broker. The default route is
 `gpt-5.3-codex-spark` with high reasoning effort and a null service tier. Only
-an explicit permanent unavailable/access-denied result permits one fallback to
-`gpt-5.6-luna` with medium effort and a null service tier. Transient failures do
-not poison model availability, and no fallback uses a parent model, fast, or
-priority service.
+a provider execution failure—model unavailable, quota, transport, or timeout—
+permits one fallback to `gpt-5.6-luna` with medium effort and a null service
+tier. Policy, permission, eligibility, schema, protocol, and artifact failures
+remain terminal. Transient failures do not poison model availability, and no
+fallback uses a parent model, fast, or priority service.
 
 Mechanical output is execution evidence only. The parent research role must
 interpret it, and a strong independent auditor remains responsible for any
@@ -173,7 +174,8 @@ The default static mechanical seat cap is unbounded. This removes only a fixed
 seat count: dispatch still obeys a separate 1.5-billion-token default budget,
 cost limits, CPU/resource capacity, provider rate limits, a bounded queue,
 dispatch batches, timeouts, and operator stop. The main-role default is 500
-million tokens; the monitor displays both budgets separately.
+million tokens; the monitor displays both budgets separately and marks token
+usage as a lower bound when any mechanical attempt lacks complete telemetry.
 
 ## Safety and scope
 

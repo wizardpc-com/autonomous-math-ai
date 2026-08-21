@@ -1676,6 +1676,7 @@ class _MonitorDashboardState:
         self.thread_tokens: dict[str, int] = {}
         self.completed_usage: dict[str, tuple[str, int]] = {}
         self.completed_mechanical_tokens = 0
+        self.mechanical_unknown_usage_count = 0
         self.rate_used: Any = None
         self.active_tools: dict[str, tuple[str, str]] = {}
         self.task_names: dict[str, str] = {}
@@ -1782,6 +1783,10 @@ class _MonitorDashboardState:
                 self.completed_mechanical_tokens += int(
                     usage.get("total_tokens") or 0
                 )
+                if str(payload.get("token_telemetry") or "unknown") in {
+                    "unknown", "partial",
+                }:
+                    self.mechanical_unknown_usage_count += 1
             parent = str(payload.get("parent_job_id") or "")
             subtask = str(payload.get("subtask_id") or "")
             for job_id, record in list(self.active_jobs.items()):
@@ -2136,6 +2141,11 @@ class _MonitorDashboardState:
             _token_text(self.mechanical_budget)
             if self.mechanical_budget is not None else "未设上限"
         )
+        mechanical_usage = _token_text(self.mechanical_tokens)
+        if self.mechanical_unknown_usage_count:
+            mechanical_usage = (
+                f"≥{mechanical_usage}（{self.mechanical_unknown_usage_count}次用量未知）"
+            )
         rate = f"｜Rate {self.rate_used}%" if self.rate_used is not None else ""
         # Role caps are independent; an incremental Director can run beside
         # research and audit after a meaningful state change.
@@ -2153,7 +2163,7 @@ class _MonitorDashboardState:
         second = (
             f"状态 {status}｜Run {self.run_id}｜运行 {elapsed}｜"
             f"Token 主角色 {_token_text(self.total_tokens)}/{budget}｜"
-            f"机械 {_token_text(self.mechanical_tokens)}/{mechanical_budget}{rate}"
+            f"机械 {mechanical_usage}/{mechanical_budget}{rate}"
         )
         mechanical_limit = (
             "∞(资源背压 " + str(self.mechanical_effective_resource_cap or "-") + ")"

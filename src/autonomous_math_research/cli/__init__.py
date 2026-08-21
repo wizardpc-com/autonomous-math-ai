@@ -453,6 +453,12 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         float(args.epoch_hours or checkpoint.epoch_hours),
         checkpoint.remaining_seconds / 3600.0,
     )
+    previous_epoch_id = campaign.latest_continuable_epoch()
+    if checkpoint.epochs and previous_epoch_id is None:
+        raise ValueError(
+            "campaign has no usable sealed checkpoint; bootstrap-failed epochs "
+            "cannot seed continuation"
+        )
     forwarded = argparse.Namespace(
         project=project,
         workspace_root=args.workspace_root, hours=checkpoint.campaign_hours,
@@ -460,7 +466,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         max_audit=None, max_mechanical_subworkers=None, budget=None, config=None,
         profile=args.profile, dry_run=args.dry_run, mock=args.mock, resume=None,
         run_id=None, recover_candidates_from=None, campaign_id=args.campaign,
-        previous_epoch_id=(checkpoint.epochs[-1] if checkpoint.epochs else None),
+        previous_epoch_id=previous_epoch_id,
     )
     return await _run_command(forwarded)
 

@@ -226,6 +226,7 @@ class HarnessConfig:
             "mechanical": {
                 "enabled": worker["enabled"],
                 "selection_policy": worker["selection_policy"],
+                "fallback_condition": worker["fallback_condition"],
                 "primary_route": {
                     key: worker["primary_route"].get(key) for key in route_fields
                 },
@@ -547,8 +548,10 @@ def _validate_config(raw: dict[str, Any]) -> None:
         )
     if worker.get("service_tier") is not None:
         raise ValueError("mechanical workers must explicitly clear service tier")
-    if worker.get("fallback_condition") != "permanent_unavailable_or_access_denied":
-        raise ValueError("mechanical fallback is allowed only for permanent unavailable/access denied")
+    if worker.get("fallback_condition") != "provider_execution_failure":
+        raise ValueError(
+            "mechanical fallback must use the explicit provider execution failure policy"
+        )
     if worker.get("recursive_spawn_allowed") is not False:
         raise ValueError("mechanical workers must prohibit recursive spawn")
     for key in ("transient_max_retries", "model_protocol_max_retries"):

@@ -171,7 +171,10 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
             raise ValueError(f"pinned mechanical {route_name} is incomplete")
         if route["service_tier"] is not None:
             raise ValueError(f"pinned mechanical {route_name} has a forbidden service tier")
-    if worker["fallback_condition"] != "permanent_unavailable_or_access_denied":
+    if worker["fallback_condition"] not in {
+        "provider_execution_failure",
+        "permanent_unavailable_or_access_denied",
+    }:
         raise ValueError("pinned mechanical fallback condition is invalid")
     if worker["recursive_spawn_allowed"] is not False:
         raise ValueError("pinned mechanical worker must prohibit recursive spawn")

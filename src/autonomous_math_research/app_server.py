@@ -96,6 +96,46 @@ class AppServerError(RuntimeError):
     pass
 
 
+class AppServerTransportClosed(AppServerError):
+    """The shared stdio transport is no longer safe for new requests."""
+
+
+class AppServerRequestTimeout(AppServerTransportClosed):
+    """A JSON-RPC request timed out, leaving shared transport health unknown."""
+
+    def __init__(self, method: str, timeout: float):
+        self.method = method
+        self.timeout = timeout
+        super().__init__(f"app-server request {method!r} exceeded {timeout} seconds")
+
+
+class AppServerTurnTransportLost(AppServerTransportClosed):
+    """A turn lost its transport after observable evidence was buffered."""
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        raw_output: str,
+        token_usage: TokenUsage,
+        token_telemetry: str,
+        cause: Exception,
+    ):
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.raw_output = str(redact_auth_material(raw_output))
+        self.token_usage = token_usage
+        self.token_telemetry = token_telemetry
+        self.server_error = {
+            "code": "app_server_transport_closed",
+            "message": str(redact_auth_material(str(cause))),
+        }
+        super().__init__(
+            f"turn {turn_id} lost app-server transport: {self.server_error['message']}"
+        )
+
+
 class StructuredOutputProtocolError(AppServerError):
     """The completed model message was not exactly one JSON object."""
 
@@ -353,6 +393,8 @@ class AppServerClient:
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._transport_generation = 0
+        self._transport_alive = False
         self._write_lock = threading.Lock()
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -370,8 +412,40 @@ class AppServerClient:
         self._thread_token_usage: dict[str, TokenUsage] = {}
         self._model_reroutes_by_thread: dict[str, list[dict[str, Any]]] = {}
         self.turn_ownership = TurnOwnershipRegistry()
+        self._background_tasks: set[asyncio.Future[Any]] = set()
         self.stderr_lines: list[str] = []
         self.initialize_result: dict[str, Any] | None = None
+
+    @property
+    def transport_available(self) -> bool:
+        process = self.process
+        return bool(
+            self._transport_alive
+            and process is not None
+            and process.poll() is None
+            and process.stdin is not None
+        )
+
+    @staticmethod
+    def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+        """Mark a terminal Future observed without changing its outcome."""
+        if not future.done() or future.cancelled():
+            return
+        try:
+            future.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _track_background(self, awaitable: Awaitable[Any]) -> asyncio.Future[Any]:
+        task = asyncio.ensure_future(awaitable)
+        self._background_tasks.add(task)
+
+        def finished(completed: asyncio.Future[Any]) -> None:
+            self._background_tasks.discard(completed)
+            self._consume_future_exception(completed)
+
+        task.add_done_callback(finished)
+        return task
 
     def _discard_buffered_completion_for_thread(self, thread_id: str) -> None:
         buffered = self._completed_thread_turns.pop(thread_id, None)
@@ -439,8 +513,8 @@ class AppServerClient:
                     await result
 
     def _report_unmanaged_turn(self, thread_id: str, turn_id: str) -> None:
-        if self.process is not None:
-            asyncio.create_task(self._interrupt_unmanaged_turn(thread_id, turn_id))
+        if self.transport_available:
+            self._track_background(self._interrupt_unmanaged_turn(thread_id, turn_id))
         if self.notification_handler:
             result = self.notification_handler({
                 "method": "amr/unmanagedContinuation",
@@ -451,13 +525,13 @@ class AppServerClient:
                 },
             })
             if asyncio.iscoroutine(result):
-                asyncio.create_task(result)
+                self._track_background(result)
 
     def _forward_notification(self, message: dict[str, Any]) -> None:
         if self.notification_handler:
             result = self.notification_handler(redact_auth_material(message))
             if asyncio.iscoroutine(result):
-                asyncio.create_task(result)
+                self._track_background(result)
 
     async def __aenter__(self) -> "AppServerClient":
         await self.start()
@@ -468,9 +542,13 @@ class AppServerClient:
 
     async def start(self) -> None:
         if self.process is not None:
-            return
+            if self.transport_available:
+                return
+            await self.close()
         self._loop = asyncio.get_running_loop()
-        self.process = subprocess.Popen(
+        self._transport_generation += 1
+        generation = self._transport_generation
+        process = subprocess.Popen(
             [self.codex_executable, "app-server", "--stdio"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -478,8 +556,15 @@ class AppServerClient:
             bufsize=0,
             env=app_server_environment(),
         )
-        self._reader_thread = threading.Thread(target=self._read_stdout_sync, daemon=True)
-        self._stderr_thread = threading.Thread(target=self._read_stderr_sync, daemon=True)
+        self.process = process
+        self._transport_alive = True
+        self.stderr_lines.clear()
+        self._reader_thread = threading.Thread(
+            target=self._read_stdout_sync, args=(process, generation), daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr_sync, args=(process,), daemon=True,
+        )
         self._reader_thread.start()
         self._stderr_thread.start()
         try:
@@ -502,9 +587,12 @@ class AppServerClient:
             raise AppServerError(f"App Server initialize failed: {exc}{suffix}") from exc
 
     async def close(self) -> None:
-        if self.process is None:
-            return
         process = self.process
+        generation = self._transport_generation
+        if process is None:
+            await self._drain_background_tasks()
+            return
+        self._transport_alive = False
         if process.stdin:
             try:
                 process.stdin.close()
@@ -526,11 +614,27 @@ class AppServerClient:
                     stream.close()
                 except OSError:
                     pass
-        self.process = None
+        if self.process is process:
+            self.process = None
+        self._fail_pending(generation, message="app-server closed")
+        for thread in (self._reader_thread, self._stderr_thread):
+            if thread is not None and thread.is_alive():
+                await asyncio.to_thread(thread.join, 1.0)
+        self._reader_thread = None
+        self._stderr_thread = None
+        await self._drain_background_tasks()
+
+    async def _drain_background_tasks(self) -> None:
+        tasks = list(self._background_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def request(self, method: str, params: dict[str, Any] | None = None, timeout: float = 60) -> Any:
-        if self.process is None:
-            raise AppServerError("app-server is not running")
+        if not self.transport_available:
+            raise AppServerTransportClosed("app-server is not running")
         request_id = self._next_id
         self._next_id += 1
         loop = asyncio.get_running_loop()
@@ -539,11 +643,23 @@ class AppServerClient:
         message: dict[str, Any] = {"id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        await self._send(message)
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            await self._send(message)
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                # JSON-RPC ids remain correlated, but after one request stalls
+                # the shared stdio server can no longer be assumed healthy.
+                # Fail every co-tenant promptly so the controller contains the
+                # provider once instead of dispatching a wave of 60s timeouts.
+                self._fail_pending(
+                    self._transport_generation,
+                    message=f"app-server request {method!r} timed out",
+                )
+                raise AppServerRequestTimeout(method, timeout) from exc
         finally:
             self._pending.pop(request_id, None)
+            self._consume_future_exception(future)
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         message: dict[str, Any] = {"method": method}
@@ -552,33 +668,55 @@ class AppServerClient:
         await self._send(message)
 
     async def _send(self, message: dict[str, Any]) -> None:
-        assert self.process is not None and self.process.stdin is not None
+        if not self.transport_available:
+            raise AppServerTransportClosed("app-server is not running")
+        process = self.process
+        assert process is not None and process.stdin is not None
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
-        with self._write_lock:
-            self.process.stdin.write(payload.encode("utf-8"))
-            self.process.stdin.flush()
-
-    def _read_stdout_sync(self) -> None:
-        assert self.process is not None and self.process.stdout is not None
         try:
-            while line := self.process.stdout.readline():
+            with self._write_lock:
+                process.stdin.write(payload.encode("utf-8"))
+                process.stdin.flush()
+        except OSError as exc:
+            self._fail_pending(
+                self._transport_generation,
+                message=f"app-server write failed: {type(exc).__name__}",
+            )
+            raise AppServerTransportClosed("app-server stdin closed") from exc
+
+    def _read_stdout_sync(
+        self, process: subprocess.Popen[bytes], generation: int,
+    ) -> None:
+        assert process.stdout is not None
+        try:
+            while line := process.stdout.readline():
                 try:
                     message = json.loads(line.decode("utf-8", errors="replace"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if self._loop and not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._dispatch_message, message)
+        except (OSError, ValueError):
+            pass
         finally:
             if self._loop and not self._loop.is_closed():
-                self._loop.call_soon_threadsafe(self._fail_pending)
+                try:
+                    self._loop.call_soon_threadsafe(
+                        self._fail_pending, generation,
+                    )
+                except RuntimeError:
+                    pass
 
-    def _read_stderr_sync(self) -> None:
-        assert self.process is not None and self.process.stderr is not None
-        while line := self.process.stderr.readline():
-            text = line.decode("utf-8", errors="replace").rstrip()
-            self.stderr_lines.append(text)
-            if len(self.stderr_lines) > 500:
-                del self.stderr_lines[:100]
+    def _read_stderr_sync(self, process: subprocess.Popen[bytes]) -> None:
+        assert process.stderr is not None
+        try:
+            while line := process.stderr.readline():
+                text = line.decode("utf-8", errors="replace").rstrip()
+                self.stderr_lines.append(text)
+                if len(self.stderr_lines) > 500:
+                    del self.stderr_lines[:100]
+        except (OSError, ValueError):
+            pass
 
     def _dispatch_message(self, message: dict[str, Any]) -> None:
         if "id" in message and ("result" in message or "error" in message) and "method" not in message:
@@ -590,21 +728,26 @@ class AppServerClient:
                     future.set_result(message.get("result"))
             return
         if "id" in message and "method" in message:
-            asyncio.create_task(self._reject_server_request(message))
+            self._track_background(self._reject_server_request(message))
             return
         self._handle_notification(message)
 
-    def _fail_pending(self) -> None:
-        error = AppServerError("app-server stdout closed")
-        for future in self._pending.values():
+    def _fail_pending(
+        self, generation: int | None = None, *, message: str = "app-server stdout closed",
+    ) -> None:
+        if generation is not None and generation != self._transport_generation:
+            return
+        self._transport_alive = False
+        futures: dict[int, asyncio.Future[Any]] = {}
+        for future in (
+            *self._pending.values(),
+            *self._turn_waiters.values(),
+            *self._thread_turn_waiters.values(),
+        ):
+            futures[id(future)] = future
+        for future in futures.values():
             if not future.done():
-                future.set_exception(error)
-        for future in self._turn_waiters.values():
-            if not future.done():
-                future.set_exception(error)
-        for future in self._thread_turn_waiters.values():
-            if not future.done():
-                future.set_exception(error)
+                future.set_exception(AppServerTransportClosed(message))
 
     async def _reject_server_request(self, message: dict[str, Any]) -> None:
         # Autonomous runs use approvalPolicy=never and prompts forbid interactive
@@ -790,6 +933,38 @@ class AppServerClient:
             self._retire_turn_ids(thread_id, started_turn_id or "")
             self.turn_ownership.finish_controller_turn(thread_id)
             raise
+        except AppServerTransportClosed as start_error:
+            # A turn/started notification can win the race with the JSON-RPC
+            # turn/start response.  If stdout then closes, interrupting through
+            # the same dead transport cannot establish containment and must not
+            # be relabelled as a native/unmanaged continuation.  The controller
+            # will close the local App Server process and restart in a fresh
+            # epoch; retain any output/usage already observed on the wire.
+            started_turn_id = self._notification_turn_by_thread.get(thread_id)
+            self._retire_turn_ids(thread_id, started_turn_id or "")
+            self.turn_ownership.finish_controller_turn(thread_id)
+            self._discard_buffered_completion_for_thread(thread_id)
+            self._model_reroutes_by_thread.pop(thread_id, None)
+            messages = (
+                self._messages.pop(started_turn_id, [])
+                if started_turn_id else []
+            )
+            usage = self._thread_token_usage.pop(thread_id, None)
+            turn_usage = (
+                self._token_usage.pop(started_turn_id, None)
+                if started_turn_id else None
+            )
+            usage = usage or turn_usage
+            if started_turn_id:
+                raise AppServerTurnTransportLost(
+                    thread_id=thread_id,
+                    turn_id=started_turn_id,
+                    raw_output=messages[-1] if messages else "",
+                    token_usage=usage or TokenUsage(),
+                    token_telemetry="observed" if usage is not None else "unknown",
+                    cause=start_error,
+                ) from start_error
+            raise
         except Exception as start_error:
             started_turn_id = self._notification_turn_by_thread.get(thread_id)
             containment_error: Exception | None = None
@@ -832,6 +1007,7 @@ class AppServerClient:
             on_started(turn_id)
         completed: dict[str, Any] | None = None
         timed_out = False
+        transport_error: AppServerTransportClosed | None = None
         interrupt_error: Exception | None = None
         did_not_stop = False
         try:
@@ -845,6 +1021,8 @@ class AppServerClient:
             except (asyncio.CancelledError, Exception):
                 pass
             raise
+        except AppServerTransportClosed as exc:
+            transport_error = exc
         except asyncio.TimeoutError:
             timed_out = True
             try:
@@ -855,12 +1033,21 @@ class AppServerClient:
                 completed = await asyncio.wait_for(asyncio.shield(waiter), timeout=15)
             except asyncio.TimeoutError:
                 did_not_stop = True
+            except AppServerTransportClosed as exc:
+                transport_error = exc
+                interrupt_error = interrupt_error or exc
+                did_not_stop = True
         finally:
             self._turn_waiters.pop(turn_id, None)
             self._thread_turn_waiters.pop(thread_id, None)
             self._turn_started_callbacks.pop(thread_id, None)
             if not waiter.done():
                 waiter.cancel()
+            else:
+                # asyncio.shield leaves the underlying waiter alive when the
+                # owner is cancelled.  EOF can then complete it with an
+                # exception that no coroutine awaits; retrieve it explicitly.
+                self._consume_future_exception(waiter)
             self.turn_ownership.finish_controller_turn(thread_id)
         terminal_turn = ((completed or {}).get("turn") or {})
         completed_turn_id = str(
@@ -920,6 +1107,15 @@ class AppServerClient:
                 token_usage=usage,
                 token_telemetry=telemetry,
             )
+        if transport_error is not None:
+            raise AppServerTurnTransportLost(
+                thread_id=thread_id,
+                turn_id=completed_turn_id,
+                raw_output=text,
+                token_usage=usage,
+                token_telemetry=telemetry,
+                cause=transport_error,
+            ) from transport_error
         if timed_out:
             if str(terminal_turn.get("status") or "").lower() == "failed":
                 raise AppServerTurnFailed(

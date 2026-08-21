@@ -1,6 +1,6 @@
 # Configuration and profiles
 
-Configuration schema v10 is merged as: built-in `codex-app-server-default`, the
+Configuration schema v11 is merged as: built-in `codex-app-server-default`, the
 project's manifest-selected `autonomous/config.yaml`, an explicit `--profile`,
 then an optional launcher one-shot override. Core
 trust validation runs last, so neither a project nor a user profile can enable
@@ -73,12 +73,20 @@ operator stop.
 Normalized telemetry separately records total input, cached input, uncached
 input, cache-write input, output, and reasoning-output tokens. Provider total
 tokens remain the budget authority, while uncached/output/reasoning components
-are the appropriate view for task depth. A provider usage-quota terminal such
-as `You've hit your usage limit` is classified as
+are the appropriate view for task depth. A mechanical Spark provider execution
+failure (`model_unavailable`, quota, transport, or timeout) continues exactly
+once on the configured fallback, which defaults to Luna with `medium`
+reasoning. Policy, permission, task eligibility, schema, protocol, and artifact
+failures never trigger fallback. If the fallback also reports a usage-quota
+terminal such as `You've hit your usage limit`, it is classified as
 `provider_quota_exhausted`: the campaign pauses, the exact task or its
 noncanonical checkpoint is retained for the next epoch, and an official reset
 timestamp is preserved when supplied. It is neither a route failure nor
 stagnation.
+
+The monitor displays mechanical tokens as an observed lower bound whenever one
+or more attempts lack complete usage telemetry. A displayed zero with unknown
+usage is not a measured zero-token execution.
 
 Selection modes are `preferred`, `balanced`, `conservative`, `disabled`, or
 `custom` with explicit thresholds. Every worker remains one-shot, nonrecursive,
@@ -88,8 +96,9 @@ mechanical-only, and unable to update canonical state.
 
 See [`examples/per-role-api-profile.json`](examples/per-role-api-profile.json).
 A profile contains exactly `profile_schema_version`, `name`, `extends`, and
-`overrides`. It cannot override project identity. Schema-v7, v8, and v9 project
-configs migrate to v10 in memory. Use `amr config migrate --project PATH --write`
+`overrides`. It cannot override project identity. Schema-v7, v8, v9, and v10
+project configs migrate to v11 in memory. Use
+`amr config migrate --project PATH --write`
 for an atomic persistent migration after reviewing the redacted effective
 configuration; the command starts no model.
 

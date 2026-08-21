@@ -37,6 +37,7 @@ from .lifecycle.campaign import (
     CampaignStore, DEFAULT_CAMPAIGN_HOURS, DEFAULT_EPOCH_HOURS,
 )
 from .mechanical import (
+    MECHANICAL_FALLBACK_FAILURE_KINDS,
     MECHANICAL_PARENT_ROLES,
     MECHANICAL_ROLE,
     MechanicalExecution,
@@ -563,6 +564,7 @@ class AutonomousController:
         self.campaign_id = campaign_id or self.run_id
         self.epoch_id = self.run_id
         self.previous_epoch_id = previous_epoch_id
+        self._previous_epoch_checkpoint_imported = previous_epoch_id is None
         self.campaign_hours = float(campaign_hours)
         self.epoch_hours = float(epoch_hours)
         if self.campaign_hours <= 0 or self.epoch_hours <= 0:
@@ -828,6 +830,7 @@ class AutonomousController:
         self._bound_jobs: dict[str, tuple[str, str]] = {}
         self._blocker_repair_jobs: set[str] = set()
         self.scheduler_stop_reason: str | None = None
+        self._provider_transport_lost: dict[str, Any] | None = None
         self.lifecycle = MonotoneLifecycle()
         self.final_conjecture_proved = False
         self.final_conjecture_refuted = False
@@ -1171,6 +1174,104 @@ class AutonomousController:
             "internal_failure": False,
         })
 
+    def _pause_for_mechanical_provider_quota(
+        self,
+        *,
+        mechanical_job_id: str,
+        state: MechanicalRequestState,
+        execution: MechanicalExecution,
+    ) -> None:
+        reset_at = (
+            _sanitize_live_text(execution.provider_reset_at)[:200]
+            if execution.provider_reset_at else None
+        )
+        reason = "campaign paused: mechanical provider quota exhausted"
+        if reset_at:
+            reason += f" until {reset_at}"
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(LifecyclePhase.DRAINING_EPOCH, reason=reason)
+        if not self.scheduler_stop_reason:
+            self.scheduler_stop_reason = reason
+        self.store.append("MECHANICAL_PROVIDER_QUOTA_EXHAUSTED", {
+            "mechanical_job_id": mechanical_job_id,
+            "parent_job_id": state.parent_job_id,
+            "parent_task_id": state.parent_task_id,
+            "parent_role": state.parent_role,
+            "subtask_id": state.packet["task_id"],
+            "provider": execution.provider,
+            "provider_profile": execution.provider_profile,
+            "model": execution.model,
+            "reasoning_effort": execution.reasoning_effort,
+            "provider_reset_at": reset_at,
+            "mathematical_failure": False,
+            "stagnation_effect": "none",
+            "action": (
+                "do not retry or cache the route as unavailable; drain the epoch, "
+                "retain unfinished parent research, and wait for provider reset"
+            ),
+            "internal_failure": False,
+        })
+
+    def _pause_for_provider_transport_loss(
+        self,
+        outcome: JobOutcome,
+        *,
+        task: ResearchTask | None = None,
+        checkpoint_job_record: dict[str, Any] | None = None,
+    ) -> None:
+        """End the epoch without turning shared transport loss into math failure."""
+        provider = outcome.provider or (
+            self.config.raw["models"].get(outcome.role, {}).get("provider")
+        )
+        reason = "campaign paused: provider transport lost; start a fresh epoch"
+        requeued_task_id: str | None = None
+        requeue_mode: str | None = None
+        if task is not None:
+            if outcome.turn_history and outcome.result:
+                outcome.logical_stop_reason = "provider transport lost"
+                continued = self._checkpoint_research_continuation(
+                    outcome, task, checkpoint_job_record,
+                )
+                requeued_task_id = continued.task_id
+                requeue_mode = "noncanonical_checkpoint"
+            else:
+                if not any(
+                    item.task_id == task.task_id
+                    for item in [
+                        *self.pending_research,
+                        *self.deferred_research_continuations,
+                    ]
+                ):
+                    self.pending_research.append(task)
+                requeued_task_id = task.task_id
+                requeue_mode = "exact_task"
+            self.store.append("TASK_REQUEUED_AFTER_PROVIDER_TRANSPORT_LOSS", {
+                "job_id": outcome.job_id,
+                "task_id": task.task_id,
+                "requeued_task_id": requeued_task_id,
+                "claim_id": task.target_claim,
+                "mode": requeue_mode,
+                "mathematical_failure": False,
+                "stagnation_effect": "none",
+            })
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(LifecyclePhase.DRAINING_EPOCH, reason=reason)
+        self.scheduler_stop_reason = self.scheduler_stop_reason or reason
+        payload = {
+            "job_id": outcome.job_id,
+            "task_id": outcome.task_id,
+            "role": outcome.role,
+            "provider": provider,
+            "server_error": _bounded_value(outcome.server_error),
+            "action": (
+                "stop dispatch, contain the shared provider, preserve the frontier, "
+                "and restart transport in a fresh epoch"
+            ),
+            "internal_failure": False,
+        }
+        self._provider_transport_lost = payload
+        self.store.append("PROVIDER_TRANSPORT_LOST", payload)
+
     def _queue_director_retry(
         self, failure_kind: str, *, retryable: bool, source: str,
     ) -> bool:
@@ -1307,11 +1408,12 @@ class AutonomousController:
 
     def _emit_scheduler_event_once(
         self, marker: str, kind: str, payload: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         if marker in self._scheduler_event_keys:
-            return
+            return False
         self._scheduler_event_keys.add(marker)
         self.store.append(kind, payload)
+        return True
 
     async def _cancel_backend_job(
         self, job_id: str, reason: str, *, fatal_on_failure: bool = True,
@@ -1350,6 +1452,7 @@ class AutonomousController:
         """Contain remote turns and reap their local owners before transport close."""
         await self._drain_scheduled_backend_cancellations()
         for job_id, active in list(self.active.items()):
+            self._retain_active_research_for_next_epoch(job_id, active, reason)
             cancel_ok = await self._cancel_backend_job(
                 job_id, reason, fatal_on_failure=False,
             )
@@ -1360,6 +1463,31 @@ class AutonomousController:
             )
             self.governor.release(job_id)
         self.active.clear()
+
+    def _retain_active_research_for_next_epoch(
+        self, job_id: str, active: ActiveJob, reason: str,
+    ) -> None:
+        if active.kind != "research" or self._finalization_started:
+            return
+        task = active.task
+        if any(
+            item.task_id == task.task_id
+            for item in [
+                *self.pending_research,
+                *self.deferred_research_continuations,
+            ]
+        ):
+            return
+        self.pending_research.append(task)
+        self.store.append("TASK_RETAINED_FOR_NEXT_EPOCH", {
+            "job_id": job_id,
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "reason": reason,
+            "task": task.to_dict(),
+            "mathematical_failure": False,
+            "stagnation_effect": "none",
+        })
 
     def _record_job_cancelled(
         self,
@@ -3036,7 +3164,6 @@ class AutonomousController:
                 else mechanical_finished
             )
             target.setdefault(key, {})[attempt] = dict(payload)
-        repository_root = self.config.project_root.resolve()
         for key, payload in mechanical_requested.items():
             if key in mechanical_terminal:
                 continue
@@ -3048,20 +3175,20 @@ class AutonomousController:
                 })
                 continue
             try:
+                workspace = self._mechanical_workspace_from_request_path(request_path)
                 request = validate_mechanical_request(
                     json.loads(request_path.read_text(encoding="utf-8")),
-                    repository_root=repository_root,
+                    repository_root=workspace,
                     expected_parent_job_id=key[0],
                     expected_parent_task_id=str(payload["parent_task_id"]),
                     expected_parent_role=str(payload["parent_role"]),
                 )
-            except (OSError, json.JSONDecodeError, MechanicalTaskRejected) as exc:
+            except (OSError, ValueError, json.JSONDecodeError, MechanicalTaskRejected) as exc:
                 self.store.append("MECHANICAL_RECOVERY_REQUEST_INVALID", {
                     "parent_job_id": key[0], "subtask_id": key[1],
                     "error": _sanitize_live_text(exc),
                 })
                 continue
-            workspace = request_path.resolve().parents[2]
             state = MechanicalRequestState(
                 parent_job_id=key[0],
                 parent_task_id=str(payload["parent_task_id"]),
@@ -3330,7 +3457,7 @@ class AutonomousController:
                     unavailable_routes=list(last_finished.get("unavailable_routes") or []),
                 )
                 primary_fallback_continuation = (
-                    last_execution.failure_kind == "model_unavailable"
+                    last_execution.failure_kind in MECHANICAL_FALLBACK_FAILURE_KINDS
                     and last_execution.model == self.mechanical_primary_route["model"]
                     and isinstance(last_execution.fallback, dict)
                     and last_execution.fallback.get("continuation_required") is True
@@ -3497,6 +3624,9 @@ class AutonomousController:
                     method_tags=["human-steering"], status="PAUSED",
                     failure_class=None, retry_condition=f"resume:{route_id}",
                     evidence_refs=[], source=f"human:{steering_id}",
+                )
+                self._defer_nonretryable_pending_routes(
+                    source=f"human_steering:{steering_id}",
                 )
             elif kind == "RESUME_ROUTE":
                 self.satisfied_route_conditions.add(f"resume:{route_id}")
@@ -3687,12 +3817,21 @@ class AutonomousController:
                     f"next_epoch:{self.previous_epoch_id}"
                 )
                 imported_continuation_ids.add(task.task_id)
-            validation_error = self._validate_director_task(task)
+            validation_error = self._validate_director_task(task, check_route=False)
             if validation_error:
                 raise ValueError(
                     "previous epoch pending research task is invalid: "
                     f"{task.task_id}: {validation_error}"
                 )
+            if not self.route_ledger.route_is_retryable(
+                task.route_family, self.satisfied_route_conditions,
+            ):
+                self._record_task_deferred_by_route_policy(
+                    task,
+                    source=f"epoch:{self.previous_epoch_id}",
+                    checkpoint_uri=checkpoint_uri,
+                )
+                continue
             if checkpoint_uri is not None and checkpoint is not None:
                 self.route_ledger.append(
                     route_id=task.route_family,
@@ -3725,6 +3864,101 @@ class AutonomousController:
                 "source": f"epoch://{self.previous_epoch_id}/state/compact_snapshot.json",
             })
             imported_research += 1
+
+        # Schema-v10 releases before TASK_RETAINED_FOR_NEXT_EPOCH wrote active
+        # research jobs only under active_tasks and then removed them while
+        # cancelling during shutdown.  The snapshot therefore omitted work
+        # cancelled by an operator or dead transport.  Recover only the latest
+        # cancelled terminal attempt of an accepted research task, and only
+        # from a PAUSED epoch; successful or completed-campaign jobs stay
+        # terminal.
+        previous_events = read_jsonl(previous_run / "EVENTS.jsonl")
+        stopped = next(
+            (
+                event.get("payload") or {}
+                for event in reversed(previous_events)
+                if event.get("kind") == "RUN_STOPPED"
+            ),
+            {},
+        )
+        if stopped.get("campaign_status") == "PAUSED":
+            accepted_from_events: dict[str, ResearchTask] = {}
+            started_by_job: dict[str, dict[str, Any]] = {}
+            latest_terminal_by_task: dict[
+                str, tuple[int, str, dict[str, Any]]
+            ] = {}
+            for event in previous_events:
+                payload = event.get("payload") or {}
+                kind = str(event.get("kind") or "")
+                if kind == "TASK_ACCEPTED" and isinstance(payload.get("task"), dict):
+                    recovered = ResearchTask.from_dict(payload["task"])
+                    accepted_from_events[recovered.task_id] = recovered
+                elif kind == "JOB_STARTED" and payload.get("job_id"):
+                    started_by_job[str(payload["job_id"])] = dict(payload)
+                elif kind in {"JOB_COMPLETED", "JOB_CANCELLED"}:
+                    job_id = str(payload.get("job_id") or "")
+                    started_payload = started_by_job.get(job_id, {})
+                    task_id = str(
+                        payload.get("task_id") or started_payload.get("task_id") or ""
+                    )
+                    if task_id:
+                        latest_terminal_by_task[task_id] = (
+                            int(event.get("sequence", 0)), kind, dict(payload),
+                        )
+            for task_id, (_sequence, kind, terminal) in sorted(
+                latest_terminal_by_task.items()
+            ):
+                task = accepted_from_events.get(task_id)
+                started_payload = started_by_job.get(
+                    str(terminal.get("job_id") or ""), {}
+                )
+                role = str(terminal.get("role") or started_payload.get("role") or "")
+                if (
+                    kind != "JOB_CANCELLED"
+                    or role not in {Role.PROVER, Role.FALSIFIER, Role.EXPLORER}
+                    or task is None
+                    or task_id in pending_ids
+                    or terminal.get("exit_reason") != stopped.get("reason")
+                ):
+                    continue
+                validation_error = self._validate_director_task(
+                    task, check_route=False,
+                )
+                if validation_error:
+                    raise ValueError(
+                        "legacy cancelled research task is invalid: "
+                        f"{task.task_id}: {validation_error}"
+                    )
+                if not self.route_ledger.route_is_retryable(
+                    task.route_family, self.satisfied_route_conditions,
+                ):
+                    self._record_task_deferred_by_route_policy(
+                        task,
+                        source=f"legacy-events:{self.previous_epoch_id}",
+                    )
+                    continue
+                self.pending_research.append(task)
+                pending_ids.add(task.task_id)
+                self.seen_task_fingerprints.add(task.fingerprint)
+                self.task_fingerprints_by_id[task.task_id] = task.fingerprint
+                self.store.append("TASK_ACCEPTED", {
+                    "task_id": task.task_id,
+                    "fingerprint": task.fingerprint,
+                    "representation_id": task.representation_id,
+                    "task": task.to_dict(),
+                    "source": f"epoch://{self.previous_epoch_id}/EVENTS.jsonl",
+                })
+                self.store.append("LEGACY_CANCELLED_TASK_IMPORTED", {
+                    "source_epoch_id": self.previous_epoch_id,
+                    "source_job_id": terminal.get("job_id"),
+                    "task_id": task.task_id,
+                    "claim_id": task.target_claim,
+                    "action": (
+                        "restore a pre-retention cancelled active task without "
+                        "claiming progress or failure"
+                    ),
+                })
+                imported_research += 1
 
         missing_continuations = continuation_ids - imported_continuation_ids
         if missing_continuations:
@@ -3792,10 +4026,10 @@ class AutonomousController:
             or abs(campaign.epoch_hours - self.epoch_hours) > 1e-9
         ):
             raise ValueError("campaign duration settings differ from the sealed campaign")
-        if self.previous_epoch_id is not None and (
-            not campaign.epochs or campaign.epochs[-1] != self.previous_epoch_id
-        ):
-            raise ValueError("previous epoch is not the latest campaign checkpoint")
+        if self.previous_epoch_id is not None:
+            self.campaign_store.require_current_continuation_source(
+                self.previous_epoch_id
+            )
         mode = "dry-run" if dry_run else ("mock" if self.mock else "real")
         self.campaign_store.append_epoch_started(
             epoch_id=self.epoch_id,
@@ -3908,6 +4142,7 @@ class AutonomousController:
         })
         try:
             self._import_previous_epoch_checkpoint()
+            self._previous_epoch_checkpoint_imported = True
         except Exception as exc:
             self.store.append("EPOCH_CHECKPOINT_IMPORT_FAILED", {
                 "campaign_id": self.campaign_id,
@@ -4015,6 +4250,24 @@ class AutonomousController:
                 self._flush_due_live_chunks()
 
                 if self.scheduler_stop_reason:
+                    if self._provider_transport_lost:
+                        stopped_reason = self.scheduler_stop_reason
+                        self._emit_scheduler_event_once(
+                            f"provider-transport-containment:{stopped_reason}",
+                            "PROVIDER_TRANSPORT_CONTAINMENT_STARTED",
+                            {
+                                "reason": stopped_reason,
+                                "in_flight_jobs": len(self.active),
+                                "in_flight_mechanical_subtasks": len(
+                                    self.active_mechanical
+                                ),
+                                "action": (
+                                    "cancel local owners without waiting for the dead "
+                                    "transport; retain research for the next epoch"
+                                ),
+                            },
+                        )
+                        break
                     if self.active or self.active_mechanical:
                         in_flight = len(self.active) + len(self.active_mechanical)
                         self._emit_scheduler_event_once(
@@ -4250,6 +4503,7 @@ class AutonomousController:
             for fingerprint, state in sorted(self.audit_gate.states.items())
             if not state.terminal
         ]
+        self._defer_nonretryable_pending_routes(source="checkpoint_preflight")
         pending_for_next_epoch = [
             *self.pending_research, *self.deferred_research_continuations,
         ]
@@ -4903,10 +5157,23 @@ class AutonomousController:
                 return f"mechanical broker {label} digest changed after installation"
         return None
 
+    def _mechanical_workspace_from_request_path(self, request_path: Path) -> Path:
+        """Recover the only input root a broker request is permitted to name."""
+        resolved = request_path.resolve()
+        if len(resolved.parents) < 3:
+            raise ValueError("mechanical request path has no parent job workspace")
+        workspace = resolved.parents[2]
+        expected_parent = (workspace / "mechanical_broker" / "requests").resolve()
+        if resolved.parent != expected_parent:
+            raise ValueError("mechanical request path escapes its broker request queue")
+        run_root = self.workspace.run_dir.resolve()
+        if not workspace.is_relative_to(run_root):
+            raise ValueError("mechanical parent workspace escapes the active run")
+        return workspace
+
     async def _poll_mechanical_requests(self) -> None:
         if not self.mechanical_worker_enabled:
             return
-        repository_root = self.config.project_root.resolve()
         for parent_job_id, active in list(self.active.items()):
             if active.task.role not in MECHANICAL_PARENT_ROLES or not active.workspace:
                 continue
@@ -4973,7 +5240,7 @@ class AutonomousController:
                 try:
                     request = validate_mechanical_request(
                         raw,
-                        repository_root=repository_root,
+                        repository_root=workspace,
                         expected_parent_job_id=parent_job_id,
                         expected_parent_task_id=active.task.task_id,
                         expected_parent_role=active.task.role,
@@ -5139,14 +5406,20 @@ class AutonomousController:
                 + 30
             )
             state.attempts_started = attempt
+            attempt_route = "fallback" if state.fallback_emitted else "primary"
             future = asyncio.create_task(self.mechanical_runner.run(
                 packet_path=packet_path,
                 output_root=output_root,
                 timeout_seconds=int(state.packet["timeout_seconds"]),
+                route=attempt_route,
             ))
             started_at = utc_now()
             self.active_mechanical[logical_job_id] = ActiveMechanicalJob(
                 logical_job_id, state, future, time.monotonic(), started_at, estimated,
+            )
+            configured_route = (
+                self.mechanical_fallback_route
+                if attempt_route == "fallback" else self.mechanical_primary_route
             )
             payload = {
                 "mechanical_job_id": logical_job_id,
@@ -5156,10 +5429,10 @@ class AutonomousController:
                 "subtask_id": state.packet["task_id"],
                 "task_kind": state.packet["task_kind"],
                 "attempt": attempt,
-                "provider": self.mechanical_primary_route["provider"],
-                "model": self.mechanical_primary_route["model"],
-                "reasoning_effort": self.mechanical_primary_route["reasoning_effort"],
-                "provider_profile": self.mechanical_primary_route["profile"],
+                "provider": configured_route["provider"],
+                "model": configured_route["model"],
+                "reasoning_effort": configured_route["reasoning_effort"],
+                "provider_profile": configured_route["profile"],
                 "service_tier": None,
                 "estimated_token_reservation": estimated,
                 "estimated_cost_reservation_usd": estimated_cost,
@@ -5295,6 +5568,7 @@ class AutonomousController:
                 "error": execution.error,
                 "failure_kind": execution.failure_kind,
                 "retryable": bool(execution.retryable),
+                "provider_reset_at": execution.provider_reset_at,
                 "unavailable_routes": list(execution.unavailable_routes),
                 "finished_at": utc_now(),
             }
@@ -5314,6 +5588,7 @@ class AutonomousController:
                     "service_tier", "token_usage",
                     "token_telemetry", "cost_usd", "cost_telemetry",
                     "error", "failure_kind", "retryable",
+                    "provider_reset_at",
                 )
             })
             for unavailable in execution.unavailable_routes:
@@ -5393,7 +5668,7 @@ class AutonomousController:
                 })
                 state.fallback_emitted = True
             if (
-                execution.failure_kind == "model_unavailable"
+                execution.failure_kind in MECHANICAL_FALLBACK_FAILURE_KINDS
                 and execution.model == self.mechanical_primary_route["model"]
                 and isinstance(execution.fallback, dict)
                 and execution.fallback.get("continuation_required") is True
@@ -5407,9 +5682,28 @@ class AutonomousController:
                     "next_model": self.mechanical_fallback_route["model"],
                     "next_reasoning_effort": self.mechanical_fallback_route["reasoning_effort"],
                     "service_tier": None,
-                    "action": "exact cached-primary continuation; does not consume transient retry budget",
+                    "trigger_failure_kind": execution.failure_kind,
+                    "action": (
+                        "one fallback continuation; does not consume transient retry budget"
+                    ),
                 })
                 self.pending_mechanical.append(state)
+                continue
+            if execution.failure_kind == "provider_quota_exhausted":
+                response = self._mechanical_response(
+                    state,
+                    status=execution.status,
+                    execution=execution,
+                    error=execution.error,
+                    failure_kind=execution.failure_kind,
+                    retryable=False,
+                )
+                self._persist_mechanical_terminal(state, response, execution=execution)
+                self._pause_for_mechanical_provider_quota(
+                    mechanical_job_id=job_id,
+                    state=state,
+                    execution=execution,
+                )
                 continue
             retry_class = (
                 "model_protocol"
@@ -5455,12 +5749,10 @@ class AutonomousController:
         return self.inbox.inbox_root / safe
 
     async def _candidate_sink(self, event: CandidateEvent, task: ResearchTask) -> None:
-        with schema_resource("candidate_event.schema.json") as schema_path:
-            self.inbox.submit(
-                event,
-                schema_path,
-                target_root=self._task_inbox(task.task_id),
-            )
+        self.inbox.submit(
+            event,
+            target_root=self._task_inbox(task.task_id),
+        )
         await self.candidate_queue.put(event)
 
     async def _poll_filesystem_candidates(self) -> None:
@@ -5833,6 +6125,7 @@ class AutonomousController:
     async def _launch_research(self, capacity: int, allow_exploration: bool) -> None:
         if not self.lifecycle.can_dispatch:
             return
+        self._defer_nonretryable_pending_routes(source="dispatch_preflight")
         active_audits = sum(item.kind == "audit" for item in self.active.values())
         scheduling = self.dynamic_scheduler.decide(
             pending_audits=len(self.pending_audits),
@@ -5905,7 +6198,7 @@ class AutonomousController:
                 break
             if need_independent and choice is None:
                 pending_key = stable_hash(sorted(task.fingerprint for task in eligible))
-                self._emit_scheduler_event_once(
+                frontier_changed = self._emit_scheduler_event_once(
                     f"independent-missing:{reserve}:{pending_key}", "EXPLORATION_SLOT_RESERVED",
                     {
                         "required_independent_slots": reserve,
@@ -5913,12 +6206,15 @@ class AutonomousController:
                     },
                 )
                 director_estimate = self._estimated_tokens(Role.DIRECTOR, "MEDIUM")
-                if self.governor.may_start(Role.DIRECTOR, director_estimate):
+                if (
+                    frontier_changed
+                    and self.governor.may_start(Role.DIRECTOR, director_estimate)
+                ):
                     self._request_director(
                         "independent exploration slot has no eligible task",
                         meaningful_change=True,
                     )
-                else:
+                elif frontier_changed:
                     self.director_needed = False
                     self.scheduler_stop_reason = (
                         "diversification required but fresh Director cannot start within remaining token budget"
@@ -6236,6 +6532,16 @@ class AutonomousController:
         self._director_incremental = False
         if (
             not outcome.succeeded
+            and outcome.failure_kind == "provider_transport_lost"
+        ):
+            self._pause_for_provider_transport_loss(outcome)
+            self.store.append("DIRECTOR_REQUEUED_AFTER_PROVIDER_TRANSPORT_LOSS", {
+                "job_id": outcome.job_id,
+                "action": "request a fresh Director in the next epoch",
+            })
+            return
+        if (
+            not outcome.succeeded
             and outcome.failure_kind == "provider_quota_exhausted"
         ):
             self._pause_for_provider_quota(outcome)
@@ -6391,6 +6697,10 @@ class AutonomousController:
                 "task": task.to_dict(),
             })
 
+        route_deferred = self._defer_nonretryable_pending_routes(
+            source="director_route_update",
+        )
+
         self._director_applied_version = max(
             self._director_applied_version, self._director_snapshot_version,
         )
@@ -6404,10 +6714,17 @@ class AutonomousController:
             "short_rationale": plan.short_rationale,
             "incremental": incremental,
             "rebased": stale,
+            "tasks_deferred_by_route_policy": route_deferred,
         })
         self.director_constraints.clear()
 
-        runnable = bool(accepted_tasks or prioritized)
+        pending_ids_after_route_updates = {
+            task.task_id for task in self.pending_research
+        }
+        runnable = bool(
+            any(task.task_id in pending_ids_after_route_updates for task in accepted_tasks)
+            or prioritized
+        )
         if not runnable:
             repair_constraint: dict[str, Any] = {
                 "action": "REPAIR_PLAN",
@@ -6472,8 +6789,68 @@ class AutonomousController:
         self._director_incremental = incremental
         self._accept_director_result(outcome)
         return
-    def _validate_director_task(self, task: ResearchTask) -> str | None:
-        if not self.route_ledger.route_is_retryable(
+    def _record_task_deferred_by_route_policy(
+        self,
+        task: ResearchTask,
+        *,
+        source: str,
+        checkpoint_uri: str | None = None,
+        release_admission: bool = False,
+    ) -> None:
+        records = [
+            item for item in self.route_ledger.records()
+            if item.get("route_id") == task.route_family
+        ]
+        latest = records[-1] if records else {}
+        if release_admission:
+            self.seen_task_fingerprints.discard(task.fingerprint)
+            if self.task_fingerprints_by_id.get(task.task_id) == task.fingerprint:
+                self.task_fingerprints_by_id.pop(task.task_id, None)
+        payload = {
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "route_family": task.route_family,
+            "route_status": latest.get("status"),
+            "retry_condition": latest.get("retry_condition"),
+            "source": source,
+            "checkpoint_uri": checkpoint_uri,
+            "task": task.to_dict(),
+            "mathematical_failure": False,
+            "canonical_progress": False,
+            "action": (
+                "do not dispatch until the durable route retry condition is satisfied; "
+                "a fresh Director may re-admit the exact task afterward"
+            ),
+        }
+        self.store.append("TASK_DEFERRED_BY_ROUTE_POLICY", payload)
+        self._record_recent_change({
+            "kind": "TASK_DEFERRED_BY_ROUTE_POLICY",
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "route_family": task.route_family,
+            "retry_condition": latest.get("retry_condition"),
+        })
+
+    def _defer_nonretryable_pending_routes(self, *, source: str) -> int:
+        deferred = 0
+        keep: list[ResearchTask] = []
+        for task in self.pending_research:
+            if self.route_ledger.route_is_retryable(
+                task.route_family, self.satisfied_route_conditions,
+            ):
+                keep.append(task)
+                continue
+            self._record_task_deferred_by_route_policy(
+                task, source=source, release_admission=True,
+            )
+            deferred += 1
+        self.pending_research = keep
+        return deferred
+
+    def _validate_director_task(
+        self, task: ResearchTask, *, check_route: bool = True,
+    ) -> str | None:
+        if check_route and not self.route_ledger.route_is_retryable(
             task.route_family, self.satisfied_route_conditions,
         ):
             return (
@@ -6547,6 +6924,28 @@ class AutonomousController:
         assigned_artifact_hashes: dict[str, str] | None = None,
         audit_lease_id: str = "",
     ) -> None:
+        if (
+            not outcome.succeeded
+            and outcome.failure_kind == "provider_transport_lost"
+        ):
+            if audit_lease_id:
+                try:
+                    lease = self.audit_leases.by_id(audit_lease_id)
+                    if lease.status == AuditLeaseStatus.ACTIVE:
+                        self.audit_leases.retry_wait(audit_lease_id)
+                except ValueError as lease_error:
+                    self.store.append("AUDIT_LEASE_ERROR", {
+                        "lease_id": audit_lease_id,
+                        "error": _sanitize_live_text(lease_error),
+                    })
+            self._pause_for_provider_transport_loss(outcome)
+            self.store.append("AUDIT_REQUEUED_AFTER_PROVIDER_TRANSPORT_LOSS", {
+                "job_id": outcome.job_id,
+                "candidate_fingerprint": assigned_fingerprint,
+                "audit_lease_id": audit_lease_id,
+                "action": "retain the nonterminal candidate for fresh-epoch audit",
+            })
+            return
         if (
             not outcome.succeeded
             and outcome.failure_kind == "provider_quota_exhausted"
@@ -7146,6 +7545,11 @@ class AutonomousController:
     ) -> None:
         if not outcome.succeeded:
             failure_kind = outcome.failure_kind or "research_failure"
+            if failure_kind == "provider_transport_lost":
+                self._pause_for_provider_transport_loss(
+                    outcome, task=task, checkpoint_job_record=job_record,
+                )
+                return
             if failure_kind == "provider_quota_exhausted":
                 self._pause_for_provider_quota(
                     outcome, task=task, checkpoint_job_record=job_record,
@@ -7504,6 +7908,7 @@ class AutonomousController:
                     status=campaign_status,
                     stopped_reason=reason,
                     checkpoint_uri=f"epoch://{self.epoch_id}/state/{checkpoint_path.name}",
+                    checkpoint_usable=self._previous_epoch_checkpoint_imported,
                 )
         except Exception as exc:
             self._internal_failure = True
