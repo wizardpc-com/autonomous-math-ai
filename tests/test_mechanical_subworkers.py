@@ -34,7 +34,7 @@ from autonomous_math_research.mechanical import (
 from autonomous_math_research.models import (
     LifecyclePhase, ResearchTask, TokenUsage, stable_hash,
 )
-from autonomous_math_research.monitor import build_status
+from autonomous_math_research.monitor import _MonitorDashboardState, build_status
 from autonomous_math_research.policy import pin_policy_manifest
 from autonomous_math_research.reporting import render_nightly_report
 from autonomous_math_research.schema import (
@@ -129,6 +129,7 @@ class SequenceMechanicalRunner:
 
     async def run(
         self, *, packet_path: Path, output_root: Path, timeout_seconds: int,
+        route: str = "primary",
     ) -> MechanicalExecution:
         packet = json.loads(packet_path.read_text(encoding="utf-8"))
         call_number = len(self.calls) + 1
@@ -141,6 +142,7 @@ class SequenceMechanicalRunner:
             "packet_path": str(packet_path),
             "output_root": str(output_root),
             "timeout_seconds": timeout_seconds,
+            "route": route,
         })
         if not self.executions:
             raise AssertionError("fake mechanical runner received an unexpected call")
@@ -268,6 +270,12 @@ class MechanicalContractTests(unittest.TestCase):
         )
         validate_mechanical_task_packet(statement_only, repository_root=REPO)
 
+        limitation = valid_packet()
+        limitation["notes"] = (
+            "This finite enumeration does not prove the general statement."
+        )
+        validate_mechanical_task_packet(limitation, repository_root=REPO)
+
         recursive = valid_packet()
         recursive["allowed_tools"] = ["codex exec", "web browser"]
         with self.assertRaisesRegex(MechanicalTaskRejected, "forbidden recursive/network"):
@@ -389,7 +397,7 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
             "--model-status-path", str(model_status_path),
         ]
         with patch.object(sys, "argv", argv), patch.object(
-            self.runner_module, "find_codex", return_value=Path("codex.cmd")
+            self.runner_module, "find_codex", return_value=Path("codex")
         ), patch.object(
             self.runner_module, "inspect_codex", return_value="codex-test"
         ), patch.object(
@@ -423,7 +431,7 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
             {"model": "gpt-5.6-luna", "reasoning_effort": "medium", "service_tier": None},
         ))
         command = module.codex_command(
-            Path("codex.cmd"),
+            Path("codex"),
             model=module.DEFAULT_WORKER_MODEL,
             reasoning_effort=module.DEFAULT_WORKER_REASONING_EFFORT,
             service_tier=None,
@@ -441,9 +449,13 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
         self.assertIn("approval_policy=\"never\"", rendered)
         self.assertNotIn("--sandbox", command)
         self.assertIn('default_permissions=\"mechanical-one-shot\"', rendered)
-        self.assertIn('filesystem.\":root\"=\"deny\"', rendered)
-        self.assertIn('filesystem.\":minimal\"=\"read\"', rendered)
-        self.assertIn('filesystem.\":workspace_roots\".\".\"=\"write\"', rendered)
+        self.assertIn('filesystem.:root="deny"', rendered)
+        self.assertIn('filesystem.:minimal="read"', rendered)
+        self.assertIn(
+            'permissions.mechanical-one-shot.filesystem.:workspace_roots={ "." = "write" }',
+            command,
+        )
+        self.assertNotIn('filesystem.\":workspace_roots\".\".\"', rendered)
         self.assertIn("permissions.mechanical-one-shot.network.enabled=false", rendered)
         self.assertIn("shell_environment_policy.ignore_default_excludes=false", rendered)
         self.assertIn("CODEX_HOME", rendered)
@@ -451,6 +463,51 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
         self.assertIn("features.plugins=false", rendered)
         self.assertNotIn("gpt-5.6-sol", rendered)
         self.assertNotIn("gpt-5.6-terra", rendered)
+
+    def test_route_config_can_start_directly_on_luna_without_route_rotation(self) -> None:
+        route_config = self.root / "route-config.json"
+        atomic_write_json(route_config, {
+            "schema_version": 2,
+            "start_route": "fallback",
+            "primary_route": {
+                "provider": "codex",
+                "model": PRIMARY_MECHANICAL_ROUTE["model"],
+                "reasoning_effort": "high",
+                "service_tier": None,
+                "profile": "local-login",
+            },
+            "fallback_route": {
+                "provider": "codex",
+                "model": FALLBACK_MECHANICAL_ROUTE["model"],
+                "reasoning_effort": "medium",
+                "service_tier": None,
+                "profile": "local-login",
+            },
+        })
+
+        primary, fallback, start_route = self.runner_module.load_worker_routes(
+            route_config, broker_managed=True,
+        )
+
+        self.assertEqual(primary["model"], PRIMARY_MECHANICAL_ROUTE["model"])
+        self.assertEqual(fallback["model"], FALLBACK_MECHANICAL_ROUTE["model"])
+        self.assertEqual(start_route, "fallback")
+
+    @unittest.skipUnless(os.name == "nt", "Windows npm wrapper behavior")
+    def test_windows_npm_wrapper_uses_node_entry_without_cmd_quote_rewriting(self) -> None:
+        npm_root = self.root / "npm"
+        wrapper = npm_root / "codex.cmd"
+        node = npm_root / "node.exe"
+        entry = npm_root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        entry.parent.mkdir(parents=True)
+        wrapper.write_text("stub\n", encoding="utf-8")
+        node.write_text("stub\n", encoding="utf-8")
+        entry.write_text("stub\n", encoding="utf-8")
+
+        prefix = self.runner_module.codex_prefix(wrapper.resolve())
+
+        self.assertEqual(prefix, [str(node.resolve()), str(entry.resolve())])
+        self.assertNotIn((os.environ.get("COMSPEC") or "cmd.exe"), prefix)
 
     def test_direct_runner_reuses_the_no_judgment_no_recursion_boundary(self) -> None:
         local_edit = valid_packet()
@@ -509,7 +566,7 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
         self.assertEqual(metadata["_mock_calls"]["run_one_shot"], 1)
         self.assertEqual(len(metadata["_mock_calls"]["record"]), 0)
 
-    def test_permanent_spark_denial_requests_one_fallback_but_transient_does_not(self) -> None:
+    def test_spark_provider_failures_request_one_luna_fallback(self) -> None:
         def permanent(_command, **kwargs):
             kwargs["stdout_path"].write_text(
                 json.dumps({
@@ -553,8 +610,46 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
         self.assertEqual(metadata["selected_model"], PRIMARY_MECHANICAL_ROUTE["model"])
         self.assertEqual(metadata["_mock_calls"]["probe"], [])
         self.assertEqual(len(metadata["_mock_calls"]["record"]), 0)
-        self.assertIsNone(metadata["fallback"])
+        self.assertEqual(metadata["fallback"]["to_model"], FALLBACK_MECHANICAL_ROUTE["model"])
+        self.assertTrue(metadata["fallback"]["continuation_required"])
         self.assertTrue(metadata["failure"]["retryable"])
+
+    def test_spark_usage_limit_is_nonretryable_quota_not_unavailability(self) -> None:
+        def quota(_command, **kwargs):
+            kwargs["stdout_path"].write_text(
+                json.dumps({
+                    "type": "turn.failed",
+                    "error": {
+                        "code": "usage_limit_reached",
+                        "message": (
+                            "You've hit your usage limit for Spark. "
+                            "Try again at Aug 23rd, 2026 2:54 PM."
+                        ),
+                    },
+                }) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            kwargs["stderr_path"].write_text("", encoding="utf-8")
+            return 1, False, 0.01
+
+        code, metadata = self._invoke_main(
+            "spark-quota",
+            cached_model_unavailable=lambda **_kwargs: None,
+            probe_model=None,
+            run_one_shot=quota,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(metadata["selected_model"], PRIMARY_MECHANICAL_ROUTE["model"])
+        self.assertEqual(metadata["_mock_calls"]["record"], [])
+        self.assertEqual(metadata["fallback"]["to_model"], FALLBACK_MECHANICAL_ROUTE["model"])
+        self.assertTrue(metadata["fallback"]["continuation_required"])
+        self.assertEqual(metadata["failure"]["kind"], "provider_quota_exhausted")
+        self.assertFalse(metadata["failure"]["retryable"])
+        self.assertEqual(
+            metadata["failure"]["provider_reset_at"],
+            "Aug 23rd, 2026 2:54 PM",
+        )
 
     def test_only_explicit_access_denial_is_cached_as_unavailable(self) -> None:
         stdout = self.root / "probe.jsonl"
@@ -692,6 +787,35 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
         self.assertEqual(metadata["_mock_calls"]["probe"], [])
         self.assertEqual(len(metadata["_mock_calls"]["record"]), 0)
         self.assertIsNone(metadata["fallback"])
+
+    def test_monitor_marks_unknown_mechanical_usage_as_a_lower_bound(self) -> None:
+        lifecycle = [{
+            "kind": "RUN_STARTED",
+            "timestamp": "2026-08-21T00:00:00+00:00",
+            "payload": {
+                "global_budget": 500_000_000,
+                "mechanical_budget": 1_500_000_000,
+                "max_director": 1,
+                "max_research_workers": 8,
+                "max_audit": 2,
+                "max_mechanical_subworkers": None,
+                "mechanical_effective_resource_cap": 8,
+            },
+        }, {
+            "kind": "MECHANICAL_SUBTASK_FAILED",
+            "timestamp": "2026-08-21T00:01:00+00:00",
+            "payload": {
+                "parent_job_id": "parent-1",
+                "subtask_id": "mechanical-1",
+                "token_usage": {"total_tokens": 0},
+                "token_telemetry": "unknown",
+            },
+        }]
+        state = _MonitorDashboardState("run-1", lifecycle, [])
+
+        lines = state.lines(quiet_seconds=0)
+
+        self.assertIn("机械 ≥0（1次用量未知）/1500.00M", lines[1])
 
     def test_worker_process_output_is_redacted_before_artifact_write(self) -> None:
         stdout = self.root / "redacted.stdout"
@@ -955,6 +1079,9 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         workspace, _writable, metadata = controller.workspace.create_job_workspace(
             f"workspace-{suffix}"
         )
+        (workspace / "AGENTS.md").write_text(
+            "neutral parent workspace fixture\n", encoding="utf-8", newline="\n",
+        )
         parent_job_id = f"job-{suffix}"
         future = asyncio.create_task(asyncio.Event().wait())
         self.parent_futures.append(future)
@@ -1013,6 +1140,123 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         )
         atomic_write_json(request_path, envelope)
         return parent_job_id, request_path, response_path
+
+    async def test_parent_workspace_inputs_are_accepted_without_project_root_fallback(self) -> None:
+        runner = SequenceMechanicalRunner([success_execution(tokens=11)])
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=runner,
+        )
+        packet = valid_packet(
+            task_id="workspace-input",
+            input_file="candidate_bundle/check.py",
+        )
+        _job, request_path, response_path = self._activate_parent(
+            controller, role="auditor", suffix="workspace-input", packet=packet,
+        )
+        workspace = request_path.resolve().parents[2]
+        source = workspace / "candidate_bundle/check.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("print('bounded replay')\n", encoding="utf-8", newline="\n")
+
+        await controller._poll_mechanical_requests()
+        await self._drain_mechanical(controller)
+
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(runner.calls[0]["packet"]["input_files"], [
+            "candidate_bundle/check.py",
+        ])
+        self.assertEqual(json.loads(response_path.read_text(encoding="utf-8"))["status"], "COMPLETED")
+
+    async def test_parent_workspace_input_cannot_fall_back_to_project_root(self) -> None:
+        runner = SequenceMechanicalRunner([])
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=runner,
+        )
+        project_only = self.project / "project-only-input.txt"
+        project_only.write_text("must remain inaccessible\n", encoding="utf-8", newline="\n")
+        packet = valid_packet(
+            task_id="project-root-fallback",
+            input_file="project-only-input.txt",
+        )
+        _job, _request_path, response_path = self._activate_parent(
+            controller, role="explorer", suffix="project-root-fallback", packet=packet,
+        )
+
+        await controller._poll_mechanical_requests()
+
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+        self.assertEqual(response["status"], "REJECTED")
+        self.assertEqual(response["failure_kind"], "ineligible_mechanical_task")
+        self.assertEqual(runner.calls, [])
+
+    async def test_subprocess_runner_uses_the_parent_workspace_as_its_input_root(self) -> None:
+        workspace = self.project / "autonomous/runs/runner-root/jobs/parent"
+        packet_path = workspace / "mechanical_subtasks/packets/task.attempt-1.json"
+        output_root = workspace / "mechanical_subtasks/runs"
+        source = workspace / "candidate_bundle/check.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("print('bounded replay')\n", encoding="utf-8", newline="\n")
+        atomic_write_json(
+            packet_path,
+            valid_packet(task_id="runner-root", input_file="candidate_bundle/check.py"),
+        )
+        runner = SubprocessMechanicalRunner(self.project)
+        runner.script = RUNNER_PATH
+        runner.expected_hashes = {runner.script: runner._digest(runner.script)}
+        captured: dict = {}
+
+        class FakeProcess:
+            returncode = 0
+            pid = 12345
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        async def fake_subprocess(*command: str, **kwargs: object) -> FakeProcess:
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return FakeProcess()
+
+        with patch(
+            "autonomous_math_research.mechanical.asyncio.create_subprocess_exec",
+            side_effect=fake_subprocess,
+        ):
+            execution = await runner.run(
+                packet_path=packet_path,
+                output_root=output_root,
+                timeout_seconds=30,
+            )
+
+        self.assertEqual(execution.failure_kind, "runner_protocol")
+        self.assertEqual(Path(str(captured["kwargs"]["cwd"])).resolve(), workspace.resolve())
+        environment = captured["kwargs"]["env"]
+        self.assertIsInstance(environment, dict)
+        self.assertEqual(
+            Path(str(environment["MATH_WORKER_REPOSITORY_ROOT"])).resolve(),
+            workspace.resolve(),
+        )
+
+    async def test_subprocess_runner_rejects_mismatched_attempt_roots(self) -> None:
+        workspace = self.project / "autonomous/runs/runner-mismatch/jobs/parent"
+        packet_path = workspace / "another-directory/task.json"
+        output_root = workspace / "mechanical_subtasks/runs"
+        atomic_write_json(packet_path, valid_packet(task_id="runner-mismatch"))
+        runner = SubprocessMechanicalRunner(self.project)
+        runner.script = RUNNER_PATH
+        runner.expected_hashes = {runner.script: runner._digest(runner.script)}
+
+        with self.assertRaisesRegex(MechanicalTaskRejected, "attempt workspace"):
+            await runner.run(
+                packet_path=packet_path,
+                output_root=output_root,
+                timeout_seconds=30,
+            )
 
     @staticmethod
     async def _drain_mechanical(controller: AutonomousController, rounds: int = 4) -> None:
@@ -1165,8 +1409,9 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         class MissingArtifactRunner:
             async def run(
                 self, *, packet_path: Path, output_root: Path, timeout_seconds: int,
+                route: str = "primary",
             ) -> MechanicalExecution:
-                del packet_path, timeout_seconds
+                del packet_path, timeout_seconds, route
                 run_dir = output_root / "missing-artifact"
                 run_dir.mkdir(parents=True, exist_ok=True)
                 execution = success_execution(tokens=3)
@@ -1226,6 +1471,50 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(kinds.count("MECHANICAL_SUBTASK_RETRY_QUEUED"), 1)
         self.assertEqual(kinds.count("MECHANICAL_SUBTASK_FALLBACK"), 0)
         self.assertEqual(len(runner.calls), 2)
+
+        quota = MechanicalExecution(
+            status="TOOL_ERROR",
+            result={},
+            model=PRIMARY_MECHANICAL_ROUTE["model"],
+            reasoning_effort="high",
+            token_usage=TokenUsage(total_tokens=4),
+            token_telemetry="observed",
+            error="provider quota exhausted",
+            failure_kind="provider_quota_exhausted",
+            retryable=False,
+            provider_reset_at="Aug 23rd, 2026 2:54 PM",
+        )
+        quota_runner = SequenceMechanicalRunner([quota])
+        quota_controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=quota_runner,
+        )
+        _job, _request, quota_response_path = self._activate_parent(
+            quota_controller, role="prover", suffix="quota",
+        )
+        await quota_controller._poll_mechanical_requests()
+        await self._drain_mechanical(quota_controller)
+        quota_response = json.loads(quota_response_path.read_text(encoding="utf-8"))
+        self.assertEqual(quota_response["failure_kind"], "provider_quota_exhausted")
+        self.assertFalse(quota_response["retryable"])
+        self.assertEqual(len(quota_runner.calls), 1)
+        self.assertEqual(
+            quota_controller.scheduler_stop_reason,
+            (
+                "campaign paused: mechanical provider quota exhausted until "
+                "Aug 23rd, 2026 2:54 PM"
+            ),
+        )
+        self.assertIs(quota_controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        quota_events = [
+            event for event in quota_controller.store.replay()
+            if event["kind"] == "MECHANICAL_PROVIDER_QUOTA_EXHAUSTED"
+        ]
+        self.assertEqual(len(quota_events), 1)
+        self.assertFalse(quota_events[0]["payload"]["mathematical_failure"])
+        self.assertEqual(quota_events[0]["payload"]["stagnation_effect"], "none")
 
         permanent = MechanicalExecution(
             status="TOOL_ERROR", result={},
@@ -1308,6 +1597,49 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         )
         self.assertEqual(continuation_kinds.count("MECHANICAL_SUBTASK_RETRY_QUEUED"), 1)
         self.assertEqual(len(continuation_runner.calls), 3)
+
+    async def test_spark_transport_failure_continues_once_on_luna_medium(self) -> None:
+        spark_failure = MechanicalExecution(
+            status="TOOL_ERROR",
+            result={},
+            model=PRIMARY_MECHANICAL_ROUTE["model"],
+            reasoning_effort="high",
+            token_usage=TokenUsage(total_tokens=3),
+            token_telemetry="unknown",
+            fallback={
+                "from_model": PRIMARY_MECHANICAL_ROUTE["model"],
+                "to_model": FALLBACK_MECHANICAL_ROUTE["model"],
+                "reason": "primary provider transport failed",
+                "continuation_required": True,
+            },
+            error="temporary transport failure",
+            failure_kind="transport_transient",
+            retryable=True,
+        )
+        luna_success = success_execution(tokens=7)
+        luna_success.model = FALLBACK_MECHANICAL_ROUTE["model"]
+        luna_success.reasoning_effort = "medium"
+        runner = SequenceMechanicalRunner([spark_failure, luna_success])
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=runner,
+        )
+        _job, _request, response_path = self._activate_parent(
+            controller, role="prover", suffix="spark-to-luna",
+        )
+
+        await controller._poll_mechanical_requests()
+        await self._drain_mechanical(controller)
+
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+        self.assertEqual(response["status"], "COMPLETED")
+        self.assertEqual(response["model"], FALLBACK_MECHANICAL_ROUTE["model"])
+        self.assertEqual([call["route"] for call in runner.calls], ["primary", "fallback"])
+        kinds = [event["kind"] for event in controller.store.replay()]
+        self.assertEqual(kinds.count("MECHANICAL_SUBTASK_FALLBACK"), 1)
+        self.assertEqual(kinds.count("MECHANICAL_SUBTASK_RETRY_QUEUED"), 0)
 
     async def test_ineligible_task_is_rejected_before_runner_for_mock_and_real_modes(self) -> None:
         for mock in (True, False):
@@ -1936,7 +2268,7 @@ class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
         migrated = load_config(self.project, bad)
         self.assertIsNone(migrated.max_mechanical_subworkers)
         self.assertEqual(
-            migrated.migrations_applied, ("7->8", "8->9", "9->10"),
+            migrated.migrations_applied, ("7->8", "8->9", "9->10", "10->11"),
         )
 
     def test_subprocess_runner_executes_run_local_pinned_sources(self) -> None:

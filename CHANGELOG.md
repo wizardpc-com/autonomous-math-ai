@@ -8,6 +8,8 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Configuration schema v11 with an explicit provider-execution fallback policy;
+  older configs migrate in memory.
 - Configuration schema v10 with per-role research turn bounds and normalized
   uncached-input token telemetry; v7/v8/v9 projects migrate in memory.
 - Configuration schema v9 with project campaign defaults, built-in Codex
@@ -30,6 +32,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Mechanical Spark execution failures now continue once on the configured Luna
+  medium fallback, while policy, schema, protocol, and artifact failures remain
+  terminal; unknown mechanical token telemetry is shown as a lower bound.
 - Codex App Server remains the default provider; API transports are opt-in.
 - A generic Windows launcher and `amr launcher` discover project manifests from
   a remembered workspace, keep persistent settings in each project's config,

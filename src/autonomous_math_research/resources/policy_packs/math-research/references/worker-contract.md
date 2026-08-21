@@ -11,7 +11,7 @@ Use UTF-8 JSON conforming exactly to [worker-task.schema.json](worker-task.schem
 - `task_kind`: one approved mechanical class from the schema; strategy/judgment is not a class.
 - `objective`: one exact execution objective.
 - `mathematical_statement`: the claim or computational question without silent reformulation.
-- `input_files`: repository-relative files to copy into the isolated run; use `[]` when none.
+- `input_files`: parent-job-workspace-relative sealed files to copy into the isolated run; use `[]` when none. Project-root fallback and `..` traversal are forbidden.
 - `allowed_tools`: exact executables or tool families the worker may invoke.
 - `bounds`: the closed object `{finite:true, description, parameters:[{name,value}, ...]}`.
 - `timeout_seconds`: positive finite controller-enforced timeout.
@@ -94,14 +94,22 @@ The runner checks each observed command executable and every returned replay com
 The built-in default primary route is `gpt-5.3-codex-spark` / `high` /
 `service_tier=null`; the default fallback is `gpt-5.6-luna` / `medium` / null.
 The controller pins configurable provider/model/effort routes into the run-local
-policy bundle. Fallback remains allowed only after the exact primary
-configuration receives an explicit permanent unavailable/access-denied result.
+policy bundle. The exact primary route may continue once on the fallback after
+`model_unavailable`, `provider_quota_exhausted`, `transport_transient`, or
+`timeout_transient`. Policy, permission, eligibility, schema, protocol, and
+artifact failures never trigger fallback.
 Environment route overrides are rejected. The child uses `approval_policy=never`, disables network access, memories, plugins, apps, multi-agent tools, and web search. The Codex process retains `CODEX_HOME` only to reuse the existing login, while a native permission profile denies model-started commands access to the filesystem root, grants only minimal runtime reads and the isolated workspace, and disables network. The command also uses `--strict-config`, so unsupported permission or isolation keys fail before a turn rather than silently weakening the boundary. `shell_environment_policy` removes `CODEX_HOME`, home/profile locators, API keys, tokens, passwords, credential helpers, and similar secret-bearing variables from model-started commands.
 
-Persist the exact primary configuration as unavailable only after that explicit
-permanent rejection. A local parse/startup error, timeout, rate limit, network
-failure, or ambiguous transport failure is not evidence that the model is
-unavailable: it receives only the configured finite same-route retry budget.
+Persist the exact primary configuration as unavailable only after an explicit
+permanent unavailable/access-denied rejection. A local parse/startup error,
+timeout, rate limit, network failure, or ambiguous transport failure is not
+evidence that the model is unavailable. After the one permitted fallback,
+transient retry budgets apply only to the selected fallback route. A provider
+usage-limit/quota-exhausted terminal is never cached as model unavailability;
+if it also occurs on the fallback, the controller drains and pauses while
+preserving unfinished parent research. When the provider supplies a reset time,
+the append-only event records that value for the operator. It is not
+mathematical failure or stagnation.
 The first actual primary execution is also its availability check; no extra paid
 probe turn exists. Once primary is cached unavailable, later tasks use only the
 pinned fallback, which has no further fallback. Never rotate beyond the two

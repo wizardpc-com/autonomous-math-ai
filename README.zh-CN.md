@@ -86,11 +86,13 @@ Director 会收到由 controller 生成的 claim 表示兼容性与已审计 bri
 ## 机械子工
 
 研究和审计角色只能通过 controller 管理的 broker 请求有限机械任务。默认使用
-Spark/high/null；只有明确的永久 unavailable/access denied 才允许一次
-Luna/medium/null fallback。临时错误不会缓存为模型不可用，也不会回退到父模型、fast
-或 priority service。默认没有静态子工席位上限，但仍受独立的 15 亿 token 默认额度、
+Spark/high/null；模型不可用、额度、传输或超时这四类 provider 执行失败允许一次
+Luna/medium/null fallback。策略、权限、任务资格、schema、protocol 和 artifact 错误仍是
+终止错误。临时错误不会缓存为模型不可用，也不会回退到父模型、fast 或 priority service。
+默认没有静态子工席位上限，但仍受独立的 15 亿 token 默认额度、
 CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超时和 operator stop
-约束。主角色默认额度为 5 亿 token；监视面板并列显示两套额度。
+约束。主角色默认额度为 5 亿 token；监视面板并列显示两套额度，并在机械 telemetry 不完整
+时明确显示观测下界和未知次数。
 
 机械结果只是父角色可以检查的执行证据。父研究模型负责解释，强 Auditor 负责最终判词。
 

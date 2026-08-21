@@ -21,6 +21,12 @@ class CandidateInbox:
         candidate_root: Path | None = None,
     ):
         self.layout = layout
+        # Package resources can change during a long-running local upgrade.
+        # Pin the protocol schema in memory when the controller-owned inbox is
+        # created so later submit/poll operations do not depend on mutable
+        # site-packages bytes.
+        with schema_resource("candidate_event.schema.json") as schema_path:
+            self.candidate_schema = load_schema(schema_path)
         self.inbox_root = inbox_root or layout.inbox_root
         self.event_log = event_log or layout.event_log
         self.candidate_root = candidate_root or (layout.autonomous_root / "candidates")
@@ -57,8 +63,8 @@ class CandidateInbox:
         """
         payload = event.to_dict()
         payload.pop("fingerprint", None)
-        if schema_path:
-            validate(payload, load_schema(schema_path))
+        schema = load_schema(schema_path) if schema_path else self.candidate_schema
+        validate(payload, schema)
         self._validate_paths(event)
         root = (target_root or self.inbox_root).resolve()
         if not root.is_relative_to(self.inbox_root.resolve()):
@@ -96,12 +102,10 @@ class CandidateInbox:
     def poll(self) -> list[CandidateEvent]:
         found: list[CandidateEvent] = []
         self.poll_errors = []
-        with schema_resource("candidate_event.schema.json") as schema_path:
-            schema = load_schema(schema_path)
         for path in sorted(self.inbox_root.rglob("*.json")):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                validate(payload, schema)
+                validate(payload, self.candidate_schema)
                 event = CandidateEvent.from_dict(payload)
                 self._validate_paths(event)
             except Exception as exc:

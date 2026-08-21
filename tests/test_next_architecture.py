@@ -5,13 +5,15 @@ import json
 from pathlib import Path
 import shutil
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.claim_graph import ClaimGraph
 from autonomous_math_research.backend import MockCodexBackend
 from autonomous_math_research.config import load_config
-from autonomous_math_research.controller import AutonomousController
+from autonomous_math_research.controller import ActiveJob, AutonomousController
 from autonomous_math_research.engine.scheduler import DynamicScheduler
+from autonomous_math_research.eventing import CandidateInbox
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.lifecycle.audit_lease import AuditLeaseBook
 from autonomous_math_research.lifecycle.campaign import CampaignStore
@@ -207,6 +209,66 @@ class NextArchitectureTests(unittest.TestCase):
         )
         self.assertEqual(store.load().status, "ACTIVE")
 
+    def test_campaign_continuation_skips_an_unusable_bootstrap_checkpoint(self) -> None:
+        store = CampaignStore(self.runtime, "campaign-checkpoint-selection")
+        store.create(project_id="external-neutral-project")
+        for epoch_id in ("usable-epoch", "failed-bootstrap-epoch"):
+            snapshot = self.runtime / "runs" / epoch_id / "state/compact_snapshot.json"
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.write_text("{}\n", encoding="utf-8", newline="\n")
+            store.append_epoch_started(
+                epoch_id=epoch_id,
+                previous_epoch_id=(None if epoch_id == "usable-epoch" else "usable-epoch"),
+                mode="mock",
+            )
+            store.append_epoch_sealed(
+                epoch_id=epoch_id,
+                elapsed_seconds=1,
+                status="PAUSED",
+                stopped_reason=(
+                    "epoch time limit reached"
+                    if epoch_id == "usable-epoch"
+                    else "bootstrap failed: epoch checkpoint import: invalid frontier"
+                ),
+                checkpoint_uri=f"epoch://{epoch_id}/state/compact_snapshot.json",
+                checkpoint_usable=epoch_id == "usable-epoch",
+            )
+
+        self.assertEqual(store.latest_continuable_epoch(), "usable-epoch")
+        store.require_current_continuation_source("usable-epoch")
+
+    def test_campaign_continuation_rejects_unsealed_newer_epoch(self) -> None:
+        store = CampaignStore(self.runtime, "campaign-unsealed-checkpoint")
+        store.create(project_id="external-neutral-project")
+        snapshot = self.runtime / "runs" / "usable-epoch" / "state/compact_snapshot.json"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("{}\n", encoding="utf-8", newline="\n")
+        store.append_epoch_started(epoch_id="usable-epoch", previous_epoch_id=None, mode="mock")
+        store.append_epoch_sealed(
+            epoch_id="usable-epoch", elapsed_seconds=1, status="PAUSED",
+            stopped_reason="epoch time limit reached",
+            checkpoint_uri="epoch://usable-epoch/state/compact_snapshot.json",
+        )
+        store.append_epoch_started(
+            epoch_id="still-active", previous_epoch_id="usable-epoch", mode="mock",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unsealed epoch"):
+            store.require_current_continuation_source("usable-epoch")
+
+    def test_campaign_continuation_does_not_silently_skip_corrupt_checkpoint(self) -> None:
+        store = CampaignStore(self.runtime, "campaign-corrupt-checkpoint")
+        store.create(project_id="external-neutral-project")
+        store.append_epoch_started(epoch_id="corrupt-epoch", previous_epoch_id=None, mode="mock")
+        store.append_epoch_sealed(
+            epoch_id="corrupt-epoch", elapsed_seconds=1, status="PAUSED",
+            stopped_reason="epoch time limit reached",
+            checkpoint_uri="epoch://corrupt-epoch/state/compact_snapshot.json",
+        )
+
+        with self.assertRaisesRegex(ValueError, "checkpoint is missing"):
+            store.latest_continuable_epoch()
+
     def test_campaign_epoch_id_rejects_path_escape(self) -> None:
         store = CampaignStore(self.runtime, "campaign-1")
         store.create(project_id="external-neutral-project")
@@ -239,6 +301,208 @@ class NextArchitectureTests(unittest.TestCase):
         )
         self.assertIn(
             "EPOCH_CHECKPOINT_IMPORTED",
+            [event["kind"] for event in second.store.replay()],
+        )
+
+    def test_fresh_epoch_defers_pending_task_whose_route_was_paused(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="epoch-before-route-pause", campaign_id="campaign-route-pause",
+        )
+        first._pin_run_inputs(0.01, True)
+        paused = research_task("paused-carry-forward", route="route-paused")
+        open_task = research_task("open-carry-forward", route="route-open")
+        first.pending_research = [paused, open_task]
+        first._write_compact_snapshot()
+        first.route_ledger.append(
+            route_id="route-paused",
+            representation_id=paused.representation_id,
+            method_tags=[], status="PAUSED", failure_class=None,
+            retry_condition="external-condition", evidence_refs=[], source="director",
+        )
+
+        second = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="epoch-after-route-pause", campaign_id="campaign-route-pause",
+            previous_epoch_id="epoch-before-route-pause",
+        )
+        second._pin_run_inputs(0.01, True)
+        second._import_previous_epoch_checkpoint()
+
+        self.assertEqual(
+            [task.task_id for task in second.pending_research],
+            [open_task.task_id],
+        )
+        deferred = [
+            event for event in second.store.replay()
+            if event["kind"] == "TASK_DEFERRED_BY_ROUTE_POLICY"
+        ]
+        self.assertEqual([event["payload"]["task_id"] for event in deferred], [
+            paused.task_id,
+        ])
+
+    def test_dispatch_rechecks_route_policy_and_releases_task_identity(self) -> None:
+        async def scenario() -> None:
+            controller = AutonomousController(
+                load_config(self.project), backend=MockCodexBackend(), mock=True,
+                run_id="dispatch-route-pause", campaign_id="dispatch-route-pause",
+            )
+            controller._pin_run_inputs(0.01, True)
+            controller.lifecycle.transition(
+                LifecyclePhase.RUNNING, reason="test scheduling",
+            )
+            task = research_task("pending-then-paused", route="route-paused")
+            controller.pending_research = [task]
+            controller.seen_task_fingerprints.add(task.fingerprint)
+            controller.task_fingerprints_by_id[task.task_id] = task.fingerprint
+            controller.route_ledger.append(
+                route_id=task.route_family,
+                representation_id=task.representation_id,
+                method_tags=[], status="PAUSED", failure_class=None,
+                retry_condition="external-condition", evidence_refs=[], source="director",
+            )
+
+            await controller._launch_research(capacity=8, allow_exploration=True)
+
+            self.assertEqual(controller.pending_research, [])
+            self.assertEqual(controller.active, {})
+            self.assertNotIn(task.fingerprint, controller.seen_task_fingerprints)
+            self.assertNotIn(task.task_id, controller.task_fingerprints_by_id)
+
+        asyncio.run(scenario())
+
+    def test_missing_independent_slot_requests_one_replan_per_frontier(self) -> None:
+        async def scenario() -> None:
+            controller = AutonomousController(
+                load_config(self.project), backend=MockCodexBackend(), mock=True,
+                run_id="independent-slot", campaign_id="independent-slot",
+            )
+            controller._pin_run_inputs(0.01, True)
+            controller.lifecycle.transition(
+                LifecyclePhase.RUNNING, reason="test scheduling",
+            )
+            controller.director_needed = False
+            controller._director_active = True
+            controller.pending_research = [
+                research_task(f"regular-route-{index}", route=f"regular-route-{index}")
+                for index in range(8)
+            ]
+
+            await controller._launch_research(capacity=8, allow_exploration=True)
+            await controller._launch_research(capacity=8, allow_exploration=True)
+
+            replans = [
+                event for event in controller.store.replay()
+                if event["kind"] == "DIRECTOR_REPLAN_REQUESTED"
+                and event["payload"].get("reason")
+                == "independent exploration slot has no eligible task"
+            ]
+            self.assertEqual(len(replans), 1)
+            self.assertEqual(controller._state_version, 1)
+
+        asyncio.run(scenario())
+
+    def test_cancelled_active_research_is_retained_in_next_epoch_snapshot(self) -> None:
+        async def scenario() -> None:
+            config = load_config(self.project)
+            first = AutonomousController(
+                config, backend=MockCodexBackend(), mock=True,
+                run_id="epoch-cancelled-active", campaign_id="campaign-cancelled-active",
+            )
+            first._pin_run_inputs(0.01, True)
+            task = research_task("cancelled-active")
+            future: asyncio.Future[JobOutcome] = asyncio.get_running_loop().create_future()
+            first.active["job-cancelled-active"] = ActiveJob(
+                logical_job_id="job-cancelled-active", task=task, future=future,
+                started_monotonic=0.0, timeout=60.0, kind="research",
+            )
+
+            await first._cancel_active_jobs_before_backend_close(
+                "controller interrupted by operator"
+            )
+            snapshot = json.loads(
+                first._write_compact_snapshot().read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["task_id"] for item in snapshot["pending_research"]],
+                [task.task_id],
+            )
+
+            second = AutonomousController(
+                config, backend=MockCodexBackend(), mock=True,
+                run_id="epoch-after-cancel", campaign_id="campaign-cancelled-active",
+                previous_epoch_id="epoch-cancelled-active",
+            )
+            second._pin_run_inputs(0.01, True)
+            second._import_previous_epoch_checkpoint()
+            self.assertEqual(
+                [item.task_id for item in second.pending_research], [task.task_id],
+            )
+
+        asyncio.run(scenario())
+
+    def test_legacy_cancelled_active_research_is_recovered_from_events(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="legacy-cancelled-epoch", campaign_id="legacy-cancelled-campaign",
+        )
+        first._pin_run_inputs(0.01, True)
+        task = research_task("legacy-cancelled-active")
+        first.store.append("TASK_ACCEPTED", {
+            "task_id": task.task_id,
+            "fingerprint": task.fingerprint,
+            "representation_id": task.representation_id,
+            "task": task.to_dict(),
+        })
+        first.store.append("JOB_STARTED", {
+            "job_id": "legacy-active-job", "task_id": task.task_id,
+            "role": task.role, "claim_id": task.target_claim,
+        })
+        first.store.append("JOB_CANCELLED", {
+            "job_id": "legacy-active-job", "task_id": task.task_id,
+            "role": task.role, "claim_id": task.target_claim,
+            "failure_kind": "cancelled",
+            "exit_reason": "controller interrupted by operator",
+        })
+        pruned = research_task("intentionally-pruned")
+        first.store.append("TASK_ACCEPTED", {
+            "task_id": pruned.task_id,
+            "fingerprint": pruned.fingerprint,
+            "representation_id": pruned.representation_id,
+            "task": pruned.to_dict(),
+        })
+        first.store.append("JOB_STARTED", {
+            "job_id": "pruned-job", "task_id": pruned.task_id,
+            "role": pruned.role, "claim_id": pruned.target_claim,
+        })
+        first.store.append("JOB_CANCELLED", {
+            "job_id": "pruned-job", "task_id": pruned.task_id,
+            "role": pruned.role, "claim_id": pruned.target_claim,
+            "failure_kind": "cancelled",
+            "exit_reason": "audited dependency pruning",
+        })
+        first.store.append("RUN_STOPPED", {
+            "reason": "controller interrupted by operator",
+            "internal_failure": False,
+            "campaign_status": "PAUSED",
+        })
+        first._write_compact_snapshot()
+
+        second = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="legacy-resumed-epoch", campaign_id="legacy-cancelled-campaign",
+            previous_epoch_id="legacy-cancelled-epoch",
+        )
+        second._pin_run_inputs(0.01, True)
+        second._import_previous_epoch_checkpoint()
+
+        self.assertEqual(
+            [item.task_id for item in second.pending_research], [task.task_id],
+        )
+        self.assertIn(
+            "LEGACY_CANCELLED_TASK_IMPORTED",
             [event["kind"] for event in second.store.replay()],
         )
 
@@ -996,6 +1260,30 @@ class NextArchitectureTests(unittest.TestCase):
         source.write_text("producer changed source\n", encoding="utf-8")
         self.assertTrue(store.verify(hashes)[0])
         self.assertTrue(all(path.startswith("epoch://epoch-1/") for path in event.artifact_paths))
+
+    def test_candidate_inbox_keeps_its_startup_schema_when_package_resource_disappears(self) -> None:
+        inbox = CandidateInbox(
+            ProjectLayout(self.project),
+            inbox_root=self.runtime / "runs" / "schema-pin" / "events" / "inbox",
+            event_log=self.runtime / "runs" / "schema-pin" / "events" / "CANDIDATES.jsonl",
+            candidate_root=self.runtime / "runs" / "schema-pin" / "candidates",
+        )
+        event = CandidateEvent(
+            event_id="schema-pinned-candidate", producer_thread_id=None,
+            producer_task_id="task", claim_id="C_ROOT", parent_claim_id=None,
+            type="KEY_LEMMA", impact="HIGH", concise_summary="candidate",
+            exact_statement="One exact candidate statement.", artifact_paths=[],
+            reproduction_commands=[], dependency_impact=[],
+        )
+
+        with patch(
+            "autonomous_math_research.eventing.schema_resource",
+            side_effect=FileNotFoundError("simulated package replacement"),
+        ):
+            inbox.submit(event)
+            found = inbox.poll()
+
+        self.assertEqual([item.event_id for item in found], [event.event_id])
 
 
 if __name__ == "__main__":

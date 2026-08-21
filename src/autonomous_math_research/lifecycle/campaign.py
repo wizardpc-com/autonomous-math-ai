@@ -136,6 +136,7 @@ class CampaignStore:
         status: str,
         stopped_reason: str,
         checkpoint_uri: str,
+        checkpoint_usable: bool = True,
     ) -> None:
         validate_storage_id(epoch_id, "epoch_id")
         if status not in {"PAUSED", "STOPPED", "COMPLETED"}:
@@ -155,6 +156,7 @@ class CampaignStore:
             "status": status,
             "stopped_reason": stopped_reason,
             "checkpoint_uri": checkpoint_uri,
+            "checkpoint_usable": bool(checkpoint_usable),
             "timestamp": utc_now(),
         })
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -163,6 +165,60 @@ class CampaignStore:
 
     def events(self) -> list[dict[str, Any]]:
         return read_jsonl(self.epochs_path)
+
+    def latest_continuable_epoch(self) -> str | None:
+        """Return the newest sealed checkpoint that can safely seed an epoch.
+
+        A bootstrap failure can create an epoch directory and a diagnostic
+        snapshot before its predecessor was imported.  Such a snapshot is
+        useful evidence but is not a continuation source.  Older schema-v1
+        records did not carry ``checkpoint_usable``; recognize their explicit
+        bootstrap-failure reason while retaining compatibility with other
+        historical checkpoints.
+        """
+        records = self.events()
+        sealed = {
+            str(record.get("epoch_id") or ""): record
+            for record in records
+            if record.get("kind") == "EPOCH_SEALED"
+        }
+        for epoch_id in reversed(self.load().epochs):
+            record = sealed.get(epoch_id)
+            if record is None:
+                raise ValueError(
+                    f"campaign has an unsealed epoch and cannot be continued: {epoch_id}"
+                )
+            reason = str(record.get("stopped_reason") or "")
+            if record.get("checkpoint_usable") is False or reason.startswith(
+                "bootstrap failed:"
+            ):
+                continue
+            uri = str(record.get("checkpoint_uri") or "")
+            prefix = f"epoch://{epoch_id}/"
+            if not uri.startswith(prefix):
+                raise ValueError(f"continuation checkpoint URI is invalid: {epoch_id}")
+            relative = Path(uri[len(prefix):])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"continuation checkpoint path is invalid: {epoch_id}")
+            epoch_root = (self.runtime_root / "runs" / epoch_id).resolve()
+            checkpoint = (epoch_root / relative).resolve()
+            if not checkpoint.is_relative_to(epoch_root) or not checkpoint.is_file():
+                raise ValueError(f"continuation checkpoint is missing: {epoch_id}")
+            try:
+                value = json.loads(checkpoint.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raise ValueError(f"continuation checkpoint is unreadable: {epoch_id}") from None
+            if not isinstance(value, dict):
+                raise ValueError(f"continuation checkpoint is invalid: {epoch_id}")
+            return epoch_id
+        return None
+
+    def require_current_continuation_source(self, epoch_id: str) -> None:
+        """Reject stale, corrupt, or concurrently active continuation sources."""
+        validate_storage_id(epoch_id, "previous_epoch_id")
+        current = self.latest_continuable_epoch()
+        if current != epoch_id:
+            raise ValueError("previous epoch is not the latest usable campaign checkpoint")
 
     def applied_inputs(self) -> set[str]:
         keys: set[str] = set()

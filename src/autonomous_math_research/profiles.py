@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_SCHEMA_VERSION = 10
+CONFIG_SCHEMA_VERSION = 11
 PROFILE_SCHEMA_VERSION = 1
 BUILTIN_PROFILE_NAME = "codex-app-server-default"
 DEFAULT_GLOBAL_TOKENS = 500_000_000
@@ -300,7 +300,7 @@ def builtin_profile(project_id: str, final_claim_id: str) -> dict[str, Any]:
                     "unsupported_effort": "error",
                     "service_tier": None,
                 },
-                "fallback_condition": "permanent_unavailable_or_access_denied",
+                "fallback_condition": "provider_execution_failure",
                 "recursive_spawn_allowed": False,
                 "transient_max_retries": 1,
                 "model_protocol_max_retries": 1,
@@ -404,9 +404,19 @@ def migrate_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         migrations.append("8->9")
         version = 9
     if version == 9:
-        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        value["schema_version"] = 10
         _augment_role_routes(value)
         migrations.append("9->10")
+        version = 10
+    if version == 10:
+        worker = value.setdefault("policy", {}).setdefault(
+            "one_shot_compute_worker", {}
+        )
+        if worker.get("fallback_condition") == "permanent_unavailable_or_access_denied":
+            worker["fallback_condition"] = "provider_execution_failure"
+        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        _augment_role_routes(value)
+        migrations.append("10->11")
         return value, migrations
     if version == CONFIG_SCHEMA_VERSION:
         _augment_role_routes(value)

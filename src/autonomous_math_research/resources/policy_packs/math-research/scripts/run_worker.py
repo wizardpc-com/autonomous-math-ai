@@ -23,7 +23,7 @@ from typing import Any
 
 
 # A resumed autonomous run executes this file from its immutable policy
-# snapshot. The controller supplies the target workspace root only for
+# snapshot. The controller supplies the sealed parent-job workspace root only for
 # validated inputs/output placement; route configuration cannot be overridden.
 _REPOSITORY_ROOT_OVERRIDE = os.environ.get("MATH_WORKER_REPOSITORY_ROOT", "").strip()
 REPO_ROOT = (
@@ -119,6 +119,12 @@ FIXED_WORKER_ROUTES = (
         "service_tier": None,
     },
 )
+FALLBACK_FAILURE_KINDS = frozenset({
+    "model_unavailable",
+    "provider_quota_exhausted",
+    "transport_transient",
+    "timeout_transient",
+})
 ALLOWED_WORKER_REASONING_EFFORTS = {
     "none",
     "minimal",
@@ -148,22 +154,27 @@ WORKER_ISOLATION_OVERRIDES = {
 }
 
 
-def load_worker_routes(path: Path | None, *, broker_managed: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+def load_worker_routes(
+    path: Path | None, *, broker_managed: bool,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
     if path is None:
         return (
             {"provider": "codex", "profile": None, **FIXED_WORKER_ROUTES[0]},
             {"provider": "codex", "profile": None, **FIXED_WORKER_ROUTES[1]},
+            "primary",
         )
     resolved = path.resolve()
     if broker_managed and not resolved.is_relative_to(REPO_ROOT):
         raise ContractError("broker route configuration must stay inside the project")
     value = read_json(resolved)
     if not isinstance(value, dict) or set(value) != {
-        "schema_version", "primary_route", "fallback_route",
+        "schema_version", "start_route", "primary_route", "fallback_route",
     }:
         raise ContractError("mechanical route configuration fields are invalid")
-    if value["schema_version"] != 1:
+    if value["schema_version"] != 2:
         raise ContractError("unsupported mechanical route configuration version")
+    if value["start_route"] not in {"primary", "fallback"}:
+        raise ContractError("mechanical start_route must be primary or fallback")
     expected = {
         "provider", "model", "reasoning_effort", "service_tier", "profile",
     }
@@ -183,7 +194,7 @@ def load_worker_routes(path: Path | None, *, broker_managed: bool) -> tuple[dict
         if route["profile"] is not None and not isinstance(route["profile"], str):
             raise ContractError(f"{name}.profile must be a string or null")
         routes.append(dict(route))
-    return routes[0], routes[1]
+    return routes[0], routes[1], str(value["start_route"])
 MODEL_STATUS_PATH = REPO_ROOT / ".tooling" / "math-worker-model-status.json"
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
@@ -254,6 +265,21 @@ PROOF_DIRECTIVE_MARKERS = (
     "prove the", "prove that", "disprove", "construct a proof",
     "证明该", "证明此", "证明命题", "给出证明", "构造证明", "证伪命题",
 )
+
+
+def contains_proof_directive(text: str, marker: str) -> bool:
+    start = 0
+    while True:
+        index = text.find(marker, start)
+        if index < 0:
+            return False
+        prefix = text[max(0, index - 24):index]
+        if not (
+            re.search(r"(?:does|do|did|will|would|can|could)\s+not\s+$", prefix)
+            or prefix.endswith(("不", "不能", "并非要", "并不"))
+        ):
+            return True
+        start = index + len(marker)
 RESULT_FIELDS = (
     "task_id",
     "status",
@@ -749,7 +775,55 @@ def classify_probe_failure(stdout_path: Path, stderr_path: Path) -> dict[str, An
     # Only a structured service-side turn failure may poison the persistent
     # route cache. Stderr is retained for diagnosis, but a local filesystem or
     # wrapper message containing "access denied" must never disable Spark.
-    service_detail = "\n".join(service_fragments).lower()
+    service_detail_raw = "\n".join(service_fragments)
+    service_detail = service_detail_raw.lower()
+    quota_markers = (
+        "usage_limit_reached",
+        "usage_limit_exceeded",
+        "insufficient_quota",
+        "quota_exceeded",
+        "billing_hard_limit_reached",
+        "spend_limit_reached",
+        "you've hit your usage limit",
+        "you have hit your usage limit",
+        "exceeded your current quota",
+        "insufficient quota",
+        "billing hard limit",
+        "usage quota exhausted",
+    )
+    provider_quota_exhausted = bool(service_failures) and any(
+        marker in service_detail for marker in quota_markers
+    )
+    provider_reset_at = None
+    if provider_quota_exhausted:
+        reset_keys = (
+            "provider_reset_at", "reset_at", "resets_at", "resetAt", "resetsAt",
+            "reset_time", "resetTime", "next_reset_at", "nextResetAt",
+        )
+        pending: list[Any] = [event.get("error") for event in service_failures]
+        while pending and provider_reset_at is None:
+            current = pending.pop()
+            if isinstance(current, dict):
+                for key in reset_keys:
+                    candidate = current.get(key)
+                    if (
+                        isinstance(candidate, (str, int, float))
+                        and not isinstance(candidate, bool)
+                        and str(candidate).strip()
+                    ):
+                        provider_reset_at = str(candidate).strip()[:200]
+                        break
+                pending.extend(current.values())
+            elif isinstance(current, list):
+                pending.extend(current)
+        if provider_reset_at is None:
+            match = re.search(
+                r"(?:try again|resets?)\s+(?:at|on)\s+([^\r\n]+)",
+                service_detail_raw,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                provider_reset_at = match.group(1).strip().rstrip(".\"'}]")[:200]
     permanent_unavailable_markers = (
         "model_not_found",
         "access_denied",
@@ -761,13 +835,21 @@ def classify_probe_failure(stdout_path: Path, stderr_path: Path) -> dict[str, An
         "not available to your project",
         "not available to this project",
     )
-    cache_as_unavailable = bool(service_failures) and any(
+    cache_as_unavailable = (
+        not provider_quota_exhausted
+        and bool(service_failures)
+        and any(
         marker in service_detail for marker in permanent_unavailable_markers
+        )
     )
     return {
         "failure_scope": "service" if service_failures else "local-or-transport",
         "failure_detail": detail or None,
         "cache_as_unavailable": cache_as_unavailable,
+        "failure_kind": (
+            "provider_quota_exhausted" if provider_quota_exhausted else None
+        ),
+        "provider_reset_at": provider_reset_at,
     }
 
 
@@ -945,9 +1027,11 @@ def repository_input_path(raw: str) -> Path:
     try:
         candidate.relative_to(REPO_ROOT.resolve())
     except ValueError as exc:
-        raise ContractError(f"input file is outside the repository: {raw}") from exc
+        raise ContractError(f"input file is outside the parent workspace: {raw}") from exc
     if not candidate.is_file():
-        raise ContractError(f"input file does not exist or is not a file: {raw}")
+        raise ContractError(
+            f"input file does not exist in the parent workspace or is not a file: {raw}"
+        )
     return candidate
 
 
@@ -1025,7 +1109,7 @@ def validate_task_packet(value: Any) -> dict[str, Any]:
             (
                 marker
                 for marker in PROOF_DIRECTIVE_MARKERS
-                if marker in directive_text
+                if contains_proof_directive(directive_text, marker)
             ),
             None,
         )
@@ -1130,10 +1214,27 @@ def find_codex() -> Path:
 
 def codex_prefix(codex: Path) -> list[str]:
     if os.name == "nt" and codex.suffix.lower() in {".cmd", ".bat"}:
-        command_processor = (
-            os.environ.get("COMSPEC") or shutil.which("cmd.exe") or "cmd.exe"
+        # npm's batch shim sends the remaining argv through cmd.exe.  Quoted
+        # TOML dotted keys and inline tables are then rewritten before the
+        # native Codex parser sees them, which can silently change permission
+        # selectors or make the profile fail to deserialize.  Invoke the npm
+        # JavaScript entry point through Node instead; it forwards argv to the
+        # same packaged native binary without a command-shell round trip.
+        npm_entry = (
+            codex.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
         )
-        return [command_processor, "/d", "/s", "/c", str(codex)]
+        bundled_node = codex.parent / "node.exe"
+        node = (
+            str(bundled_node.resolve())
+            if bundled_node.is_file()
+            else (shutil.which("node.exe") or shutil.which("node"))
+        )
+        if npm_entry.is_file() and node:
+            return [str(Path(node).resolve()), str(npm_entry.resolve())]
+        raise ContractError(
+            "Codex npm wrapper cannot be invoked without cmd.exe; "
+            "a Node runtime and the @openai/codex entry point are required"
+        )
     return [str(codex)]
 
 
@@ -1223,11 +1324,11 @@ def codex_command(
     # and can access only minimal runtime paths plus this isolated workspace.
     command.extend([
         "-c", f"default_permissions={json.dumps(permission_profile)}",
-        "-c", f'permissions.{permission_profile}.filesystem.":root"="deny"',
-        "-c", f'permissions.{permission_profile}.filesystem.":minimal"="read"',
+        "-c", f'permissions.{permission_profile}.filesystem.:root="deny"',
+        "-c", f'permissions.{permission_profile}.filesystem.:minimal="read"',
         "-c", (
             f'permissions.{permission_profile}.filesystem.'
-            f'":workspace_roots"."."={json.dumps(workspace_access)}'
+            f':workspace_roots={{ "." = {json.dumps(workspace_access)} }}'
         ),
         "-c", f"permissions.{permission_profile}.network.enabled=false",
     ])
@@ -1647,10 +1748,14 @@ def main() -> int:
     try:
         receipt = create_broker_receipt(args)
         model_status_path = broker_model_status_path(args)
-        primary_route, fallback_route_config = load_worker_routes(
+        primary_route, fallback_route_config, start_route = load_worker_routes(
             args.route_config, broker_managed=bool(args.broker_managed),
         )
-        fixed_routes = (primary_route, fallback_route_config)
+        fixed_routes = (
+            (fallback_route_config,)
+            if start_route == "fallback"
+            else (primary_route, fallback_route_config)
+        )
         packet_path = args.task_packet.resolve()
         raw_packet = read_json(packet_path)
         task_schema = read_json(TASK_SCHEMA_SOURCE)
@@ -1710,7 +1815,7 @@ def main() -> int:
         selected_route: dict[str, Any] | None = None
         failure: dict[str, Any] | None = None
 
-        for route_index, route in enumerate(fixed_routes):
+        for route in fixed_routes:
             model = str(route["model"])
             reasoning_effort = str(route["reasoning_effort"])
             service_tier = route["service_tier"]
@@ -1736,7 +1841,7 @@ def main() -> int:
                     "cached_unavailable": unavailable,
                     "worker_usage": None,
                 })
-                if route_index == 0:
+                if model == str(primary_route["model"]):
                     fallback = {
                         "from_provider": primary_route["provider"],
                         "from_model": primary_route["model"],
@@ -1906,28 +2011,26 @@ def main() -> int:
                         run_dir=run_dir,
                         path=model_status_path,
                     )
-                    if model == str(primary_route["model"]):
-                        fallback = {
-                            "from_provider": primary_route["provider"],
-                            "from_model": primary_route["model"],
-                            "to_provider": fallback_route_config["provider"],
-                            "to_model": fallback_route_config["model"],
-                            "reason": (
-                                "primary worker execution returned permanent unavailable/access denied; "
-                                "controller must continue once with cached-primary Luna fallback"
-                            ),
-                            "primary_actual_attempted": True,
-                            "continuation_required": True,
-                        }
+                failure_kind = classified.get("failure_kind") or (
+                    "model_unavailable" if classified.get("cache_as_unavailable")
+                    else "transport_transient"
+                )
                 execution_failure = {
-                    "kind": (
-                        "model_unavailable" if classified.get("cache_as_unavailable")
-                        else "transport_transient"
+                    "kind": failure_kind,
+                    "retryable": failure_kind not in {
+                        "model_unavailable", "provider_quota_exhausted",
+                    },
+                    "message": (
+                        "provider quota exhausted"
+                        if failure_kind == "provider_quota_exhausted"
+                        else f"worker exited with code {exit_code}"
                     ),
-                    "retryable": not bool(classified.get("cache_as_unavailable")),
-                    "message": f"worker exited with code {exit_code}",
                     "detail": classified.get("failure_detail"),
                 }
+                if classified.get("provider_reset_at") is not None:
+                    execution_failure["provider_reset_at"] = classified[
+                        "provider_reset_at"
+                    ]
                 raise ContractError(f"worker exited with code {exit_code}")
             verify_immutable_snapshot(run_dir, immutable_before)
             result = validate_worker_result(read_json(last_message), packet, run_dir)
@@ -1937,6 +2040,25 @@ def main() -> int:
                 execution_failure = {
                     "kind": "model_output_protocol", "retryable": True,
                     "message": str(exc),
+                }
+            failure_kind = str(execution_failure.get("kind") or "")
+            if (
+                fallback is None
+                and model == str(primary_route["model"])
+                and failure_kind in FALLBACK_FAILURE_KINDS
+            ):
+                fallback = {
+                    "from_provider": primary_route["provider"],
+                    "from_model": primary_route["model"],
+                    "to_provider": fallback_route_config["provider"],
+                    "to_model": fallback_route_config["model"],
+                    "reason": (
+                        f"primary provider execution failed ({failure_kind}); "
+                        "controller must continue once on the configured fallback"
+                    ),
+                    "primary_actual_attempted": True,
+                    "continuation_required": True,
+                    "trigger_failure_kind": failure_kind,
                 }
             preserved = ["worker.stdout.jsonl", "worker.stderr.log", "worker-command.json"]
             if last_message.is_file():

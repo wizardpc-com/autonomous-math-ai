@@ -8,7 +8,9 @@ import unittest
 from uuid import uuid4
 
 from autonomous_math_research.app_server import (
-    AppServerClient, AppServerRequestError, TurnOwnershipRegistry,
+    AppServerClient, AppServerRequestError, AppServerRequestTimeout,
+    AppServerTransportClosed, AppServerTurnTimeout,
+    AppServerTurnTransportLost, TurnOwnershipRegistry,
 )
 from autonomous_math_research.backend import (
     AppServerBackend, TurnDirective, _classify_failure,
@@ -620,6 +622,50 @@ class _HangingTurnClient(AppServerClient):
         return {}
 
 
+class _TransportLostStartClient(AppServerClient):
+    def __init__(self):
+        super().__init__(codex_executable="unused")
+        self._transport_alive = True
+        self.interrupt_calls: list[tuple[str, str]] = []
+
+    @property
+    def transport_available(self) -> bool:
+        return self._transport_alive
+
+    async def request(  # type: ignore[override]
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 60,
+    ) -> object:
+        del timeout
+        if method != "turn/start":
+            raise AssertionError(f"unexpected request: {method}")
+        assert params is not None
+        thread_id = str(params["threadId"])
+        self._handle_notification({
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turn": {"id": "turn-lost-during-start", "status": "inProgress"},
+            },
+        })
+        self._handle_notification({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": "turn-lost-during-start",
+                "item": {"type": "agentMessage", "text": '{"turn": 1}'},
+            },
+        })
+        self._transport_alive = False
+        raise AppServerTransportClosed("app-server stdout closed")
+
+    async def interrupt(self, thread_id: str, turn_id: str) -> object:
+        self.interrupt_calls.append((thread_id, turn_id))
+        raise AppServerTransportClosed("app-server stdout closed")
+
+
 class _BlockingInterruptClient(_HangingTurnClient):
     def __init__(self):
         super().__init__()
@@ -631,6 +677,20 @@ class _BlockingInterruptClient(_HangingTurnClient):
         self.interrupt_started.set()
         await self.release_interrupt.wait()
         return {}
+
+
+class _RequestTimeoutClient(AppServerClient):
+    def __init__(self):
+        super().__init__(codex_executable="unused")
+        self._transport_generation = 1
+        self._transport_alive = True
+
+    @property
+    def transport_available(self) -> bool:
+        return self._transport_alive
+
+    async def _send(self, message: dict[str, object]) -> None:
+        del message
 
 
 class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
@@ -726,6 +786,17 @@ class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("thread-1", client.turn_ownership._open_threads)
 
+    async def test_transport_loss_during_turn_start_is_not_misclassified_as_unmanaged(self) -> None:
+        client = _TransportLostStartClient()
+
+        with self.assertRaises(AppServerTurnTransportLost) as raised:
+            await self._start_turn(client)
+
+        self.assertEqual(raised.exception.turn_id, "turn-lost-during-start")
+        self.assertEqual(raised.exception.raw_output, '{"turn": 1}')
+        self.assertEqual(client.interrupt_calls, [])
+        self.assertNotIn("thread-1", client.turn_ownership._open_threads)
+
     async def test_cancelled_wait_interrupts_remote_turn_and_closes_ownership(self) -> None:
         client = _HangingTurnClient()
         task = asyncio.create_task(self._start_turn(client))
@@ -737,6 +808,82 @@ class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.interrupt_calls, [("thread-1", "turn-hanging")])
         self.assertNotIn("thread-1", client.turn_ownership._open_threads)
+
+    async def test_stdout_eof_during_cancel_retrieves_abandoned_waiter_exception(self) -> None:
+        client = _HangingTurnClient()
+        task = asyncio.create_task(self._start_turn(client))
+        await client.started.wait()
+        await asyncio.sleep(0)
+        waiter = client._thread_turn_waiters["thread-1"]
+
+        task.cancel()
+        client._fail_pending()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertTrue(waiter.done())
+        self.assertFalse(
+            waiter._log_traceback,  # type: ignore[attr-defined]
+            "the abandoned shielded waiter would emit 'Future exception was never retrieved'",
+        )
+
+    async def test_stale_reader_eof_cannot_fail_new_transport_futures(self) -> None:
+        client = AppServerClient(codex_executable="unused")
+        client._transport_generation = 2
+        future = asyncio.get_running_loop().create_future()
+        client._pending[1] = future
+
+        client._fail_pending(1)
+        self.assertFalse(future.done())
+
+        client._fail_pending(2)
+        with self.assertRaises(AppServerTransportClosed):
+            await future
+
+    async def test_one_request_timeout_fails_shared_waiters_and_closes_dispatch(self) -> None:
+        client = _RequestTimeoutClient()
+        co_tenant = asyncio.get_running_loop().create_future()
+        client._turn_waiters["turn-co-tenant"] = co_tenant
+
+        with self.assertRaises(AppServerRequestTimeout):
+            await client.request("thread/start", {}, timeout=0.001)
+
+        self.assertFalse(client.transport_available)
+        with self.assertRaises(AppServerTransportClosed):
+            await co_tenant
+
+    async def test_turn_transport_loss_preserves_buffered_output_and_usage(self) -> None:
+        client = _HangingTurnClient()
+        task = asyncio.create_task(self._start_turn(client))
+        await client.started.wait()
+        await asyncio.sleep(0)
+        client._handle_notification({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-hanging",
+                "item": {
+                    "type": "agentMessage",
+                    "text": '{"turn": 1}',
+                },
+            },
+        })
+        client._handle_notification({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-hanging",
+                "tokenUsage": {"total": {"totalTokens": 321}},
+            },
+        })
+        client._fail_pending()
+
+        with self.assertRaises(AppServerTurnTransportLost) as raised:
+            await task
+
+        self.assertEqual(raised.exception.raw_output, '{"turn": 1}')
+        self.assertEqual(raised.exception.token_usage.total_tokens, 321)
+        self.assertEqual(raised.exception.token_telemetry, "observed")
 
     async def test_repeated_cancellation_does_not_orphan_interrupt_task(self) -> None:
         client = _BlockingInterruptClient()
@@ -846,6 +993,56 @@ class ResearchTerminationAndStagnationTests(unittest.TestCase):
         self.assertEqual(kind, "provider_quota_exhausted")
         self.assertFalse(retryable)
         self.assertEqual(details["provider_reset_at"], "2026-08-22T00:00:00Z")
+
+    def test_uncontained_turn_timeout_is_provider_transport_loss(self) -> None:
+        kind, retryable, details = _classify_failure(AppServerTurnTimeout(
+            thread_id="thread-timeout",
+            turn_id="turn-timeout",
+            timeout=1800,
+            turn=None,
+            raw_output="bounded partial output",
+            token_usage=TokenUsage(total_tokens=100),
+            token_telemetry="observed",
+            did_not_stop=True,
+        ))
+        self.assertEqual(kind, "provider_transport_lost")
+        self.assertFalse(retryable)
+        self.assertTrue(details["did_not_stop_after_interrupt"])
+
+    def test_provider_transport_loss_pauses_epoch_and_requeues_exact_task(self) -> None:
+        TEST_RUNTIME.mkdir(parents=True, exist_ok=True)
+        root = TEST_RUNTIME / f"amr-transport-loss-{uuid4().hex}"
+        root.mkdir()
+        try:
+            project = initialize_project(root / "neutral-project")
+            controller = AutonomousController(
+                load_config(project), backend=MockCodexBackend(), mock=True,
+                run_id="transport-epoch", campaign_id="transport-campaign",
+            )
+            controller._pin_run_inputs(0.01, True)
+            task = research_task()
+            outcome = JobOutcome(
+                job_id="job-transport", task_id=task.task_id, role=task.role,
+                claim_id=task.target_claim, status="ERROR", result={},
+                failure_kind="provider_transport_lost", retryable=False,
+                error="app-server stdout closed",
+                server_error={"code": "app_server_stdout_closed"},
+            )
+
+            controller._accept_research_result(outcome, task)
+
+            self.assertFalse(controller._internal_failure)
+            self.assertEqual(
+                [item.task_id for item in controller.pending_research],
+                [task.task_id],
+            )
+            self.assertIn(
+                "provider transport lost", controller.scheduler_stop_reason or "",
+            )
+            self.assertTrue(controller._provider_transport_lost)
+            self.assertEqual(controller.stagnation.attempts, {})
+        finally:
+            shutil.rmtree(root)
 
     def test_provider_quota_pauses_campaign_and_requeues_exact_task(self) -> None:
         TEST_RUNTIME.mkdir(parents=True, exist_ok=True)

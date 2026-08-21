@@ -10,7 +10,7 @@
     "rate_limits", "observability", "timeouts", "workspace", "policy"
   ],
   "properties": {
-    "schema_version": {"const": 10},
+    "schema_version": {"const": 11},
     "profile": {"type": "string", "minLength": 1},
     "project": {"$ref": "#/$defs/project"},
     "campaign": {"$ref": "#/$defs/campaign"},
@@ -378,7 +378,7 @@
         "service_tier": {"type": "null"},
         "primary_route": {"$ref": "#/$defs/mechanicalRoute"},
         "fallback_route": {"$ref": "#/$defs/mechanicalRoute"},
-        "fallback_condition": {"const": "permanent_unavailable_or_access_denied"},
+        "fallback_condition": {"const": "provider_execution_failure"},
         "recursive_spawn_allowed": {"const": false},
         "transient_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},
         "model_protocol_max_retries": {"$ref": "#/$defs/nonNegativeInteger"},

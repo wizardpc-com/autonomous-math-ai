@@ -9,7 +9,8 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .app_server import (
-    AppServerClient, AppServerError, AppServerRequestError, AppServerTurnFailed,
+    AppServerClient, AppServerError, AppServerRequestError,
+    AppServerTransportClosed, AppServerTurnFailed,
     AppServerTurnTimeout, ModelRoutePolicyError, ServiceTierPolicyError,
     StructuredOutputProtocolError, UnmanagedContinuationError,
     attest_model_route, attest_no_service_tier,
@@ -171,7 +172,10 @@ def _classify_failure(exc: Exception) -> tuple[str, bool, dict[str, Any] | None]
             "route_event": exc.route_event,
         }
     if isinstance(exc, AppServerTurnTimeout):
-        return "transport_transient", True, _server_error_details(exc.server_error)
+        details = _server_error_details(exc.server_error)
+        if details.get("did_not_stop_after_interrupt"):
+            return "provider_transport_lost", False, details
+        return "transport_transient", True, details
     if isinstance(exc, (AppServerTurnFailed, AppServerRequestError)):
         details = (
             _turn_error_details(exc) if isinstance(exc, AppServerTurnFailed)
@@ -200,6 +204,14 @@ def _classify_failure(exc: Exception) -> tuple[str, bool, dict[str, Any] | None]
         return "transport_transient" if retryable else "turn_failed", retryable, details
     if isinstance(exc, StructuredOutputProtocolError):
         return "model_output_protocol", True, None
+    if isinstance(exc, AppServerTransportClosed):
+        details = getattr(exc, "server_error", None)
+        if not isinstance(details, dict):
+            details = {
+                "code": "app_server_transport_closed",
+                "message": str(redact_auth_material(str(exc))),
+            }
+        return "provider_transport_lost", False, details
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, AppServerError)):
         return "transport_transient", True, None
     if isinstance(exc, SchemaError):
@@ -475,6 +487,8 @@ class AppServerBackend:
     async def cancel(self, job_id: str) -> bool:
         ids = self.active.get(job_id)
         if not ids:
+            return False
+        if not self.client.transport_available:
             return False
         await self.client.interrupt(*ids)
         return True
