@@ -781,7 +781,10 @@ class AppServerClient:
             started_turn_id = self._notification_turn_by_thread.get(thread_id)
             if started_turn_id:
                 try:
-                    await asyncio.shield(self.interrupt(thread_id, started_turn_id))
+                    # Do not shield this coroutine. A second cancellation of
+                    # the owning job must cancel and reap the interrupt request
+                    # too, rather than leaving an unowned request Future behind.
+                    await self.interrupt(thread_id, started_turn_id)
                 except (asyncio.CancelledError, Exception):
                     pass
             self._retire_turn_ids(thread_id, started_turn_id or "")
@@ -835,7 +838,10 @@ class AppServerClient:
             completed = await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
         except asyncio.CancelledError:
             try:
-                await asyncio.shield(self.interrupt(thread_id, turn_id))
+                # The caller owns containment through completion. Shielding
+                # here can orphan the interrupt task if shutdown cancels the
+                # caller a second time while App Server is closing.
+                await self.interrupt(thread_id, turn_id)
             except (asyncio.CancelledError, Exception):
                 pass
             raise
@@ -853,6 +859,8 @@ class AppServerClient:
             self._turn_waiters.pop(turn_id, None)
             self._thread_turn_waiters.pop(thread_id, None)
             self._turn_started_callbacks.pop(thread_id, None)
+            if not waiter.done():
+                waiter.cancel()
             self.turn_ownership.finish_controller_turn(thread_id)
         terminal_turn = ((completed or {}).get("turn") or {})
         completed_turn_id = str(

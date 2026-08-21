@@ -84,27 +84,189 @@ from .workspace import WorkspaceManager
 
 
 DEFAULT_RUN_HOURS = 12.0
-_UNAUTHORIZED_TOP_LEVEL_DELEGATION_RE = re.compile(
-    # Treat Codex itself as a forbidden command only when it occupies a shell
-    # command position.  A broad whitespace match used to flag harmless text
-    # searches such as ``rg codex`` while still allowing ``codex app-server``
-    # to bypass the broker-only delegation boundary.
-    r"(?i)(?:^|[;&|]\s*)(?:&\s*)?(?:[\"'][^\"']*[\\/])?"
-    r"codex(?:\.cmd|\.exe)?[\"']?(?:\s|$)|"
-    r"(?:cmd(?:\.exe)?(?:\s+/(?:d|s))*\s+/c|"
-    r"(?:powershell|pwsh)(?:\.exe)?[^\r\n]{0,120}?(?:-command|-c)|"
-    r"(?:ba|z)?sh[^\r\n]{0,80}?-(?:l)?c|start-process)"
-    r"[^\r\n]{0,200}?(?:[\"'][^\"']*[\\/])?codex(?:\.cmd|\.exe)?[\"']?(?:\s|$)|"
-    r"(?:subprocess\.(?:run|popen|call)|os\.system)\s*\([^\r\n]{0,200}?"
-    r"codex(?:\.cmd|\.exe)?(?:[\"']|\s)|"
-    r"(?:npx|bunx|npm\s+exec|pnpm\s+exec)\s+(?:--yes\s+)?@openai[\\/]codex|"
-    r"python(?:\.exe)?\s+-m\s+codex(?:\s|$)|"
-    r"run_worker\.py|"
-    r"tools[./\\]autonomous_math_research[./\\]"
-    r"(?:delegate_mechanical_task|mechanical|controller|cli|__main__|smoke)\.py|"
-    r"python(?:\.exe)?\s+-m\s+tools\.autonomous_math_research(?:\s|$)|"
-    r"spawn_agent|create_thread"
+CONTINUATION_CHECKPOINT_REASONS = frozenset({
+    "bounded same-thread turn limit reached",
+    "controller token budget reached",
+    "token telemetry unavailable; bounded continuation stopped fail-closed",
+})
+_PYTHON_DELEGATION_CODE_RE = re.compile(
+    r"(?is)(?:subprocess\.(?:run|popen|call)|os\.system)\s*\(.{0,500}?"
+    r"(?:^|[\s\"'/\\])codex(?:\.cmd|\.exe)?(?:[\s\"']|$)"
 )
+
+
+def _split_unquoted_shell_segments(command: str) -> list[str]:
+    """Split shell pipelines without treating quoted evidence as executable syntax."""
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for character in command:
+        if escaped:
+            current.append(character)
+            escaped = False
+            continue
+        if quote:
+            current.append(character)
+            if character == "`":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            current.append(character)
+        elif character in ";&|\r\n":
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+        else:
+            current.append(character)
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _shell_words(segment: str) -> list[str]:
+    """Return simple shell words with surrounding quotes removed."""
+    words: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for character in segment:
+        if escaped:
+            current.append(character)
+            escaped = False
+            continue
+        if quote:
+            if character == "`":
+                escaped = True
+            elif character == quote:
+                quote = None
+            else:
+                current.append(character)
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character.isspace():
+            if current:
+                words.append("".join(current))
+                current = []
+        else:
+            current.append(character)
+    if current:
+        words.append("".join(current))
+    return words
+
+
+def _command_basename(value: str) -> str:
+    return value.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _is_codex_executable(value: str) -> bool:
+    return _command_basename(value) in {"codex", "codex.cmd", "codex.exe"}
+
+
+def _is_forbidden_python_script(value: str) -> bool:
+    normalized = value.strip().replace("\\", "/").lower()
+    if normalized.rsplit("/", 1)[-1] == "run_worker.py":
+        return True
+    return bool(re.search(
+        r"(?:^|/)tools/autonomous_math_research/"
+        r"(?:delegate_mechanical_task|mechanical|controller|cli|__main__|smoke)\.py$",
+        normalized,
+    ))
+
+
+def _is_unauthorized_top_level_delegation(command: str, *, depth: int = 0) -> bool:
+    """Detect execution of a delegation entry point, not a harmless mention of it."""
+    if not command or depth > 3:
+        return False
+    for segment in _split_unquoted_shell_segments(command):
+        words = _shell_words(segment)
+        if not words:
+            continue
+
+        # Shell launch helpers still put the actual executable in command position.
+        while words and _command_basename(words[0]) in {
+            "call", "command", "exec", "nohup", "start",
+        }:
+            words = words[1:]
+        if not words:
+            continue
+        executable = _command_basename(words[0])
+        if _is_codex_executable(words[0]) or executable in {
+            "spawn_agent", "create_thread",
+        }:
+            return True
+
+        if executable in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+            lowered = [word.lower() for word in words]
+            for flag in ("-command", "-c"):
+                if flag in lowered[1:]:
+                    index = lowered.index(flag, 1)
+                    return _is_unauthorized_top_level_delegation(
+                        " ".join(words[index + 1:]), depth=depth + 1,
+                    )
+            continue
+        if executable in {"cmd", "cmd.exe"}:
+            lowered = [word.lower() for word in words]
+            if "/c" in lowered:
+                index = lowered.index("/c")
+                return _is_unauthorized_top_level_delegation(
+                    " ".join(words[index + 1:]), depth=depth + 1,
+                )
+            continue
+        if executable in {"sh", "bash", "zsh"}:
+            lowered = [word.lower() for word in words]
+            for flag in ("-c", "-lc"):
+                if flag in lowered:
+                    index = lowered.index(flag)
+                    return _is_unauthorized_top_level_delegation(
+                        " ".join(words[index + 1:]), depth=depth + 1,
+                    )
+            continue
+        if executable in {"start-process", "start-process.exe"}:
+            # This branch is reached only when Start-Process is itself executed.
+            if any(_is_codex_executable(word) for word in words[1:]):
+                return True
+            continue
+
+        if executable in {"npx", "bunx"}:
+            if any(
+                word.lower().replace("\\", "/") == "@openai/codex"
+                for word in words[1:]
+            ):
+                return True
+        if executable in {"npm", "pnpm"} and len(words) > 2:
+            if words[1].lower() == "exec" and any(
+                word.lower().replace("\\", "/") == "@openai/codex"
+                for word in words[2:]
+            ):
+                return True
+
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", executable):
+            lowered = [word.lower() for word in words]
+            if "-m" in lowered:
+                index = lowered.index("-m")
+                legacy_module_prefix = "tools" + ".autonomous_math_research"
+                if index + 1 < len(words) and (
+                    words[index + 1].lower() == "codex"
+                    or words[index + 1].lower().startswith(legacy_module_prefix)
+                ):
+                    return True
+            if "-c" in lowered:
+                index = lowered.index("-c")
+                code = " ".join(words[index + 1:])
+                if _PYTHON_DELEGATION_CODE_RE.search(code):
+                    return True
+            if any(_is_forbidden_python_script(word) for word in words[1:]):
+                return True
+        elif _is_forbidden_python_script(words[0]):
+            return True
+    return False
 
 
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
@@ -600,7 +762,7 @@ class AutonomousController:
         self.stagnation = StagnationTracker(int(config.raw["stagnation"]["attempt_threshold"]))
         engine_config = config.raw["engine"]
         self.research_turn_policy = ResearchTurnPolicy(
-            max_turns=int(engine_config["research_max_turns"]),
+            max_turns=dict(engine_config["research_max_turns"]),
         )
         self.reasoning_health = ReasoningHealthMonitor(
             short_reasoning_tokens=int(engine_config["reasoning_health_short_tokens"]),
@@ -631,8 +793,10 @@ class AutonomousController:
         self._max_mechanical_subworkers_override = max_mechanical_subworkers
         self.guard = CanonicalGuard(config.project_root, config.protected_paths)
         self.pending_research: list[ResearchTask] = []
+        self.deferred_research_continuations: list[ResearchTask] = []
         self.pending_audits: list[ResearchTask] = []
         self.active: dict[str, ActiveJob] = {}
+        self._scheduled_backend_cancellations: set[asyncio.Task[bool]] = set()
         self.pending_mechanical: list[MechanicalRequestState] = []
         self.active_mechanical: dict[str, ActiveMechanicalJob] = {}
         self.completed_mechanical_jobs: list[dict[str, Any]] = []
@@ -662,6 +826,7 @@ class AutonomousController:
         self._director_active = False
         self._director_incremental = False
         self._bound_jobs: dict[str, tuple[str, str]] = {}
+        self._blocker_repair_jobs: set[str] = set()
         self.scheduler_stop_reason: str | None = None
         self.lifecycle = MonotoneLifecycle()
         self.final_conjecture_proved = False
@@ -946,6 +1111,66 @@ class AutonomousController:
             "lifecycle_phase": self.lifecycle.phase,
         })
 
+    def _pause_for_provider_quota(
+        self,
+        outcome: JobOutcome,
+        *,
+        task: ResearchTask | None = None,
+        checkpoint_job_record: dict[str, Any] | None = None,
+    ) -> None:
+        details = outcome.server_error if isinstance(outcome.server_error, dict) else {}
+        reset_value = details.get("provider_reset_at")
+        reset_at = (
+            _sanitize_live_text(reset_value)[:200]
+            if isinstance(reset_value, (str, int, float))
+            and not isinstance(reset_value, bool)
+            else None
+        )
+        provider = outcome.provider or (
+            self.config.raw["models"].get(outcome.role, {}).get("provider")
+        )
+        reason = "campaign paused: provider quota exhausted"
+        if reset_at not in {None, ""}:
+            reason += f" until {reset_at}"
+        if task is not None:
+            if outcome.turn_history and outcome.result:
+                outcome.logical_stop_reason = "provider quota exhausted"
+                continued = self._checkpoint_research_continuation(
+                    outcome, task, checkpoint_job_record,
+                )
+                requeued_task_id = continued.task_id
+                requeue_mode = "noncanonical_checkpoint"
+            else:
+                if not any(item.task_id == task.task_id for item in self.pending_research):
+                    self.pending_research.append(task)
+                requeued_task_id = task.task_id
+                requeue_mode = "exact_task"
+            self.store.append("TASK_REQUEUED_AFTER_PROVIDER_QUOTA", {
+                "job_id": outcome.job_id,
+                "task_id": task.task_id,
+                "requeued_task_id": requeued_task_id,
+                "claim_id": task.target_claim,
+                "mode": requeue_mode,
+                "mathematical_failure": False,
+                "stagnation_effect": "none",
+            })
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(LifecyclePhase.DRAINING_EPOCH, reason=reason)
+        if not self.scheduler_stop_reason:
+            self.scheduler_stop_reason = reason
+        self.store.append("PROVIDER_QUOTA_EXHAUSTED", {
+            "job_id": outcome.job_id,
+            "task_id": outcome.task_id,
+            "role": outcome.role,
+            "provider": provider,
+            "provider_reset_at": reset_at,
+            "action": (
+                "pause campaign, preserve frontier, and wait for the provider reset; "
+                "do not count as mathematical failure or stagnation"
+            ),
+            "internal_failure": False,
+        })
+
     def _queue_director_retry(
         self, failure_kind: str, *, retryable: bool, source: str,
     ) -> bool:
@@ -1103,9 +1328,38 @@ class AutonomousController:
             return False
 
     def _schedule_backend_cancel(self, job_id: str, reason: str) -> None:
-        # The helper catches transport failures itself, so the task cannot
-        # create an unobserved exception that later destabilizes the loop.
-        asyncio.create_task(self._cancel_backend_job(job_id, reason))
+        task = asyncio.create_task(self._cancel_backend_job(job_id, reason))
+        self._scheduled_backend_cancellations.add(task)
+        task.add_done_callback(self._scheduled_backend_cancellations.discard)
+
+    async def _drain_scheduled_backend_cancellations(self) -> None:
+        tasks = list(self._scheduled_backend_cancellations)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    async def _reap_cancelled_job_future(active: ActiveJob) -> None:
+        if not active.future.done():
+            active.future.cancel()
+        try:
+            await active.future
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _cancel_active_jobs_before_backend_close(self, reason: str) -> None:
+        """Contain remote turns and reap their local owners before transport close."""
+        await self._drain_scheduled_backend_cancellations()
+        for job_id, active in list(self.active.items()):
+            cancel_ok = await self._cancel_backend_job(
+                job_id, reason, fatal_on_failure=False,
+            )
+            await self._reap_cancelled_job_future(active)
+            self._record_job_cancelled(
+                job_id, active, reason,
+                remote_cancel_succeeded=cancel_ok,
+            )
+            self.governor.release(job_id)
+        self.active.clear()
 
     def _record_job_cancelled(
         self,
@@ -1874,9 +2128,7 @@ class AutonomousController:
             item = params.get("item") or {}
             item_type = str(item.get("type") or "")
             command = _sanitize_live_text(item.get("command"))
-            forbidden_command = bool(
-                _UNAUTHORIZED_TOP_LEVEL_DELEGATION_RE.search(command)
-            )
+            forbidden_command = _is_unauthorized_top_level_delegation(command)
             if item_type == "collabToolCall" or forbidden_command:
                 thread_id = str(params.get("threadId") or "")
                 identity = self._live_identity(thread_id)
@@ -2283,14 +2535,30 @@ class AutonomousController:
             telemetry=outcome.token_telemetry,
             max_effort_supported=self._max_effort_supported(task.role),
         )
+        blocker_reported = str(outcome.result.get("result_type") or "") == "BLOCKED"
+        blocker_repair_attempted = job_id in self._blocker_repair_jobs
+        blocker_verified = bool(
+            blocker_repair_attempted
+            and blocker_reported
+            and str(outcome.result.get("status") or "").strip().upper() == "BLOCKED"
+            and len(str(outcome.result.get("main_finding") or "").strip()) >= 16
+            and len(
+                str(outcome.result.get("next_suggested_question") or "").strip()
+            ) >= 8
+        )
         directive = self.research_turn_policy.decide(
             result=outcome.result,
+            role=task.role,
             turn_index=turn_index,
             candidate_accepted=candidate_accepted,
             canonical_progress=canonical_progress,
             health_signal=health,
             budget_stop_reason=outcome.continuation_budget_stop_reason,
+            blocker_repair_attempted=blocker_repair_attempted,
+            blocker_verified=blocker_verified,
         )
+        if blocker_reported and directive.continue_same_thread:
+            self._blocker_repair_jobs.add(job_id)
         self.store.append("RESEARCH_TURN_COMPLETED", {
             "job_id": job_id,
             "task_id": task.task_id,
@@ -2303,6 +2571,12 @@ class AutonomousController:
             "role_reported_status": outcome.result.get("status"),
             "candidate_accepted": candidate_accepted,
             "canonical_progress": canonical_progress,
+            "blocker_reported": blocker_reported,
+            "blocker_repair_attempted": blocker_repair_attempted,
+            "blocker_controller_verified": blocker_verified,
+            "blocker_verification_scope": (
+                "execution scheduling only; no mathematical or trust effect"
+            ),
             "reasoning_health": health.to_dict(),
             "controller_directive": (
                 "CONTINUE" if directive.continue_same_thread else "STOP"
@@ -2357,9 +2631,16 @@ class AutonomousController:
         last_retry_sequence_by_task: dict[str, int] = {}
         last_retained_sequence_by_task: dict[str, int] = {}
         retained_audit_fingerprints: set[str] = set()
+        checkpointed_continuations: dict[str, ResearchTask] = {}
         for event in records:
             payload = event.get("payload") or {}
             task_id = str(payload.get("task_id") or "")
+            if event["kind"] == "RESEARCH_CONTINUATION_CHECKPOINTED":
+                raw_task = payload.get("continuation_task")
+                if not isinstance(raw_task, dict):
+                    raise ValueError("continuation checkpoint event has no task packet")
+                continuation = ResearchTask.from_dict(raw_task)
+                checkpointed_continuations[continuation.task_id] = continuation
             if event["kind"] == "AUDIT_RETAINED_AFTER_ERROR":
                 fingerprint = str(payload.get("candidate_fingerprint") or "")
                 if fingerprint:
@@ -2692,6 +2973,12 @@ class AutonomousController:
         for task_id, task in accepted.items():
             if task_id not in completed_tasks and task_id not in started_task_ids and task_id not in pending_ids:
                 self.pending_research.append(task)
+        for task_id, task in checkpointed_continuations.items():
+            if task_id in started_task_ids or task_id in pending_ids:
+                continue
+            self.deferred_research_continuations.append(task)
+            self.seen_task_fingerprints.add(task.fingerprint)
+            self.task_fingerprints_by_id[task.task_id] = task.fingerprint
         mechanical_requested: dict[tuple[str, str], dict[str, Any]] = {}
         mechanical_terminal = {
             (
@@ -3346,6 +3633,30 @@ class AutonomousController:
 
         imported_research = 0
         pending_ids = {item.task_id for item in self.pending_research}
+        imported_continuation_ids: set[str] = set()
+        continuation_ids_raw = snapshot.get("deferred_research_continuation_ids") or []
+        if (
+            not isinstance(continuation_ids_raw, list)
+            or not all(isinstance(item, str) and item for item in continuation_ids_raw)
+            or len(continuation_ids_raw) != len(set(continuation_ids_raw))
+        ):
+            raise ValueError("previous epoch continuation id index is invalid")
+        continuation_ids = set(continuation_ids_raw)
+        continuation_index_raw = snapshot.get("research_continuation_checkpoints") or []
+        if not isinstance(continuation_index_raw, list):
+            raise ValueError("previous epoch continuation checkpoint index is invalid")
+        continuation_index: dict[str, dict[str, str]] = {}
+        for item in continuation_index_raw:
+            if not isinstance(item, dict) or set(item) != {"task_id", "uri", "sha256"}:
+                raise ValueError("previous epoch continuation checkpoint index is invalid")
+            task_id = str(item["task_id"])
+            if not task_id or task_id in continuation_index:
+                raise ValueError("previous epoch continuation checkpoint index is invalid")
+            continuation_index[task_id] = {
+                "uri": str(item["uri"]), "sha256": str(item["sha256"]),
+            }
+        if set(continuation_index) != continuation_ids:
+            raise ValueError("previous epoch continuation indexes disagree")
         for raw in snapshot.get("pending_research") or []:
             if not isinstance(raw, dict):
                 raise ValueError("previous epoch pending research task is invalid")
@@ -3357,16 +3668,70 @@ class AutonomousController:
                     f"{_sanitize_live_text(exc)}"
                 ) from exc
             if task.task_id in pending_ids:
+                if task.task_id in continuation_ids:
+                    raise ValueError(
+                        "previous epoch continuation task id collides with pending work"
+                    )
                 continue
+            checkpoint_uri: str | None = None
+            checkpoint: dict[str, Any] | None = None
+            if task.task_id in continuation_ids:
+                checkpoint_entry = continuation_index[task.task_id]
+                checkpoint_uri, checkpoint = self._validate_research_continuation_checkpoint(
+                    task,
+                    source_epoch_id=self.previous_epoch_id,
+                    expected_uri=checkpoint_entry["uri"],
+                    expected_sha256=checkpoint_entry["sha256"],
+                )
+                self.satisfied_route_conditions.add(
+                    f"next_epoch:{self.previous_epoch_id}"
+                )
+                imported_continuation_ids.add(task.task_id)
             validation_error = self._validate_director_task(task)
             if validation_error:
                 raise ValueError(
                     "previous epoch pending research task is invalid: "
                     f"{task.task_id}: {validation_error}"
                 )
+            if checkpoint_uri is not None and checkpoint is not None:
+                self.route_ledger.append(
+                    route_id=task.route_family,
+                    representation_id=task.representation_id,
+                    method_tags=[task.role, "controller-continuation"],
+                    status="ACTIVE",
+                    failure_class=None,
+                    retry_condition=None,
+                    evidence_refs=[checkpoint_uri],
+                    source=f"epoch:{self.previous_epoch_id}",
+                )
+                self.store.append("RESEARCH_CONTINUATION_IMPORTED", {
+                    "source_epoch_id": self.previous_epoch_id,
+                    "source_job_id": checkpoint["source_job_id"],
+                    "source_task_id": checkpoint["source_task_id"],
+                    "task_id": task.task_id,
+                    "claim_id": task.target_claim,
+                    "checkpoint_uri": checkpoint_uri,
+                    "action": "admit as fresh-epoch work; prior output remains noncanonical",
+                })
             self.pending_research.append(task)
             pending_ids.add(task.task_id)
+            self.seen_task_fingerprints.add(task.fingerprint)
+            self.task_fingerprints_by_id[task.task_id] = task.fingerprint
+            self.store.append("TASK_ACCEPTED", {
+                "task_id": task.task_id,
+                "fingerprint": task.fingerprint,
+                "representation_id": task.representation_id,
+                "task": task.to_dict(),
+                "source": f"epoch://{self.previous_epoch_id}/state/compact_snapshot.json",
+            })
             imported_research += 1
+
+        missing_continuations = continuation_ids - imported_continuation_ids
+        if missing_continuations:
+            raise ValueError(
+                "previous epoch continuation index refers to missing tasks: "
+                f"{sorted(missing_continuations)}"
+            )
 
         imported_candidates = 0
         for raw in snapshot.get("candidate_audit_frontier") or []:
@@ -3815,18 +4180,7 @@ class AutonomousController:
                 )
                 self._persist_mechanical_terminal(state, response)
             self.pending_mechanical.clear()
-            for job_id, active in list(self.active.items()):
-                cancel_ok = await self._cancel_backend_job(
-                    job_id, stopped_reason, fatal_on_failure=False,
-                )
-                if not active.future.done():
-                    active.future.cancel()
-                self._record_job_cancelled(
-                    job_id, active, stopped_reason,
-                    remote_cancel_succeeded=cancel_ok,
-                )
-                self.governor.release(job_id)
-            self.active.clear()
+            await self._cancel_active_jobs_before_backend_close(stopped_reason)
             try:
                 await self.backend.close()
             except Exception as exc:
@@ -3896,9 +4250,40 @@ class AutonomousController:
             for fingerprint, state in sorted(self.audit_gate.states.items())
             if not state.terminal
         ]
-        snapshot["pending_research"] = [
-            task.to_dict() for task in self.pending_research
+        pending_for_next_epoch = [
+            *self.pending_research, *self.deferred_research_continuations,
         ]
+        pending_task_ids = [task.task_id for task in pending_for_next_epoch]
+        if len(pending_task_ids) != len(set(pending_task_ids)):
+            raise ValueError("next-epoch research frontier contains duplicate task ids")
+        snapshot["pending_research"] = [
+            task.to_dict() for task in pending_for_next_epoch
+        ]
+        snapshot["deferred_research_continuation_ids"] = [
+            task.task_id for task in self.deferred_research_continuations
+        ]
+        continuation_checkpoints: list[dict[str, str]] = []
+        checkpoint_prefix = (
+            f"epoch://{self.epoch_id}/state/research_checkpoints/"
+        )
+        for task in self.deferred_research_continuations:
+            references = [
+                item for item in task.required_files
+                if item.startswith(checkpoint_prefix)
+            ]
+            if len(references) != 1:
+                raise ValueError(
+                    "deferred continuation must reference exactly one current-epoch "
+                    "checkpoint"
+                )
+            checkpoint_uri = references[0]
+            checkpoint_path = self.artifact_store.resolve_uri(checkpoint_uri)
+            continuation_checkpoints.append({
+                "task_id": task.task_id,
+                "uri": checkpoint_uri,
+                "sha256": file_digest(checkpoint_path),
+            })
+        snapshot["research_continuation_checkpoints"] = continuation_checkpoints
         snapshot["pending_audits"] = [
             task.to_dict() for task in self.pending_audits
         ]
@@ -5812,7 +6197,8 @@ class AutonomousController:
                     str(active.task.metadata.get("audit_lease_id") or ""),
                 )
             else:
-                self._accept_research_result(outcome, active.task)
+                self._accept_research_result(outcome, active.task, record)
+            self._blocker_repair_jobs.discard(job_id)
 
     async def _collect_terminal_envelopes_before_shutdown(self) -> None:
         """Persist futures that won the race with controller shutdown.
@@ -5848,6 +6234,16 @@ class AutonomousController:
         """Apply a v2 plan while rebasing every action against current state."""
         incremental = self._director_incremental
         self._director_incremental = False
+        if (
+            not outcome.succeeded
+            and outcome.failure_kind == "provider_quota_exhausted"
+        ):
+            self._pause_for_provider_quota(outcome)
+            self.store.append("DIRECTOR_REQUEUED_AFTER_PROVIDER_QUOTA", {
+                "job_id": outcome.job_id,
+                "action": "request a fresh Director after provider reset",
+            })
+            return
         if not outcome.succeeded:
             failure_kind = outcome.failure_kind or "director_failure"
             self.store.append("DIRECTOR_REJECTED", self._failure_payload(outcome))
@@ -6151,6 +6547,28 @@ class AutonomousController:
         assigned_artifact_hashes: dict[str, str] | None = None,
         audit_lease_id: str = "",
     ) -> None:
+        if (
+            not outcome.succeeded
+            and outcome.failure_kind == "provider_quota_exhausted"
+        ):
+            if audit_lease_id:
+                try:
+                    lease = self.audit_leases.by_id(audit_lease_id)
+                    if lease.status == AuditLeaseStatus.ACTIVE:
+                        self.audit_leases.retry_wait(audit_lease_id)
+                except ValueError as lease_error:
+                    self.store.append("AUDIT_LEASE_ERROR", {
+                        "lease_id": audit_lease_id,
+                        "error": _sanitize_live_text(lease_error),
+                    })
+            self._pause_for_provider_quota(outcome)
+            self.store.append("AUDIT_REQUEUED_AFTER_PROVIDER_QUOTA", {
+                "job_id": outcome.job_id,
+                "candidate_fingerprint": assigned_fingerprint,
+                "audit_lease_id": audit_lease_id,
+                "action": "retain the nonterminal candidate for fresh-epoch audit",
+            })
+            return
         fingerprint = (
             outcome.result.get("candidate_fingerprint") if outcome.succeeded else None
         ) or assigned_fingerprint
@@ -6528,9 +6946,211 @@ class AutonomousController:
                 )
                 self.store.append("DEPENDENCY_PRUNED", {"job_id": job_id, "task_id": active.task.task_id, "failed_dependencies": reasons})
 
-    def _accept_research_result(self, outcome: JobOutcome, task: ResearchTask) -> None:
+    def _research_checkpoint_artifacts(
+        self, job_record: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        artifact_refs: dict[str, str] = {}
+        for raw, expected in dict(
+            (job_record or {}).get("artifact_hashes") or {}
+        ).items():
+            path = Path(str(raw)).resolve()
+            if not path.is_relative_to(self.run_dir.resolve()) or not path.is_file():
+                raise ValueError("continuation artifact is unavailable outside the epoch")
+            observed = file_digest(path)
+            if observed != str(expected):
+                raise ValueError("continuation artifact changed before checkpoint")
+            relative = path.relative_to(self.run_dir.resolve()).as_posix()
+            artifact_refs[f"epoch://{self.epoch_id}/{relative}"] = observed
+        return artifact_refs
+
+    def _checkpoint_research_continuation(
+        self,
+        outcome: JobOutcome,
+        task: ResearchTask,
+        job_record: dict[str, Any] | None,
+    ) -> ResearchTask:
+        turn_count = len(outcome.turn_history)
+        checkpoint_id = stable_hash({
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "source_job_id": outcome.job_id,
+            "source_task_fingerprint": task.fingerprint,
+            "turn_count": turn_count,
+        })[:24]
+        continuation_task_id = f"continuation-{checkpoint_id}"
+        relative = (
+            Path("state") / "research_checkpoints" / f"{checkpoint_id}.json"
+        )
+        checkpoint_path = self.run_dir / relative
+        checkpoint_uri = f"epoch://{self.epoch_id}/{relative.as_posix()}"
+        artifact_refs = self._research_checkpoint_artifacts(job_record)
+        continuation_raw = task.to_dict()
+        continuation_raw.update({
+            "task_id": continuation_task_id,
+            "why_now": (
+                "Controller continuation after the prior same-thread turn bound; read "
+                f"the noncanonical checkpoint {checkpoint_uri} before continuing the "
+                "same exact objective and next open obligation."
+            ),
+            "required_files": list(dict.fromkeys([
+                *task.required_files,
+                checkpoint_uri,
+                *artifact_refs,
+            ])),
+        })
+        continuation = ResearchTask.from_dict(continuation_raw)
+        proof_frontier = (
+            self.graph.proof_frontier(task.target_claim)
+            if task.target_claim in self.graph.claims else None
+        )
+        checkpoint = {
+            "schema_version": 1,
+            "authority": "derived_noncanonical",
+            "trust_effect": "none",
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "source_job_id": outcome.job_id,
+            "source_task_id": task.task_id,
+            "source_task_fingerprint": task.fingerprint,
+            "continuation_task_id": continuation.task_id,
+            "continuation_task_fingerprint": continuation.fingerprint,
+            "continuation_task_sha256": stable_hash(continuation.to_dict()),
+            "claim_id": task.target_claim,
+            "role": task.role,
+            "route_family": task.route_family,
+            "turn_count": turn_count,
+            "logical_stop_reason": outcome.logical_stop_reason,
+            "proof_frontier": proof_frontier,
+            "current_obligation": (
+                proof_frontier.get("next_obligation_id")
+                if proof_frontier is not None else None
+            ),
+            "completed_evidence": {
+                "candidate_accepted": bool(outcome.candidate_accepted),
+                "canonical_progress": bool(outcome.canonical_progress),
+                "artifact_hashes": artifact_refs,
+            },
+            "next_obligation": str(
+                outcome.result.get("next_suggested_question") or ""
+            ).strip() or (
+                proof_frontier.get("next_obligation_id")
+                if proof_frontier is not None else None
+            ),
+            "last_result": outcome.result,
+            "turn_history": outcome.turn_history,
+            "artifact_hashes": artifact_refs,
+            "retry_condition": f"next_epoch:{self.epoch_id}",
+            "created_at": utc_now(),
+            "boundary": (
+                "Prior model output and artifacts are research evidence only; this "
+                "checkpoint cannot change mathematical, trust, or evidence status."
+            ),
+        }
+        atomic_write_json(checkpoint_path, checkpoint)
+        self.deferred_research_continuations.append(continuation)
+        self.seen_task_fingerprints.add(continuation.fingerprint)
+        self.task_fingerprints_by_id[
+            continuation.task_id
+        ] = continuation.fingerprint
+        self.route_ledger.append(
+            route_id=task.route_family,
+            representation_id=task.representation_id,
+            method_tags=[task.role, "controller-continuation"],
+            status="PAUSED",
+            failure_class=None,
+            retry_condition=f"next_epoch:{self.epoch_id}",
+            evidence_refs=[checkpoint_uri, *artifact_refs],
+            source=f"job:{outcome.job_id}",
+        )
+        self.store.append("RESEARCH_CONTINUATION_CHECKPOINTED", {
+            "job_id": outcome.job_id,
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "turn_count": turn_count,
+            "checkpoint_uri": checkpoint_uri,
+            "checkpoint_sha256": file_digest(checkpoint_path),
+            "continuation_task": continuation.to_dict(),
+            "retry_condition": f"next_epoch:{self.epoch_id}",
+            "action": "defer to the next epoch without claiming progress or failure",
+        })
+        self._record_recent_change({
+            "kind": "RESEARCH_CONTINUATION_CHECKPOINTED",
+            "task_id": task.task_id,
+            "continuation_task_id": continuation.task_id,
+            "claim_id": task.target_claim,
+            "turn_count": turn_count,
+            "checkpoint_uri": checkpoint_uri,
+        })
+        return continuation
+
+    def _validate_research_continuation_checkpoint(
+        self,
+        task: ResearchTask,
+        *,
+        source_epoch_id: str,
+        expected_uri: str,
+        expected_sha256: str,
+    ) -> tuple[str, dict[str, Any]]:
+        prefix = f"epoch://{source_epoch_id}/state/research_checkpoints/"
+        references = [item for item in task.required_files if item.startswith(prefix)]
+        if len(references) != 1:
+            raise ValueError(
+                "continuation task must reference exactly one source-epoch checkpoint"
+            )
+        checkpoint_uri = references[0]
+        if checkpoint_uri != expected_uri:
+            raise ValueError("continuation checkpoint URI does not match snapshot index")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValueError("continuation checkpoint digest index is invalid")
+        checkpoint_path = self.artifact_store.resolve_uri(checkpoint_uri)
+        if file_digest(checkpoint_path) != expected_sha256:
+            raise ValueError("continuation checkpoint digest changed")
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        expected = {
+            "schema_version": 1,
+            "authority": "derived_noncanonical",
+            "trust_effect": "none",
+            "campaign_id": self.campaign_id,
+            "epoch_id": source_epoch_id,
+            "continuation_task_id": task.task_id,
+            "continuation_task_fingerprint": task.fingerprint,
+            "continuation_task_sha256": stable_hash(task.to_dict()),
+            "claim_id": task.target_claim,
+            "role": task.role,
+            "route_family": task.route_family,
+            "retry_condition": f"next_epoch:{source_epoch_id}",
+        }
+        for key, value in expected.items():
+            if checkpoint.get(key) != value:
+                raise ValueError(f"continuation checkpoint {key} does not match task")
+        artifact_hashes = checkpoint.get("artifact_hashes") or {}
+        if not isinstance(artifact_hashes, dict):
+            raise ValueError("continuation checkpoint artifact hashes are invalid")
+        for uri, expected_hash in artifact_hashes.items():
+            if (
+                not str(uri).startswith(f"epoch://{source_epoch_id}/")
+                or str(uri) not in task.required_files
+                or not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash))
+            ):
+                raise ValueError("continuation checkpoint artifact binding is invalid")
+            artifact = self.artifact_store.resolve_uri(str(uri))
+            if file_digest(artifact) != str(expected_hash):
+                raise ValueError("continuation checkpoint artifact digest changed")
+        return checkpoint_uri, checkpoint
+
+    def _accept_research_result(
+        self,
+        outcome: JobOutcome,
+        task: ResearchTask,
+        job_record: dict[str, Any] | None = None,
+    ) -> None:
         if not outcome.succeeded:
             failure_kind = outcome.failure_kind or "research_failure"
+            if failure_kind == "provider_quota_exhausted":
+                self._pause_for_provider_quota(
+                    outcome, task=task, checkpoint_job_record=job_record,
+                )
+                return
             retry = self._retry_count(
                 self.retry_counts, task.task_id, failure_kind,
             )
@@ -6586,6 +7206,46 @@ class AutonomousController:
             return
         result_type = str(outcome.result.get("result_type", "NO_PROGRESS"))
         meaningful = bool(outcome.canonical_progress or outcome.candidate_accepted)
+        if (
+            not meaningful
+            and outcome.logical_stop_reason in CONTINUATION_CHECKPOINT_REASONS
+        ):
+            self._checkpoint_research_continuation(outcome, task, job_record)
+            self._replan_after_wave = True
+            return
+        if (
+            not meaningful
+            and outcome.logical_stop_reason == "controller-verified execution blocker"
+        ):
+            self.route_ledger.append(
+                route_id=task.route_family,
+                representation_id=task.representation_id,
+                method_tags=[task.role, "controller-verified-blocker"],
+                status="PAUSED",
+                failure_class=None,
+                retry_condition=f"new_evidence:{task.target_claim}",
+                evidence_refs=list(outcome.artifact_paths),
+                source=f"job:{outcome.job_id}",
+            )
+            self.store.append("RESEARCH_TASK_BLOCKED", {
+                "job_id": outcome.job_id,
+                "task_id": task.task_id,
+                "claim_id": task.target_claim,
+                "role": task.role,
+                "blocker": _bounded_value(outcome.result.get("main_finding")),
+                "next_obligation": _bounded_value(
+                    outcome.result.get("next_suggested_question")
+                ),
+                "mathematical_failure": False,
+                "stagnation_effect": "none",
+                "retry_condition": f"new_evidence:{task.target_claim}",
+            })
+            self._request_director(
+                "controller-verified execution blocker requires a different route",
+                meaningful_change=False,
+            )
+            self._replan_after_wave = True
+            return
         self.route_ledger.append(
             route_id=task.route_family,
             representation_id=task.representation_id,

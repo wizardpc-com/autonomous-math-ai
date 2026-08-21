@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_SCHEMA_VERSION = 9
+CONFIG_SCHEMA_VERSION = 10
 PROFILE_SCHEMA_VERSION = 1
 BUILTIN_PROFILE_NAME = "codex-app-server-default"
 DEFAULT_GLOBAL_TOKENS = 500_000_000
@@ -17,6 +17,9 @@ def _usage_mapping(*, camel: bool) -> dict[str, list[str]]:
     names = {
         "input_tokens": "inputTokens" if camel else "input_tokens",
         "cached_input_tokens": "cachedInputTokens" if camel else "cached_input_tokens",
+        "uncached_input_tokens": (
+            "uncachedInputTokens" if camel else "uncached_input_tokens"
+        ),
         "cache_write_input_tokens": (
             "cacheWriteInputTokens" if camel else "cache_write_input_tokens"
         ),
@@ -76,6 +79,11 @@ def _provider_defaults() -> dict[str, Any]:
                     "cached_input_tokens": [
                         "input_tokens_details.cached_tokens",
                         "prompt_tokens_details.cached_tokens",
+                    ],
+                    "uncached_input_tokens": [
+                        "uncached_input_tokens",
+                        "input_tokens_details.uncached_tokens",
+                        "prompt_tokens_details.uncached_tokens",
                     ],
                     "cache_write_input_tokens": [],
                     "output_tokens": ["output_tokens", "completion_tokens"],
@@ -175,7 +183,11 @@ def builtin_profile(project_id: str, final_claim_id: str) -> dict[str, Any]:
             "model_protocol_max_retries": 1,
             "director_max_retries": 1,
             "director_debounce_seconds": 2.0,
-            "research_max_turns": 4,
+            "research_max_turns": {
+                "prover": 12,
+                "falsifier": 12,
+                "explorer": 12,
+            },
             "reasoning_health_short_tokens": 600,
             "reasoning_health_repeated_token_tolerance": 2,
             "reasoning_health_retry_limit": 2,
@@ -311,6 +323,15 @@ def _augment_role_routes(config: dict[str, Any]) -> None:
         str(config.get("project", {}).get("final_conjecture_claim_id") or "C_ROOT"),
     )
     config.setdefault("providers", deepcopy(defaults["providers"]))
+    for provider in config.get("providers", {}).values():
+        if not isinstance(provider, dict):
+            continue
+        capabilities = provider.get("capabilities")
+        if not isinstance(capabilities, dict):
+            continue
+        usage_mapping = capabilities.get("usage_mapping")
+        if isinstance(usage_mapping, dict):
+            usage_mapping.setdefault("uncached_input_tokens", [])
     engine = config.setdefault("engine", {})
     for key in (
         "research_max_turns",
@@ -319,6 +340,17 @@ def _augment_role_routes(config: dict[str, Any]) -> None:
         "reasoning_health_retry_limit",
     ):
         engine.setdefault(key, defaults["engine"][key])
+    turns = engine.get("research_max_turns")
+    if isinstance(turns, int) and not isinstance(turns, bool):
+        engine["research_max_turns"] = {
+            role: max(2, int(turns))
+            for role in ("prover", "falsifier", "explorer")
+        }
+    elif isinstance(turns, dict):
+        engine["research_max_turns"] = {
+            role: int(turns.get(role, defaults["engine"]["research_max_turns"][role]))
+            for role in ("prover", "falsifier", "explorer")
+        }
     for role, route in list(config.get("models", {}).items()):
         base = deepcopy(defaults["models"].get(role) or defaults["models"]["explorer"])
         if isinstance(route, dict):
@@ -363,13 +395,18 @@ def migrate_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         migrations.append("7->8")
         version = 8
     if version == 8:
-        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        value["schema_version"] = 9
         value["campaign"] = {
             "hours": 12.0,
             "epoch_hours": 2.0,
         }
         _augment_role_routes(value)
         migrations.append("8->9")
+        version = 9
+    if version == 9:
+        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        _augment_role_routes(value)
+        migrations.append("9->10")
         return value, migrations
     if version == CONFIG_SCHEMA_VERSION:
         _augment_role_routes(value)

@@ -1696,6 +1696,12 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             'python "helpers/emit_event.py" '
             '--project "neutral-project" --file candidate_event.json',
             'python "runtime/runs/r/jobs/j/delegate_mechanical_task.py" task_packet.json',
+            'powershell.exe -Command \'Get-Process python,codex '
+            '-ErrorAction SilentlyContinue | Format-Table -AutoSize\'',
+            'powershell.exe -Command \'Get-Process | Where-Object { '
+            '$_.ProcessName -match "python|codex" }\'',
+            'rg -n "codex|spawn_agent|create_thread" src tests',
+            'Get-ChildItem mechanical_broker; Get-Process codex',
         ):
             allowed = AutonomousController(
                 self.config,
@@ -1738,6 +1744,33 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             },
         })
         self.assertTrue(bypass._internal_failure)
+
+        for forbidden_command in (
+            'powershell.exe -Command \'codex exec --model anything -\'',
+            'powershell.exe -Command \'Get-Date; & "C:\\\\tools\\\\codex.exe" exec\'',
+            'cmd.exe /d /c "codex exec --model anything -"',
+            "bash -lc 'codex exec --model anything -'",
+            'Start-Process -FilePath codex -ArgumentList "exec"',
+            'python -m codex exec --model anything -',
+        ):
+            rejected = AutonomousController(
+                self.config,
+                backend=MockCodexBackend(),
+                mock=True,
+                mechanical_runner=SequenceMechanicalRunner([]),
+            )
+            await rejected._trace_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-rejected",
+                    "turnId": "turn-rejected",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": forbidden_command,
+                    },
+                },
+            })
+            self.assertTrue(rejected._internal_failure, forbidden_command)
 
     async def test_broker_client_tamper_fails_closed_before_request_acceptance(self) -> None:
         controller = AutonomousController(
@@ -1902,7 +1935,9 @@ class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
         bad.write_text(json.dumps(raw), encoding="utf-8")
         migrated = load_config(self.project, bad)
         self.assertIsNone(migrated.max_mechanical_subworkers)
-        self.assertEqual(migrated.migrations_applied, ("7->8", "8->9"))
+        self.assertEqual(
+            migrated.migrations_applied, ("7->8", "8->9", "9->10"),
+        )
 
     def test_subprocess_runner_executes_run_local_pinned_sources(self) -> None:
         manifest_path = self.project / "autonomous/runs/pin-test/policy/MANIFEST.json"

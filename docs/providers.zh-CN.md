@@ -9,7 +9,8 @@ preflight、错误分类、token/cost telemetry 规范化、retry、canonical ga
 provider 返回值从不自动成为证明。
 
 capability 必须声明 structured-output 模式、reasoning 参数和支持的 effort、显式 effort
-mapping、安全 service tiers、token 字段路径、可选 cost 路径及机械 one-shot 能力。不
+mapping、安全 service tiers、总/cached/uncached/cache-write input、output、reasoning
+output token 字段路径、可选 cost 路径及机械 one-shot 能力。不
 支持的 effort 默认预检失败；只有 route 选择 `map` 且 capability 给出精确映射时才允许，
 禁止静默降级。没有原生 Structured Outputs 的 provider 必须显式使用 `json_text`，本地
 schema gate 仍然执行。
@@ -17,6 +18,10 @@ schema gate 仍然执行。
 凭据只能写 `{kind, reference}`；kind 为 `environment`、`system_credential`、
 `provider_profile` 或 `none`。环境变量方式只保存 `OPENAI_API_KEY` 这样的变量名。
 validate/explain 不读取变量值，真实 adapter 发请求时才解析引用。
+
+adapter 必须把 provider quota 耗尽与普通 rate limit 分开。usage-limit/quota-exhausted 在
+当前 epoch 内不重试；controller 保存 provider 给出的 reset 时间，暂停 campaign，并保留
+任务 frontier。该状态不构成数学失败或 stagnation。
 
 第三方包可在 Python entry-point group `autonomous_math_research.providers` 注册 factory；
 未安装但被角色引用的 adapter 会在零模型配置预检中失败。内置机械 runner 对应

@@ -119,6 +119,7 @@ class TokenGovernor:
         self.total.total_tokens += delta
         self.total.input_tokens += max(0, usage.input_tokens - int(self.by_job.get(job_id, {}).get("input_tokens", 0)))
         self.total.cached_input_tokens += max(0, usage.cached_input_tokens - int(self.by_job.get(job_id, {}).get("cached_input_tokens", 0)))
+        self.total.uncached_input_tokens += max(0, usage.uncached_input_tokens - int(self.by_job.get(job_id, {}).get("uncached_input_tokens", 0)))
         self.total.cache_write_input_tokens += max(0, usage.cache_write_input_tokens - int(self.by_job.get(job_id, {}).get("cache_write_input_tokens", 0)))
         self.total.output_tokens += max(0, usage.output_tokens - int(self.by_job.get(job_id, {}).get("output_tokens", 0)))
         self.total.reasoning_output_tokens += max(0, usage.reasoning_output_tokens - int(self.by_job.get(job_id, {}).get("reasoning_output_tokens", 0)))

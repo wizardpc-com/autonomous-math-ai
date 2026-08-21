@@ -21,7 +21,8 @@ MECHANICAL_TERMINAL_KINDS = {
 }
 MECHANICAL_EVENT_PREFIX = "MECHANICAL_SUBTASK_"
 TOKEN_KEYS = (
-    "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "input_tokens", "cached_input_tokens", "uncached_input_tokens",
+    "cache_write_input_tokens",
     "output_tokens", "reasoning_output_tokens", "total_tokens",
 )
 SENSITIVE_FILE_NAMES = {
@@ -60,7 +61,13 @@ def _safe_int(value: Any) -> int:
 
 def _token_usage(value: Any) -> dict[str, int]:
     raw = value if isinstance(value, dict) else {}
-    return {key: _safe_int(raw.get(key)) for key in TOKEN_KEYS}
+    normalized = {key: _safe_int(raw.get(key)) for key in TOKEN_KEYS}
+    if not normalized["uncached_input_tokens"]:
+        normalized["uncached_input_tokens"] = max(
+            0,
+            normalized["input_tokens"] - normalized["cached_input_tokens"],
+        )
+    return normalized
 
 
 def _portable_path(path: Path, project_root: Path) -> str:

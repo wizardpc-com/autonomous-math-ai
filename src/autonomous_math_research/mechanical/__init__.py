@@ -416,6 +416,7 @@ def _merge_usage(target: TokenUsage, raw: Any) -> bool:
     aliases = {
         "input_tokens": ("input_tokens", "inputTokens"),
         "cached_input_tokens": ("cached_input_tokens", "cachedInputTokens"),
+        "uncached_input_tokens": ("uncached_input_tokens", "uncachedInputTokens"),
         "cache_write_input_tokens": ("cache_write_input_tokens", "cacheWriteInputTokens"),
         "output_tokens": ("output_tokens", "outputTokens"),
         "reasoning_output_tokens": ("reasoning_output_tokens", "reasoningOutputTokens"),
@@ -459,6 +460,12 @@ def _runner_usage(metadata: dict[str, Any]) -> tuple[TokenUsage, str]:
         if "worker_usage" in metadata:
             observed += int(_merge_usage(usage, metadata.get("worker_usage")))
             unknown += int(metadata.get("worker_usage") is None)
+    if usage.uncached_input_tokens == 0 and (
+        usage.input_tokens or usage.cached_input_tokens
+    ):
+        usage.uncached_input_tokens = max(
+            0, usage.input_tokens - usage.cached_input_tokens,
+        )
     if observed and unknown:
         return usage, "partial"
     if observed:

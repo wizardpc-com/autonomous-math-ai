@@ -18,7 +18,8 @@ Each provider declares:
 - native JSON Schema, JSON-text, or no structured-output capability;
 - canonical reasoning efforts plus an explicit provider-specific mapping;
 - safe service tiers and the provider parameter path;
-- token field paths and optional cost path;
+- total/cached/uncached/cache-write input, output, and reasoning-output token
+  field paths plus an optional cost path;
 - whether a controller-managed mechanical one-shot runner is supported.
 
 Unsupported effort fails preflight unless the route says
@@ -31,6 +32,11 @@ Credentials contain only `{kind, reference}`. Kinds are `environment`,
 only a variable name such as `OPENAI_API_KEY`; validation never resolves or
 prints it. Actual resolution happens only when a selected real adapter starts a
 request.
+
+Adapters normalize provider quota terminals separately from ordinary rate
+limits. A usage-limit/quota-exhausted response is non-retryable within the
+current epoch, preserves any provider reset timestamp, pauses the campaign, and
+retains pending work. It never becomes mathematical failure or stagnation.
 
 ## OpenAI-compatible routes
 

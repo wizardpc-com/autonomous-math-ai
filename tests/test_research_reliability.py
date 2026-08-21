@@ -10,10 +10,12 @@ from uuid import uuid4
 from autonomous_math_research.app_server import (
     AppServerClient, AppServerRequestError, TurnOwnershipRegistry,
 )
-from autonomous_math_research.backend import AppServerBackend, TurnDirective
+from autonomous_math_research.backend import (
+    AppServerBackend, TurnDirective, _classify_failure,
+)
 from autonomous_math_research.claim_graph import ClaimGraph
 from autonomous_math_research.config import load_config
-from autonomous_math_research.controller import AutonomousController
+from autonomous_math_research.controller import ActiveJob, AutonomousController
 from autonomous_math_research.backend import MockCodexBackend
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.models import (
@@ -227,6 +229,56 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.turn_calls), 2)
         self.assertEqual({call["thread_id"] for call in client.turn_calls}, {"thread-proof"})
         self.assertEqual([item["turn_index"] for item in outcome.turn_history], [1, 2])
+        self.assertEqual(
+            set(outcome.turn_history[-1]["token_usage"]),
+            set(TokenUsage().to_dict()),
+        )
+
+    async def test_controller_repairs_first_blocker_before_scheduling_terminal(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="blocker-repair", campaign_id="blocker-repair",
+        )
+        controller._pin_run_inputs(0.01, True)
+        task = research_task()
+        canonical_before = controller._canonical_progress_marker(task.target_claim)
+
+        first = JobOutcome(
+            job_id="job-blocker", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed",
+            result=worker_result("BLOCKED", status="BLOCKED"),
+            thread_id="thread-blocker", turn_id="turn-1",
+        )
+        first_directive = await controller._control_research_turn(
+            job_id=first.job_id, task=task, canonical_before=canonical_before,
+            outcome=first, turn_index=1,
+        )
+        self.assertTrue(first_directive.continue_same_thread)
+
+        second = JobOutcome(
+            job_id="job-blocker", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed",
+            result=worker_result("BLOCKED", status="BLOCKED"),
+            thread_id="thread-blocker", turn_id="turn-2",
+        )
+        second_directive = await controller._control_research_turn(
+            job_id=second.job_id, task=task, canonical_before=canonical_before,
+            outcome=second, turn_index=2,
+        )
+        self.assertFalse(second_directive.continue_same_thread)
+        self.assertEqual(
+            second_directive.reason, "controller-verified execution blocker",
+        )
+        turn_events = [
+            item["payload"] for item in controller.store.replay()
+            if item["kind"] == "RESEARCH_TURN_COMPLETED"
+        ]
+        self.assertFalse(turn_events[0]["blocker_controller_verified"])
+        self.assertTrue(turn_events[1]["blocker_controller_verified"])
+        self.assertEqual(
+            turn_events[1]["blocker_verification_scope"],
+            "execution scheduling only; no mathematical or trust effect",
+        )
 
     async def test_health_escalation_changes_only_the_next_owned_turn(self) -> None:
         client = SequenceAppServerClient([
@@ -303,6 +355,52 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(client.turn_calls), 1)
         self.assertEqual(outcome.logical_stop_reason, "controller token budget reached")
+
+    async def test_shutdown_reaps_cancelled_job_before_backend_close(self) -> None:
+        order: list[str] = []
+
+        class ShutdownOrderBackend(MockCodexBackend):
+            async def cancel(self, job_id: str) -> bool:
+                order.append(f"remote-cancel:{job_id}")
+                return True
+
+            async def close(self) -> None:
+                order.append("backend-close")
+
+        backend = ShutdownOrderBackend()
+        controller = AutonomousController(
+            load_config(self.project), backend=backend, mock=True,
+            run_id="shutdown-order", campaign_id="shutdown-order",
+        )
+        never = asyncio.Event()
+
+        async def running_job() -> JobOutcome:
+            try:
+                await never.wait()
+            finally:
+                await asyncio.sleep(0)
+                order.append("job-cleaned")
+
+        future = asyncio.create_task(running_job())
+        await asyncio.sleep(0)
+        controller.active["job-1"] = ActiveJob(
+            logical_job_id="job-1",
+            task=research_task(),
+            future=future,
+            started_monotonic=0.0,
+            timeout=60.0,
+            kind="research",
+        )
+
+        await controller._cancel_active_jobs_before_backend_close("internal failure")
+        await backend.close()
+
+        self.assertEqual(
+            order,
+            ["remote-cancel:job-1", "job-cleaned", "backend-close"],
+        )
+        self.assertTrue(future.done())
+        self.assertEqual(controller.active, {})
 
 
 class TurnOwnershipTests(unittest.TestCase):
@@ -522,6 +620,19 @@ class _HangingTurnClient(AppServerClient):
         return {}
 
 
+class _BlockingInterruptClient(_HangingTurnClient):
+    def __init__(self):
+        super().__init__()
+        self.interrupt_started = asyncio.Event()
+        self.release_interrupt = asyncio.Event()
+
+    async def interrupt(self, thread_id: str, turn_id: str) -> object:
+        self.interrupt_calls.append((thread_id, turn_id))
+        self.interrupt_started.set()
+        await self.release_interrupt.wait()
+        return {}
+
+
 class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
     async def _start_turn(
         self, client: AppServerClient,
@@ -627,6 +738,32 @@ class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.interrupt_calls, [("thread-1", "turn-hanging")])
         self.assertNotIn("thread-1", client.turn_ownership._open_threads)
 
+    async def test_repeated_cancellation_does_not_orphan_interrupt_task(self) -> None:
+        client = _BlockingInterruptClient()
+        baseline_tasks = set(asyncio.all_tasks())
+        task = asyncio.create_task(self._start_turn(client))
+        await client.started.wait()
+        task.cancel()
+        await client.interrupt_started.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        leaked = [
+            pending for pending in asyncio.all_tasks()
+            if pending not in baseline_tasks and not pending.done()
+        ]
+        try:
+            self.assertEqual(leaked, [])
+        finally:
+            client.release_interrupt.set()
+            for pending in leaked:
+                pending.cancel()
+            if leaked:
+                await asyncio.gather(*leaked, return_exceptions=True)
+        self.assertNotIn("thread-1", client.turn_ownership._open_threads)
+
     async def test_unknown_completion_of_open_turn_fails_closed_immediately(self) -> None:
         traced: list[dict[str, object]] = []
         client = AppServerClient(codex_executable="unused", notification_handler=traced.append)
@@ -699,6 +836,123 @@ class ReasoningHealthTests(unittest.TestCase):
 
 
 class ResearchTerminationAndStagnationTests(unittest.TestCase):
+    def test_usage_limit_is_provider_quota_not_rate_or_math_failure(self) -> None:
+        kind, retryable, details = _classify_failure(AppServerRequestError({
+            "code": "usage_limit_reached",
+            "message": "You've hit your usage limit",
+            "reset_at": "2026-08-22T00:00:00Z",
+            "http_status": 429,
+        }))
+        self.assertEqual(kind, "provider_quota_exhausted")
+        self.assertFalse(retryable)
+        self.assertEqual(details["provider_reset_at"], "2026-08-22T00:00:00Z")
+
+    def test_provider_quota_pauses_campaign_and_requeues_exact_task(self) -> None:
+        TEST_RUNTIME.mkdir(parents=True, exist_ok=True)
+        root = TEST_RUNTIME / f"amr-quota-{uuid4().hex}"
+        root.mkdir()
+        try:
+            project = initialize_project(root / "neutral-project")
+            controller = AutonomousController(
+                load_config(project), backend=MockCodexBackend(), mock=True,
+                run_id="quota-epoch", campaign_id="quota-campaign",
+            )
+            controller._pin_run_inputs(0.01, True)
+            task = research_task()
+            outcome = JobOutcome(
+                job_id="quota-job",
+                task_id=task.task_id,
+                role=task.role,
+                claim_id=task.target_claim,
+                status="ERROR",
+                result={},
+                failure_kind="provider_quota_exhausted",
+                retryable=False,
+                error="provider usage quota exhausted",
+                server_error={
+                    "provider_reset_at": "2026-08-22T00:00:00Z",
+                },
+            )
+
+            controller._accept_research_result(outcome, task)
+
+            self.assertEqual(controller.pending_research, [task])
+            self.assertIn("provider quota exhausted", controller.scheduler_stop_reason)
+            self.assertIn("2026-08-22T00:00:00Z", controller.scheduler_stop_reason)
+            self.assertFalse(controller._internal_failure)
+            self.assertEqual(controller.stagnation.attempts, {})
+            self.assertFalse(any(
+                item.get("status") == "FAILED"
+                for item in controller.route_ledger.records()
+            ))
+            events = [item["kind"] for item in controller.store.replay()]
+            self.assertIn("PROVIDER_QUOTA_EXHAUSTED", events)
+            self.assertIn("TASK_REQUEUED_AFTER_PROVIDER_QUOTA", events)
+        finally:
+            shutil.rmtree(root)
+
+    def test_blocked_requires_one_repair_turn_and_controller_verification(self) -> None:
+        policy = ResearchTurnPolicy(
+            max_turns={"prover": 12, "falsifier": 8, "explorer": 6},
+        )
+        first = policy.decide(
+            result=worker_result("BLOCKED", status="BLOCKED"),
+            role="prover",
+            turn_index=1,
+            candidate_accepted=False,
+            canonical_progress=False,
+            health_signal=None,
+            blocker_repair_attempted=False,
+            blocker_verified=False,
+        )
+        self.assertTrue(first.continue_same_thread)
+        self.assertIn("repair", first.reason)
+
+        unverified = policy.decide(
+            result=worker_result("BLOCKED", status="BLOCKED"),
+            role="prover",
+            turn_index=2,
+            candidate_accepted=False,
+            canonical_progress=False,
+            health_signal=None,
+            blocker_repair_attempted=True,
+            blocker_verified=False,
+        )
+        self.assertTrue(unverified.continue_same_thread)
+
+        verified = policy.decide(
+            result=worker_result("BLOCKED", status="BLOCKED"),
+            role="prover",
+            turn_index=2,
+            candidate_accepted=False,
+            canonical_progress=False,
+            health_signal=None,
+            blocker_repair_attempted=True,
+            blocker_verified=True,
+        )
+        self.assertFalse(verified.continue_same_thread)
+        self.assertEqual(verified.reason, "controller-verified execution blocker")
+
+    def test_turn_limits_are_selected_per_research_role(self) -> None:
+        policy = ResearchTurnPolicy(
+            max_turns={"prover": 12, "falsifier": 8, "explorer": 6},
+        )
+        self.assertEqual(policy.max_turns_for("prover"), 12)
+        self.assertEqual(policy.max_turns_for("falsifier"), 8)
+        self.assertEqual(policy.max_turns_for("explorer"), 6)
+        at_limit = policy.decide(
+            result=worker_result("NO_PROGRESS"),
+            role="explorer",
+            turn_index=6,
+            candidate_accepted=False,
+            canonical_progress=False,
+            health_signal=None,
+        )
+        self.assertFalse(at_limit.continue_same_thread)
+        self.assertEqual(
+            at_limit.reason, "bounded same-thread turn limit reached",
+        )
+
     def test_incomplete_plausible_proof_does_not_end_logical_job(self) -> None:
         policy = ResearchTurnPolicy(max_turns=3)
         directive = policy.decide(
