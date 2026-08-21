@@ -556,16 +556,31 @@ class Claim:
 class TokenUsage:
     input_tokens: int = 0
     cached_input_tokens: int = 0
+    uncached_input_tokens: int = 0
     cache_write_input_tokens: int = 0
     output_tokens: int = 0
     reasoning_output_tokens: int = 0
     total_tokens: int = 0
 
+    def __post_init__(self) -> None:
+        if self.uncached_input_tokens == 0 and (
+            self.input_tokens or self.cached_input_tokens
+        ):
+            self.uncached_input_tokens = max(
+                0, self.input_tokens - self.cached_input_tokens,
+            )
+
     @classmethod
     def from_app_server(cls, data: dict[str, Any]) -> "TokenUsage":
+        input_tokens = int(data.get("inputTokens", 0))
+        cached_input_tokens = int(data.get("cachedInputTokens", 0))
         return cls(
-            input_tokens=int(data.get("inputTokens", 0)),
-            cached_input_tokens=int(data.get("cachedInputTokens", 0)),
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            uncached_input_tokens=int(data.get(
+                "uncachedInputTokens",
+                max(0, input_tokens - cached_input_tokens),
+            )),
             cache_write_input_tokens=int(data.get("cacheWriteInputTokens", 0)),
             output_tokens=int(data.get("outputTokens", 0)),
             reasoning_output_tokens=int(data.get("reasoningOutputTokens", 0)),

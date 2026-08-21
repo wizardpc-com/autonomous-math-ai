@@ -18,7 +18,7 @@ from autonomous_math_research.controller import AutonomousController
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.models import ResearchTask, TokenUsage
 from autonomous_math_research.provider_backend import (
-    OpenAICompatibleBackend, ProviderRouterBackend,
+    OpenAICompatibleBackend, ProviderRouterBackend, ProviderTransportError,
 )
 from autonomous_math_research.provider_config import redact_config
 from autonomous_math_research.resources import schema_resource
@@ -59,7 +59,7 @@ class ProviderConfigurationTests(unittest.TestCase):
 
     def test_default_profile_is_codex_and_new_budgets_are_separate(self) -> None:
         config = load_config(self.project)
-        self.assertEqual(config.raw["schema_version"], 9)
+        self.assertEqual(config.raw["schema_version"], 10)
         self.assertEqual(config.raw["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
         self.assertEqual(config.profile_name, "codex-app-server-default")
         self.assertTrue(all(
@@ -70,6 +70,13 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertIsNone(config.max_mechanical_subworkers)
         self.assertFalse(
             config.raw["policy"]["one_shot_compute_worker"]["recursive_spawn_allowed"]
+        )
+        self.assertEqual(config.research_max_turns("prover"), 12)
+        self.assertEqual(config.research_max_turns("falsifier"), 12)
+        self.assertEqual(config.research_max_turns("explorer"), 12)
+        self.assertIn(
+            "uncached_input_tokens",
+            config.raw["providers"]["codex"]["capabilities"]["usage_mapping"],
         )
 
     def test_init_cli_accepts_explicit_ids_and_strict_cli_stays_zero_model(self) -> None:
@@ -152,7 +159,7 @@ class ProviderConfigurationTests(unittest.TestCase):
             json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
         config = load_config(self.project)
-        self.assertEqual(config.migrations_applied, ("8->9",))
+        self.assertEqual(config.migrations_applied, ("8->9", "9->10"))
         self.assertEqual(config.campaign_hours, 12.0)
         self.assertEqual(config.epoch_hours, 2.0)
 
@@ -160,7 +167,7 @@ class ProviderConfigurationTests(unittest.TestCase):
             "config", "summary", "--project", str(self.project),
         ])
         self.assertEqual(code, 0, payload)
-        self.assertEqual(payload["config_schema_version"], 9)
+        self.assertEqual(payload["config_schema_version"], 10)
         self.assertEqual(payload["campaign"]["epoch_hours"], 2.0)
         self.assertEqual(payload["model_turns_started"], 0)
 
@@ -170,7 +177,7 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["written"])
         persisted = json.loads(config_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 9)
+        self.assertEqual(persisted["schema_version"], 10)
         self.assertEqual(persisted["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
         self.assertEqual(payload["model_turns_started"], 0)
 
@@ -183,6 +190,34 @@ class ProviderConfigurationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "must not exceed"):
             load_config(self.project, profile_path=self._profile(profile))
+
+    def test_v9_scalar_turn_limit_migrates_and_per_role_override_validates(self) -> None:
+        config_path = self.project / "autonomous" / "config.yaml"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["schema_version"] = 9
+        raw["engine"] = {"research_max_turns": 7}
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        migrated = load_config(self.project)
+        self.assertEqual(migrated.migrations_applied, ("9->10",))
+        self.assertEqual(migrated.raw["engine"]["research_max_turns"], {
+            "prover": 7, "falsifier": 7, "explorer": 7,
+        })
+
+        profile = {
+            "profile_schema_version": 1,
+            "name": "deeper-prover",
+            "extends": "codex-app-server-default",
+            "overrides": {
+                "engine": {"research_max_turns": {"prover": 16}},
+            },
+        }
+        overridden = load_config(
+            self.project, profile_path=self._profile(profile, "turn-profile.json"),
+        )
+        self.assertEqual(overridden.research_max_turns("prover"), 16)
+        self.assertEqual(overridden.research_max_turns("falsifier"), 7)
 
     def test_provider_capabilities_reject_unsupported_structured_mode(self) -> None:
         raw = json.loads(
@@ -276,6 +311,24 @@ class ProviderConfigurationTests(unittest.TestCase):
         governor.record("job", "explorer", TokenUsage(total_tokens=12), cost_usd=None)
         governor.record("job", "explorer", TokenUsage(total_tokens=12), cost_usd=0.30)
         self.assertAlmostEqual(governor.total_cost_usd, 0.30)
+
+    def test_token_accounting_separates_cached_uncached_output_and_reasoning(self) -> None:
+        usage = TokenUsage.from_app_server({
+            "inputTokens": 1000,
+            "cachedInputTokens": 800,
+            "outputTokens": 120,
+            "reasoningOutputTokens": 75,
+            "totalTokens": 1120,
+        })
+        self.assertEqual(usage.cached_input_tokens, 800)
+        self.assertEqual(usage.uncached_input_tokens, 200)
+        self.assertEqual(usage.output_tokens, 120)
+        self.assertEqual(usage.reasoning_output_tokens, 75)
+        governor = TokenGovernor(global_budget=10_000, configured_max_research=1)
+        governor.record("job", "prover", usage)
+        snapshot = governor.snapshot()["total"]
+        self.assertEqual(snapshot["uncached_input_tokens"], 200)
+        self.assertEqual(snapshot["cached_input_tokens"], 800)
 
     def test_strict_init_detects_placeholders_then_accepts_consistent_ids(self) -> None:
         with self.assertRaisesRegex(ValueError, "placeholder"):
@@ -378,7 +431,13 @@ class OpenAICompatibleAdapterTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "id": "response-test", "model": "test-model",
                 "service_tier": "default", "output_text": json.dumps(result),
-                "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+                "usage": {
+                    "input_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 80},
+                    "output_tokens": 7,
+                    "output_tokens_details": {"reasoning_tokens": 3},
+                    "total_tokens": 107,
+                },
                 "billing": {"cost_usd": 0.25},
             }
 
@@ -403,7 +462,11 @@ class OpenAICompatibleAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.provider, "openai-compatible")
         self.assertEqual(outcome.requested_service_tier, "default")
         self.assertEqual(outcome.observed_service_tier, "default")
-        self.assertEqual(outcome.token_usage.total_tokens, 18)
+        self.assertEqual(outcome.token_usage.total_tokens, 107)
+        self.assertEqual(outcome.token_usage.cached_input_tokens, 80)
+        self.assertEqual(outcome.token_usage.uncached_input_tokens, 20)
+        self.assertEqual(outcome.token_usage.output_tokens, 7)
+        self.assertEqual(outcome.token_usage.reasoning_output_tokens, 3)
         self.assertEqual(outcome.cost_usd, 0.25)
         self.assertTrue(captured["endpoint"].endswith("/responses"))
         self.assertNotIn("Authorization", captured["headers"])
@@ -436,6 +499,66 @@ class OpenAICompatibleAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rates["providers"]["codex"]["used"], 15)  # type: ignore[index]
         self.assertEqual(
             rates["providers"]["openai-compatible"]["used"], 72,  # type: ignore[index]
+        )
+
+    async def test_transport_usage_limit_preserves_official_reset_hint(self) -> None:
+        profile = self.root / "quota-profile.json"
+        profile.write_text(json.dumps({
+            "profile_schema_version": 1,
+            "name": "quota-transport",
+            "extends": "codex-app-server-default",
+            "overrides": {
+                "providers": {
+                    "openai-compatible": {
+                        "credential": {"kind": "none", "reference": None},
+                    }
+                },
+                "models": {
+                    "explorer": {
+                        "provider": "openai-compatible",
+                        "model": "test-model",
+                        "effort": "high",
+                        "service_tier": "default",
+                    }
+                },
+            },
+        }, indent=2) + "\n", encoding="utf-8")
+        config = load_config(self.project, profile_path=profile)
+
+        async def transport(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise ProviderTransportError(
+                "provider HTTP request failed with status 429",
+                status=429,
+                payload={
+                    "error": {
+                        "code": "usage_limit_reached",
+                        "message": "You've hit your usage limit",
+                        "reset_at": "2026-08-22T00:00:00Z",
+                    }
+                },
+            )
+
+        backend = OpenAICompatibleBackend(
+            config, "openai-compatible", transport=transport,
+        )
+        task = ResearchTask(
+            task_id="quota-test", role="explorer", target_claim="C_ROOT",
+            exact_objective="Return a schema-valid deterministic test result.",
+            why_now="quota test", dependencies=[], expected_information_gain="LOW",
+            mathematical_impact="LOW", estimated_cost_tier="LOW", required_files=[],
+            stop_conditions=["return"], output_contract="worker_result.schema.json",
+        )
+        with schema_resource("worker_result.schema.json") as path:
+            schema = load_schema(path)
+        outcome = await backend.run_job(
+            job_id="job-quota", task=task, prompt="test", output_schema=schema,
+            workspace=self.project, writable_roots=[self.project], timeout=3,
+            token_budget=100, candidate_sink=lambda _event: asyncio.sleep(0),
+        )
+        self.assertEqual(outcome.failure_kind, "provider_quota_exhausted")
+        self.assertFalse(outcome.retryable)
+        self.assertEqual(
+            outcome.server_error["provider_reset_at"], "2026-08-22T00:00:00Z",
         )
 
 

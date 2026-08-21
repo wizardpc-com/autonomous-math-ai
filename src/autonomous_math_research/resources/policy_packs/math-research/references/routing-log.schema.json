@@ -41,11 +41,13 @@
     "usage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["input_tokens", "cached_input_tokens", "output_tokens", "latency_seconds", "cost"],
+      "required": ["input_tokens", "cached_input_tokens", "uncached_input_tokens", "output_tokens", "reasoning_output_tokens", "latency_seconds", "cost"],
       "properties": {
         "input_tokens": {"type": ["integer", "null"], "minimum": 0},
         "cached_input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "uncached_input_tokens": {"type": ["integer", "null"], "minimum": 0},
         "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "reasoning_output_tokens": {"type": ["integer", "null"], "minimum": 0},
         "latency_seconds": {"type": ["number", "null"], "minimum": 0},
         "cost": {
           "oneOf": [

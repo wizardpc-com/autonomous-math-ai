@@ -41,6 +41,12 @@ COMMON_OVERRIDE_PATHS = (
     ("budgets.global_cost_usd", "主角色 cost 上限，null 表示未设置"),
     ("budgets.mechanical_cost_usd", "机械子工 cost 上限，null 表示未设置"),
 ) + tuple(
+    (
+        f"engine.research_max_turns.{role}",
+        f"{role} 单逻辑任务最大 continuation turn",
+    )
+    for role in ("prover", "falsifier", "explorer")
+) + tuple(
     (f"models.{role}.{field}", f"{role} {label}")
     for role in ROLE_ORDER
     for field, label in (
@@ -86,6 +92,7 @@ _SIMPLE_OVERRIDE_PATTERNS = (
         r"^engine\.(?:max_retries|transient_protocol_max_retries|"
         r"model_protocol_max_retries|director_max_retries)$"
     ),
+    re.compile(r"^engine\.research_max_turns\.(?:prover|falsifier|explorer)$"),
     re.compile(
         r"^models\.([a-z_]+)\.(?:provider|model|endpoint|profile|effort|"
         r"unsupported_effort|service_tier|output_mode|timeout_seconds|"

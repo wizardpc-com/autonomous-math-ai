@@ -8,6 +8,8 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Configuration schema v10 with per-role research turn bounds and normalized
+  uncached-input token telemetry; v7/v8/v9 projects migrate in memory.
 - Configuration schema v9 with project campaign defaults, built-in Codex
   profile, migrations, and redacted `amr config validate/explain/summary`.
 - Provider capability declarations, per-role provider/model routes, an optional
@@ -41,11 +43,46 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mechanical workers; existing schema-v7 configs retain their pinned limits.
 - Mechanical delegation is preferred for finite, mechanically checkable work
   while remaining one-shot, nonrecursive, and outside canonical trust.
+- Top-level delegation enforcement now parses actual shell command positions,
+  so read-only process inspection and text searches may mention Codex while
+  direct, wrapped, or recursive Codex execution still fails closed.
 - The harness now lives in its own source checkout and research repositories
   integrate exclusively through the installed `amr` CLI and project manifest.
 - App Server active goals are no longer armed for autonomous jobs; token limits
   remain controller-enforced, unowned native continuations fail closed, and
   only controller-verified canonical progress resets stagnation.
+- The built-in research continuation bound is now 12 turns without changing
+  scheduler concurrency. Turn-bound tasks are digest-bound as noncanonical
+  checkpoints and carried into the next epoch instead of being classified as
+  route failures or stagnation progress.
+- A first `BLOCKED` research result now receives a same-thread repair turn;
+  only a post-repair controller-actionable blocker may pause the route, with no
+  mathematical or trust effect. Turn/token boundaries record explicit current,
+  completed-evidence, and next-obligation checkpoint fields.
+- Provider usage exhaustion is classified as `provider_quota_exhausted`,
+  preserves official reset hints, pauses the campaign, and requeues exact work
+  without consuming retry, route-failure, or stagnation state.
+- Director task admission now resolves portable `project://`, `campaign://`,
+  and `epoch://` required-file references, rechecks them before dispatch, and
+  gives workers an internal readable-path mapping without weakening durable
+  evidence references. Task dependencies are explicitly ClaimGraph claim ids.
+- Director task admission rejects attempts to bind one stable task id to
+  different task content.
+- Top-level job workspaces and mechanical broker control files are isolated by
+  controller job id, with a final active-task-id guard against concurrent
+  duplicate dispatch.
+- `amr campaign continue` now forwards the complete internal run namespace,
+  including the fresh-epoch run id default, instead of failing before preflight.
+- App Server completion correlation no longer leaves a thread-level copy of a
+  delivered turn that can be consumed by the next same-thread continuation.
+  Response/stream id aliases, repeated start notifications, request failure,
+  cancellation, and unknown completion ids now have explicit tested handling.
+- `CORE_CAPSULE` size enforcement now validates and atomically writes the same
+  compact UTF-8 bytes, bounds oversized nested values and active-task sets,
+  records compaction counts, and preserves the highest-priority frontier.
+- Controller shutdown now reaps scheduled cancellation work and cancelled job
+  owners before closing provider transports, preventing orphaned App Server
+  interrupt futures during internal-failure cleanup.
 
 ### Planned
 

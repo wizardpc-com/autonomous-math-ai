@@ -1,6 +1,6 @@
 # Configuration and profiles
 
-Configuration schema v9 is merged as: built-in `codex-app-server-default`, the
+Configuration schema v10 is merged as: built-in `codex-app-server-default`, the
 project's manifest-selected `autonomous/config.yaml`, an explicit `--profile`,
 then an optional launcher one-shot override. Core
 trust validation runs last, so neither a project nor a user profile can enable
@@ -20,14 +20,15 @@ and `model_turns_started: 0`. Plaintext-looking secrets and URL user information
 fail validation; explanation output redacts defense-in-depth matches.
 
 `summary` emits a compact redacted view of project identity, campaign duration,
-concurrency, budgets, each role route, and mechanical routing. Schema v9 adds
+concurrency, budgets, each role route, and mechanical routing. Schema v9 added
 `campaign.hours` (default `12`) and `campaign.epoch_hours` (default `2`). When
 the corresponding CLI flags are absent, `amr run` uses these project values;
 explicit `--hours` and `--epoch-hours` remain highest priority.
 
 The `engine` section also controls controller-owned research continuation:
 
-- `research_max_turns` (default `4`) bounds turns in one logical research job;
+- `research_max_turns.prover`, `.falsifier`, and `.explorer` (each defaulting
+  to `12`) independently bound turns in one logical research job;
 - `reasoning_health_short_tokens` (default `600`) is a diagnostic threshold;
 - `reasoning_health_repeated_token_tolerance` (default `2`) detects repeated
   counts;
@@ -35,6 +36,15 @@ The `engine` section also controls controller-owned research continuation:
 
 These settings never relax audit or canonical gates. App Server goals are not
 armed; per-thread token limits remain controller-enforced from telemetry.
+The first model-reported `BLOCKED` result always receives a controller-owned
+repair turn. Only a structurally actionable blocker repeated after repair may
+end the logical job, and that verification is scheduling-only: it has no
+mathematical, trust, or evidence effect. Reaching a turn or controller token
+boundary without verified progress creates a controller-owned, noncanonical
+checkpoint for the next epoch instead of marking the route failed or resetting
+stagnation. The checkpoint records the current canonical obligation, completed
+evidence bindings, and next obligation; the checkpoint and full continuation
+task are digest-bound and revalidated before fresh-epoch dispatch.
 
 ## Role routes
 
@@ -60,6 +70,16 @@ no static seat count, not unlimited dispatch: the broker still applies its own
 budget, CPU/resource cap, rate limits, queue depth, dispatch batch, timeout, and
 operator stop.
 
+Normalized telemetry separately records total input, cached input, uncached
+input, cache-write input, output, and reasoning-output tokens. Provider total
+tokens remain the budget authority, while uncached/output/reasoning components
+are the appropriate view for task depth. A provider usage-quota terminal such
+as `You've hit your usage limit` is classified as
+`provider_quota_exhausted`: the campaign pauses, the exact task or its
+noncanonical checkpoint is retained for the next epoch, and an official reset
+timestamp is preserved when supplied. It is neither a route failure nor
+stagnation.
+
 Selection modes are `preferred`, `balanced`, `conservative`, `disabled`, or
 `custom` with explicit thresholds. Every worker remains one-shot, nonrecursive,
 mechanical-only, and unable to update canonical state.
@@ -68,8 +88,8 @@ mechanical-only, and unable to update canonical state.
 
 See [`examples/per-role-api-profile.json`](examples/per-role-api-profile.json).
 A profile contains exactly `profile_schema_version`, `name`, `extends`, and
-`overrides`. It cannot override project identity. Schema-v7 and v8 project
-configs migrate to v9 in memory. Use `amr config migrate --project PATH --write`
+`overrides`. It cannot override project identity. Schema-v7, v8, and v9 project
+configs migrate to v10 in memory. Use `amr config migrate --project PATH --write`
 for an atomic persistent migration after reviewing the redacted effective
 configuration; the command starts no model.
 

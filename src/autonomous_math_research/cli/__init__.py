@@ -459,7 +459,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         epoch_hours=epoch_hours, max_director=None, max_research_workers=None,
         max_audit=None, max_mechanical_subworkers=None, budget=None, config=None,
         profile=args.profile, dry_run=args.dry_run, mock=args.mock, resume=None,
-        recover_candidates_from=None, campaign_id=args.campaign,
+        run_id=None, recover_candidates_from=None, campaign_id=args.campaign,
         previous_epoch_id=(checkpoint.epochs[-1] if checkpoint.epochs else None),
     )
     return await _run_command(forwarded)

@@ -42,8 +42,10 @@ mechanical delegation without treating model output as mathematical truth.
   Structured Outputs compatibility checks.
 - **Controller-owned continuation:** a hard research task can use bounded,
   explicit same-thread turns; a completed turn or self-reported proof does not
-  by itself complete the logical task. Missing token telemetry or an exhausted
-  controller budget blocks further continuation fail-closed.
+  by itself complete the logical task. A first `BLOCKED` report receives a
+  repair turn; turn/token boundaries checkpoint the task for the next epoch.
+  Provider quota exhaustion pauses and preserves work without counting as
+  mathematical failure or stagnation.
 - **Canonical proof frontier:** stable proof obligations live in `ClaimGraph`,
   and only audited canonical progress can close them or reset stagnation.
 

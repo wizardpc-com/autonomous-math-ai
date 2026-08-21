@@ -190,13 +190,22 @@ def build_status(
     active_jobs.sort(key=lambda item: str(item.get("start_time") or ""))
     token_keys = {
         "inputTokens": "input_tokens", "cachedInputTokens": "cached_input_tokens",
+        "uncachedInputTokens": "uncached_input_tokens",
         "cacheWriteInputTokens": "cache_write_input_tokens", "outputTokens": "output_tokens",
         "reasoningOutputTokens": "reasoning_output_tokens", "totalTokens": "total_tokens",
     }
-    token_totals = {
-        camel: sum(int(value.get(camel, 0) or 0) for value in token_by_thread.values())
-        for camel in token_keys
-    }
+    token_totals = {camel: 0 for camel in token_keys}
+    for value in token_by_thread.values():
+        for camel in token_keys:
+            if camel == "uncachedInputTokens" and value.get(camel) is None:
+                observed = max(
+                    0,
+                    int(value.get("inputTokens", 0) or 0)
+                    - int(value.get("cachedInputTokens", 0) or 0),
+                )
+            else:
+                observed = int(value.get(camel, 0) or 0)
+            token_totals[camel] += observed
     # Completed JobOutcome telemetry is the source for mock backends and a
     # fallback for App Server versions that omit token notifications.  Avoid
     # double-counting a real job when thread telemetry is already available.

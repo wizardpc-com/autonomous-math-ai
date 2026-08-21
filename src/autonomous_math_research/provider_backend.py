@@ -16,7 +16,8 @@ from .app_server import (
     redact_auth_material,
 )
 from .backend import (
-    AppServerBackend, CandidateSink, CodexBackend, TurnController, _classify_failure,
+    AppServerBackend, CandidateSink, CodexBackend, TurnController,
+    _classify_failure, _provider_quota_details,
 )
 from .config import HarnessConfig
 from .models import JobOutcome, ResearchTask, TokenUsage
@@ -62,6 +63,12 @@ def normalize_usage(raw: Any, mapping: dict[str, list[str]]) -> tuple[TokenUsage
                 setattr(usage, field_name, int(value))
                 observed += 1
                 break
+    if usage.uncached_input_tokens == 0 and (
+        usage.input_tokens or usage.cached_input_tokens
+    ):
+        usage.uncached_input_tokens = max(
+            0, usage.input_tokens - usage.cached_input_tokens,
+        )
     if usage.total_tokens == 0 and (usage.input_tokens or usage.output_tokens):
         usage.total_tokens = usage.input_tokens + usage.output_tokens
     return usage, "observed" if observed else "unknown"
@@ -319,7 +326,12 @@ class OpenAICompatibleBackend:
             )
         except Exception as exc:
             if isinstance(exc, ProviderTransportError):
-                if exc.status == 429:
+                details = {"http_status": exc.status, "error": exc.payload}
+                quota_details = _provider_quota_details(details)
+                if quota_details is not None:
+                    failure_kind, retryable = "provider_quota_exhausted", False
+                    details = quota_details
+                elif exc.status == 429:
                     failure_kind, retryable = "rate_limit", True
                 elif exc.status in {401, 403}:
                     failure_kind, retryable = "access_denied", False
@@ -329,7 +341,6 @@ class OpenAICompatibleBackend:
                     failure_kind, retryable = "transport_transient", True
                 else:
                     failure_kind, retryable = "provider_request", False
-                details = {"http_status": exc.status, "error": exc.payload}
             else:
                 failure_kind, retryable, details = _classify_failure(exc)
             return JobOutcome(

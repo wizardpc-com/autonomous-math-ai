@@ -84,7 +84,26 @@ the next turn fail-closed.
 Any unowned `turn/started` is interrupted and stops the run fail-closed. A
 model's `PROOF` or `COUNTEREXAMPLE` label does not end a logical job: termination
 requires a validated candidate entering the audit frontier, controller-verified
-canonical progress, a concrete execution blocker, or a configured turn bound.
+canonical progress, a post-repair controller-actionable execution blocker, or a
+configured turn bound. The first `BLOCKED` report therefore receives a repair
+turn; blocker verification is only an execution-scheduling decision and never
+a mathematical verdict. The built-in per-role bounds are twelve turns. If a
+turn or controller token bound is reached without verified progress, the
+controller records the result, turn history, canonical current/next proof
+obligation, completed evidence bindings, and artifact digests in a noncanonical
+checkpoint. The route is paused for the remainder of the epoch and the
+digest-bound continuation task is admitted in the next epoch only after
+fail-closed integrity and schema checks. This carry-over never changes claim,
+trust, evidence, or audit status.
+
+Turn completion is correlated by both turn id and thread because some App
+Server versions expose different response and stream ids. A completion buffered
+before the `turn/start` response is consumed exactly once across both indexes;
+delivered or duplicate notifications are never carried into the next turn.
+Repeated `turn/started` for the same owned id is idempotent, while a distinct
+start or completion id remains an unmanaged continuation and fails closed.
+Cancellation and a failed `turn/start` response attempt to interrupt any remote
+turn already observed before releasing controller ownership.
 
 Crash recovery never guesses how far an interrupted proof got. It preserves
 completed-turn events, interrupts the stale remote turn, and requeues the exact
@@ -109,16 +128,22 @@ describes review state, `EvidenceLevel` describes what was checked, and
 Failures are handled in this order:
 
 1. local schema, bootstrap, canonical, or policy violation;
-2. transport, rate-limit, or transient protocol failure;
-3. a server-completed turn with failed status;
-4. missing or invalid structured model output;
-5. role-level semantic validation failure;
-6. controller or state-machine failure.
+2. provider quota exhaustion (pause and preserve until the supplied reset);
+3. transport, rate-limit, or transient protocol failure;
+4. a server-completed turn with failed status;
+5. missing or invalid structured model output;
+6. role-level semantic validation failure;
+7. controller or state-machine failure.
 
 A failed job is never passed into a role parser. Original server errors,
 streamed events, identifiers, retry classification, and telemetry are retained.
 Role protocol failures use bounded role-local retries. Controller, canonical,
 policy, and local-schema failures drain the epoch as internal failures.
+Quota exhaustion is not a bounded transport retry or a mathematical failure:
+the campaign pauses, official reset metadata is retained, and exact pending
+work is carried forward. Token telemetry keeps total, cached input, uncached
+input, cache-write input, output, and reasoning output separate; total tokens
+remain the budget authority, not a proxy for research depth.
 
 ## Scheduling
 
@@ -135,6 +160,13 @@ Incremental Director work is coalesced and debounced behind a version watermark.
 The Director does not wait for all research and audit jobs to drain and cannot
 block their normal dispatch.
 
+A task id is a stable binding to one task fingerprint within an epoch. The
+controller rejects changed task content that reuses an accepted id and has a
+final dispatch-time guard against concurrently active duplicate ids. Each job
+attempt receives a job-id-qualified workspace, so sequential retries and even
+defense-in-depth test bypasses cannot overwrite another attempt's sealed
+mechanical broker configuration.
+
 Every Director snapshot includes a controller-owned representation compatibility
 view (claims grouped by representation id, known complete contracts, missing
 contract ids, and independently audited bridge pairs) plus latest route state.
@@ -150,7 +182,25 @@ content-addressed bundles before audit. Durable references use `project://`,
 `campaign://`, or `epoch://` URIs, so evidence does not depend on a machine's
 absolute path.
 
+Director `required_files` accepts those durable URIs as well as legacy
+project-relative or project-contained absolute paths. The controller resolves
+and rechecks each reference before dispatch, then supplies the research worker
+with an internal read-path mapping while preserving the portable reference in
+the task and event history. `ResearchTask.dependencies` names existing
+`ClaimGraph` claims only; task-to-task sequencing is expressed by a later
+Director wave rather than by placing task ids in that field.
+
 `CORE_CAPSULE` is a bounded rebuildable snapshot, `RESEARCH_MAP` is a derived
 human-readable view, and `ROUTE_LEDGER` records failed approaches and explicit
 retry conditions. None of these derived views can override the canonical claim
-graph.
+graph. The capsule's 32 KiB contract is enforced against the exact compact
+UTF-8 bytes written atomically. Oversized nested values and low-priority or old
+derived entries are deterministically compacted, with source, dropped, and
+truncation counts retained in the capsule; high-priority frontier entries are
+discarded last.
+
+During controller shutdown, remote turn containment and locally scheduled
+cancellation tasks are completed before provider transports close. Each local
+job owner is then cancelled and awaited, so an App Server interrupt request
+cannot outlive its controller task or surface as an unobserved Future after
+stdio closes.

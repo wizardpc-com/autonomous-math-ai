@@ -9,20 +9,44 @@ from .reasoning_health import ReasoningHealthSignal
 class ResearchTurnPolicy:
     """Controller policy for deciding whether one logical research job is done."""
 
-    def __init__(self, *, max_turns: int):
-        if max_turns < 1:
-            raise ValueError("max_turns must be positive")
-        self.max_turns = int(max_turns)
+    def __init__(self, *, max_turns: int | dict[str, int]):
+        if isinstance(max_turns, int) and not isinstance(max_turns, bool):
+            if max_turns < 1:
+                raise ValueError("max_turns must be positive")
+            self.max_turns = {
+                role: int(max_turns)
+                for role in ("prover", "falsifier", "explorer")
+            }
+        elif isinstance(max_turns, dict):
+            expected = {"prover", "falsifier", "explorer"}
+            if set(max_turns) != expected or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+                for value in max_turns.values()
+            ):
+                raise ValueError(
+                    "max_turns must define positive prover, falsifier, explorer limits"
+                )
+            self.max_turns = dict(max_turns)
+        else:
+            raise ValueError("max_turns must be an integer or per-role mapping")
+
+    def max_turns_for(self, role: str) -> int:
+        if role not in self.max_turns:
+            raise ValueError(f"unsupported multi-turn research role: {role}")
+        return self.max_turns[role]
 
     def decide(
         self,
         *,
         result: dict[str, Any],
+        role: str = "prover",
         turn_index: int,
         candidate_accepted: bool,
         canonical_progress: bool,
         health_signal: ReasoningHealthSignal | None,
         budget_stop_reason: str | None = None,
+        blocker_repair_attempted: bool = False,
+        blocker_verified: bool = False,
     ) -> TurnDirective:
         if canonical_progress:
             return TurnDirective.stop("controller-verified canonical progress")
@@ -30,7 +54,22 @@ class ResearchTurnPolicy:
             return TurnDirective.stop("validated candidate entered the audit frontier")
         if budget_stop_reason:
             return TurnDirective.stop(budget_stop_reason)
-        if turn_index >= self.max_turns:
+        result_type = str(result.get("result_type") or "NO_PROGRESS")
+        if result_type == "BLOCKED":
+            if blocker_repair_attempted and blocker_verified:
+                return TurnDirective.stop("controller-verified execution blocker")
+            if not blocker_repair_attempted:
+                return TurnDirective.continue_with(
+                    self._continuation_prompt(result, "an unverified blocker report"),
+                    reason="controller-required blocker repair turn",
+                )
+            if turn_index >= self.max_turns_for(role):
+                return TurnDirective.stop("bounded same-thread turn limit reached")
+            return TurnDirective.continue_with(
+                self._continuation_prompt(result, "the blocker remains unverified"),
+                reason="unverified blocker requires another bounded repair turn",
+            )
+        if turn_index >= self.max_turns_for(role):
             return TurnDirective.stop("bounded same-thread turn limit reached")
         if health_signal and health_signal.action in {"RETRY", "ESCALATE"}:
             return TurnDirective.continue_with(
@@ -38,8 +77,7 @@ class ResearchTurnPolicy:
                 reason=f"reasoning health diagnostic: {health_signal.diagnostic}",
                 effort_override=health_signal.recommended_effort,
             )
-        result_type = str(result.get("result_type") or "NO_PROGRESS")
-        if result_type in {"BLOCKED", "TOOL_ERROR"}:
+        if result_type == "TOOL_ERROR":
             return TurnDirective.stop(f"explicit execution terminal: {result_type}")
         # A model's PROOF/COUNTEREXAMPLE label is not controller-verified
         # progress and cannot terminate the job without a validated candidate.

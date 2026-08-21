@@ -99,6 +99,10 @@ class UnifiedLauncherTests(unittest.TestCase):
             "scheduler.max_mechanical_subworkers=null"
         )
         self.assertIsNone(value)
+        path, value = parse_override_assignment(
+            "engine.research_max_turns.prover=16"
+        )
+        self.assertEqual((path, value), ("engine.research_max_turns.prover", 16))
         self.assertFalse(override_path_allowed("workspace.protected_paths"))
         self.assertFalse(override_path_allowed("providers.codex.credential.reference"))
         with self.assertRaisesRegex(ValueError, "not eligible"):
@@ -109,6 +113,7 @@ class UnifiedLauncherTests(unittest.TestCase):
         common_paths = {path for path, _label in COMMON_OVERRIDE_PATHS}
         self.assertIn("models.prover.retries.transport", common_paths)
         self.assertIn("models.auditor.cost_limit_usd", common_paths)
+        self.assertIn("engine.research_max_turns.prover", common_paths)
         self.assertIn(
             "policy.one_shot_compute_worker.primary_route.model", common_paths,
         )

@@ -136,6 +136,8 @@ checks are complete.
 
 - `--resume` is only for the same crashed epoch.
 - `amr campaign continue` creates a new epoch from a sealed checkpoint.
+- A paused, sealed epoch must be continued, not resumed; validate the updated
+  harness with a separate new dry run before continuing the real campaign.
 - Budget or epoch drain stops new dispatch and waits for healthy in-flight work.
 - Failed runs remain immutable evidence; recovery imports into a new append-only
   context rather than rewriting the old run.

@@ -153,7 +153,8 @@ def _provider_capabilities(provider: dict[str, Any], label: str) -> dict[str, An
     if not isinstance(usage, dict):
         raise ValueError(f"{label}.capabilities.usage_mapping must be an object")
     for field in (
-        "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+        "input_tokens", "cached_input_tokens", "uncached_input_tokens",
+        "cache_write_input_tokens",
         "output_tokens", "reasoning_output_tokens", "total_tokens",
     ):
         paths = usage.get(field)

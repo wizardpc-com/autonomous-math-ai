@@ -151,6 +151,12 @@ class HarnessConfig:
         route = self.raw["models"][role]
         return int(route.get("retries", {}).get(retry_class, 0))
 
+    def research_max_turns(self, role: str) -> int:
+        limits = self.raw["engine"]["research_max_turns"]
+        if role not in limits:
+            raise ValueError(f"role {role!r} has no research continuation limit")
+        return int(limits[role])
+
     def explained(self) -> dict[str, Any]:
         return {
             "config_schema_version": CONFIG_SCHEMA_VERSION,
@@ -391,8 +397,19 @@ def _validate_config(raw: dict[str, Any]) -> None:
             raise ValueError(f"engine {key} must be non-negative")
     if float(raw["engine"].get("director_debounce_seconds", 0.2)) < 0:
         raise ValueError("engine director_debounce_seconds must be non-negative")
-    if int(raw["engine"].get("research_max_turns", 1)) < 1:
-        raise ValueError("engine research_max_turns must be positive")
+    turn_limits = raw["engine"].get("research_max_turns")
+    expected_turn_roles = {"prover", "falsifier", "explorer"}
+    if not isinstance(turn_limits, dict) or set(turn_limits) != expected_turn_roles:
+        raise ValueError(
+            "engine research_max_turns must contain exactly prover, falsifier, explorer"
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 2
+        for value in turn_limits.values()
+    ):
+        raise ValueError(
+            "engine research_max_turns values must be integers of at least 2"
+        )
     if int(raw["engine"].get("reasoning_health_short_tokens", 0)) < 0:
         raise ValueError("engine reasoning_health_short_tokens must be non-negative")
     if int(raw["engine"].get("reasoning_health_repeated_token_tolerance", 2)) < 2:

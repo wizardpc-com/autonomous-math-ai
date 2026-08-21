@@ -126,12 +126,22 @@ class TurnOwnershipRegistry:
         self._owned_ids[thread_id] = set()
         self._started_count[thread_id] = 0
 
+    def is_controller_turn_open(self, thread_id: str) -> bool:
+        return thread_id in self._open_threads
+
     def observe_started(self, thread_id: str, turn_id: str) -> bool:
-        if thread_id in self._open_threads and self._started_count.get(thread_id, 0) == 0:
-            self._started_count[thread_id] = 1
-            if turn_id:
-                self._owned_ids.setdefault(thread_id, set()).add(turn_id)
-            return True
+        if thread_id in self._open_threads:
+            owned = self._owned_ids.setdefault(thread_id, set())
+            if self._started_count.get(thread_id, 0) == 0:
+                self._started_count[thread_id] = 1
+                if turn_id:
+                    owned.add(turn_id)
+                return True
+            # App Server notifications are at-least-once telemetry. Replaying
+            # the same owned start is harmless; only a distinct turn is an
+            # unmanaged continuation.
+            if turn_id and turn_id in owned:
+                return True
         self.unmanaged_continuations.append({
             "thread_id": thread_id,
             "turn_id": turn_id,
@@ -150,6 +160,16 @@ class TurnOwnershipRegistry:
         if thread_id not in self._open_threads:
             return False
         owned = self._owned_ids.setdefault(thread_id, set())
+        if (
+            turn_id
+            and self._started_count.get(thread_id, 0) > 0
+            and turn_id not in owned
+        ):
+            self.unmanaged_continuations.append({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+            })
+            return False
         if turn_id:
             owned.add(turn_id)
         return True
@@ -344,6 +364,7 @@ class AppServerClient:
         self._response_turn_by_thread: dict[str, str] = {}
         self._turn_aliases: dict[str, str] = {}
         self._turn_started_callbacks: dict[str, Callable[[str], None]] = {}
+        self._retired_turn_ids_by_thread: dict[str, set[str]] = {}
         self._messages: dict[str, list[str]] = {}
         self._token_usage: dict[str, TokenUsage] = {}
         self._thread_token_usage: dict[str, TokenUsage] = {}
@@ -351,6 +372,54 @@ class AppServerClient:
         self.turn_ownership = TurnOwnershipRegistry()
         self.stderr_lines: list[str] = []
         self.initialize_result: dict[str, Any] | None = None
+
+    def _discard_buffered_completion_for_thread(self, thread_id: str) -> None:
+        buffered = self._completed_thread_turns.pop(thread_id, None)
+        if buffered is None:
+            return
+        for turn_id, candidate in list(self._completed_turns.items()):
+            if candidate is buffered:
+                self._completed_turns.pop(turn_id, None)
+
+    def _pop_buffered_completion(
+        self, thread_id: str, turn_ids: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        buffered: dict[str, Any] | None = None
+        for turn_id in turn_ids:
+            if not turn_id:
+                continue
+            candidate = self._completed_turns.pop(turn_id, None)
+            if buffered is None and candidate is not None:
+                buffered = candidate
+        thread_candidate = self._completed_thread_turns.pop(thread_id, None)
+        if buffered is None:
+            buffered = thread_candidate
+        if buffered is None:
+            return None
+        # A completion received before turn/start's response is indexed by
+        # both turn and thread because the two ids may differ on Windows.
+        # Consuming either index must remove every alias of that same event.
+        for turn_id, candidate in list(self._completed_turns.items()):
+            if candidate is buffered:
+                self._completed_turns.pop(turn_id, None)
+        for candidate_thread, candidate in list(self._completed_thread_turns.items()):
+            if candidate is buffered:
+                self._completed_thread_turns.pop(candidate_thread, None)
+        return buffered
+
+    def _retire_turn_ids(self, thread_id: str, *turn_ids: str) -> None:
+        retired = self._retired_turn_ids_by_thread.setdefault(thread_id, set())
+        retired.update(turn_id for turn_id in turn_ids if turn_id)
+        # App Server clients can survive many jobs in one campaign. Bound this
+        # late-notification guard without affecting any realistically active
+        # same-thread continuation.
+        while len(self._retired_turn_ids_by_thread) > 4096:
+            oldest_thread_id = next(iter(self._retired_turn_ids_by_thread))
+            if oldest_thread_id == thread_id and len(self._retired_turn_ids_by_thread) > 1:
+                oldest_thread_id = next(
+                    item for item in self._retired_turn_ids_by_thread if item != thread_id
+                )
+            self._retired_turn_ids_by_thread.pop(oldest_thread_id, None)
 
     async def _interrupt_unmanaged_turn(self, thread_id: str, turn_id: str) -> None:
         """Best-effort containment after a native turn escapes ownership."""
@@ -368,6 +437,27 @@ class AppServerClient:
                 })
                 if asyncio.iscoroutine(result):
                     await result
+
+    def _report_unmanaged_turn(self, thread_id: str, turn_id: str) -> None:
+        if self.process is not None:
+            asyncio.create_task(self._interrupt_unmanaged_turn(thread_id, turn_id))
+        if self.notification_handler:
+            result = self.notification_handler({
+                "method": "amr/unmanagedContinuation",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "action": "interrupt_and_fail_closed",
+                },
+            })
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+
+    def _forward_notification(self, message: dict[str, Any]) -> None:
+        if self.notification_handler:
+            result = self.notification_handler(redact_auth_material(message))
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
 
     async def __aenter__(self) -> "AppServerClient":
         await self.start()
@@ -528,27 +618,24 @@ class AppServerClient:
         method = message.get("method")
         params = message.get("params") or {}
         thread_id = str(params.get("threadId") or "")
+        turn_payload = params.get("turn") or {}
+        event_turn_id = str(
+            params.get("turnId")
+            or (turn_payload.get("id") if isinstance(turn_payload, dict) else "")
+            or ""
+        )
+        if event_turn_id in self._retired_turn_ids_by_thread.get(thread_id, set()):
+            # Late telemetry from a completed turn remains observable but must
+            # not mutate buffers, usage, aliases, or ownership for its successor.
+            self._forward_notification(message)
+            return
         if method == "turn/started":
             turn = params.get("turn") or {}
             notification_turn_id = str(turn.get("id") or "")
             if thread_id and notification_turn_id and not self.turn_ownership.observe_started(
                 thread_id, notification_turn_id,
             ):
-                if self.process is not None:
-                    asyncio.create_task(
-                        self._interrupt_unmanaged_turn(thread_id, notification_turn_id)
-                    )
-                if self.notification_handler:
-                    result = self.notification_handler({
-                        "method": "amr/unmanagedContinuation",
-                        "params": {
-                            "threadId": thread_id,
-                            "turnId": notification_turn_id,
-                            "action": "interrupt_and_fail_closed",
-                        },
-                    })
-                    if asyncio.iscoroutine(result):
-                        asyncio.create_task(result)
+                self._report_unmanaged_turn(thread_id, notification_turn_id)
                 return
             if thread_id and notification_turn_id:
                 self._notification_turn_by_thread[thread_id] = notification_turn_id
@@ -578,8 +665,12 @@ class AppServerClient:
         elif method == "turn/completed":
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id", ""))
-            if thread_id and not self.turn_ownership.observe_completed(thread_id, turn_id):
-                return
+            if thread_id:
+                was_controller_owned = self.turn_ownership.is_controller_turn_open(thread_id)
+                if not self.turn_ownership.observe_completed(thread_id, turn_id):
+                    if was_controller_owned and turn_id:
+                        self._report_unmanaged_turn(thread_id, turn_id)
+                    return
             if thread_id and turn_id:
                 self._notification_turn_by_thread[thread_id] = turn_id
             # A tool-using turn can emit several completed agentMessage items:
@@ -595,19 +686,21 @@ class AppServerClient:
             if completed_messages:
                 self._messages[turn_id] = completed_messages
             waiter = self._turn_waiters.get(turn_id)
-            if waiter and not waiter.done():
-                waiter.set_result(params)
-            else:
-                self._completed_turns[turn_id] = params
             thread_waiter = self._thread_turn_waiters.get(thread_id)
-            if thread_waiter and not thread_waiter.done():
-                thread_waiter.set_result(params)
-            elif thread_id:
-                self._completed_thread_turns[thread_id] = params
-        if self.notification_handler:
-            result = self.notification_handler(redact_auth_material(message))
-            if asyncio.iscoroutine(result):
-                asyncio.create_task(result)
+            matched_waiter = waiter is not None or thread_waiter is not None
+            notified_waiters: set[int] = set()
+            for candidate_waiter in (waiter, thread_waiter):
+                if candidate_waiter is None or id(candidate_waiter) in notified_waiters:
+                    continue
+                notified_waiters.add(id(candidate_waiter))
+                if not candidate_waiter.done():
+                    candidate_waiter.set_result(params)
+            if not matched_waiter:
+                if turn_id:
+                    self._completed_turns[turn_id] = params
+                if thread_id:
+                    self._completed_thread_turns[thread_id] = params
+        self._forward_notification(message)
 
     async def start_thread(
         self,
@@ -678,12 +771,40 @@ class AppServerClient:
             "outputSchema": output_schema,
         }
         self._notification_turn_by_thread.pop(thread_id, None)
+        self._response_turn_by_thread.pop(thread_id, None)
+        self._discard_buffered_completion_for_thread(thread_id)
         self._model_reroutes_by_thread.pop(thread_id, None)
         self.turn_ownership.begin_controller_turn(thread_id)
         try:
             response = await self.request("turn/start", params)
-        except Exception:
+        except asyncio.CancelledError:
+            started_turn_id = self._notification_turn_by_thread.get(thread_id)
+            if started_turn_id:
+                try:
+                    # Do not shield this coroutine. A second cancellation of
+                    # the owning job must cancel and reap the interrupt request
+                    # too, rather than leaving an unowned request Future behind.
+                    await self.interrupt(thread_id, started_turn_id)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._retire_turn_ids(thread_id, started_turn_id or "")
             self.turn_ownership.finish_controller_turn(thread_id)
+            raise
+        except Exception as start_error:
+            started_turn_id = self._notification_turn_by_thread.get(thread_id)
+            containment_error: Exception | None = None
+            if started_turn_id:
+                try:
+                    await self.interrupt(thread_id, started_turn_id)
+                except Exception as exc:
+                    containment_error = exc
+            self._retire_turn_ids(thread_id, started_turn_id or "")
+            self.turn_ownership.finish_controller_turn(thread_id)
+            self._discard_buffered_completion_for_thread(thread_id)
+            if containment_error is not None:
+                raise UnmanagedContinuationError(
+                    "turn/start failed after the remote turn began and containment failed"
+                ) from start_error
             raise
         turn = response["turn"]
         response_turn_id = str(turn["id"])
@@ -699,12 +820,13 @@ class AppServerClient:
         waiter = asyncio.get_running_loop().create_future()
         self._turn_waiters[turn_id] = waiter
         self._thread_turn_waiters[thread_id] = waiter
+        buffered_completion = self._pop_buffered_completion(
+            thread_id, (turn_id, response_turn_id),
+        )
         if str(turn.get("status") or "").lower() in {"completed", "failed", "interrupted"}:
             waiter.set_result({"threadId": thread_id, "turn": turn})
-        elif turn_id in self._completed_turns:
-            waiter.set_result(self._completed_turns.pop(turn_id))
-        elif thread_id in self._completed_thread_turns:
-            waiter.set_result(self._completed_thread_turns.pop(thread_id))
+        elif buffered_completion is not None:
+            waiter.set_result(buffered_completion)
         if on_started:
             self._turn_started_callbacks[thread_id] = on_started
             on_started(turn_id)
@@ -714,6 +836,15 @@ class AppServerClient:
         did_not_stop = False
         try:
             completed = await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
+        except asyncio.CancelledError:
+            try:
+                # The caller owns containment through completion. Shielding
+                # here can orphan the interrupt task if shutdown cancels the
+                # caller a second time while App Server is closing.
+                await self.interrupt(thread_id, turn_id)
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
         except asyncio.TimeoutError:
             timed_out = True
             try:
@@ -728,12 +859,17 @@ class AppServerClient:
             self._turn_waiters.pop(turn_id, None)
             self._thread_turn_waiters.pop(thread_id, None)
             self._turn_started_callbacks.pop(thread_id, None)
+            if not waiter.done():
+                waiter.cancel()
             self.turn_ownership.finish_controller_turn(thread_id)
         terminal_turn = ((completed or {}).get("turn") or {})
         completed_turn_id = str(
             terminal_turn.get("id")
             or self._notification_turn_by_thread.get(thread_id)
             or turn_id
+        )
+        self._retire_turn_ids(
+            thread_id, response_turn_id, turn_id, completed_turn_id,
         )
         self._turn_aliases[response_turn_id] = completed_turn_id
         # Structured output is one JSON document.  Do not concatenate every

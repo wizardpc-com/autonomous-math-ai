@@ -1696,6 +1696,12 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             'python "helpers/emit_event.py" '
             '--project "neutral-project" --file candidate_event.json',
             'python "runtime/runs/r/jobs/j/delegate_mechanical_task.py" task_packet.json',
+            'powershell.exe -Command \'Get-Process python,codex '
+            '-ErrorAction SilentlyContinue | Format-Table -AutoSize\'',
+            'powershell.exe -Command \'Get-Process | Where-Object { '
+            '$_.ProcessName -match "python|codex" }\'',
+            'rg -n "codex|spawn_agent|create_thread" src tests',
+            'Get-ChildItem mechanical_broker; Get-Process codex',
         ):
             allowed = AutonomousController(
                 self.config,
@@ -1739,6 +1745,33 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         })
         self.assertTrue(bypass._internal_failure)
 
+        for forbidden_command in (
+            'powershell.exe -Command \'codex exec --model anything -\'',
+            'powershell.exe -Command \'Get-Date; & "C:\\\\tools\\\\codex.exe" exec\'',
+            'cmd.exe /d /c "codex exec --model anything -"',
+            "bash -lc 'codex exec --model anything -'",
+            'Start-Process -FilePath codex -ArgumentList "exec"',
+            'python -m codex exec --model anything -',
+        ):
+            rejected = AutonomousController(
+                self.config,
+                backend=MockCodexBackend(),
+                mock=True,
+                mechanical_runner=SequenceMechanicalRunner([]),
+            )
+            await rejected._trace_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-rejected",
+                    "turnId": "turn-rejected",
+                    "item": {
+                        "type": "commandExecution",
+                        "command": forbidden_command,
+                    },
+                },
+            })
+            self.assertTrue(rejected._internal_failure, forbidden_command)
+
     async def test_broker_client_tamper_fails_closed_before_request_acceptance(self) -> None:
         controller = AutonomousController(
             self.config,
@@ -1769,6 +1802,122 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             {problem["kind"] for problem in status["problems"]},
         )
 
+    async def test_duplicate_task_job_instances_keep_broker_configs_isolated(self) -> None:
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        controller.lifecycle.transition(
+            LifecyclePhase.RUNNING, reason="unit test duplicate task isolation",
+        )
+        task_id = "stable-duplicate-task"
+        workspaces: list[Path] = []
+        sealed_config_hashes: list[str] = []
+        for suffix in ("first", "second"):
+            job_id = f"job-{suffix}"
+            workspace, _writable, metadata = (
+                controller.workspace.create_job_workspace(
+                    task_id, job_id=job_id,
+                )
+            )
+            future = asyncio.create_task(asyncio.Event().wait())
+            self.parent_futures.append(future)
+            controller.active[job_id] = ActiveJob(
+                job_id,
+                parent_task(task_id, "prover"),
+                future,
+                time.monotonic(),
+                300,
+                "research",
+                str(workspace),
+                "2026-08-20T00:00:00Z",
+                metadata,
+            )
+            controller.workspace.install_mechanical_broker_client(
+                workspace,
+                parent_job_id=job_id,
+                parent_task_id=task_id,
+                parent_role="prover",
+                parent_timeout_seconds=300,
+                enabled=True,
+                broker_client_source=PACKAGE_SOURCE / "delegate_mechanical_task.py",
+                broker_client_sha256=file_digest(
+                    PACKAGE_SOURCE / "delegate_mechanical_task.py"
+                ),
+            )
+            active = controller.active[job_id]
+            active.broker_client_sha256 = file_digest(
+                workspace / "delegate_mechanical_task.py"
+            )
+            active.broker_config_sha256 = file_digest(
+                controller.workspace.mechanical_broker_config_path(workspace)
+            )
+            workspaces.append(workspace)
+            sealed_config_hashes.append(active.broker_config_sha256)
+
+        self.assertNotEqual(workspaces[0], workspaces[1])
+        self.assertNotEqual(
+            controller.workspace.mechanical_broker_config_path(workspaces[0]),
+            controller.workspace.mechanical_broker_config_path(workspaces[1]),
+        )
+        self.assertEqual(
+            file_digest(controller.workspace.mechanical_broker_config_path(workspaces[0])),
+            sealed_config_hashes[0],
+        )
+        self.assertEqual(
+            file_digest(controller.workspace.mechanical_broker_config_path(workspaces[1])),
+            sealed_config_hashes[1],
+        )
+
+        await controller._poll_mechanical_requests()
+
+        self.assertFalse(controller._internal_failure)
+        self.assertNotIn(
+            "MECHANICAL_BROKER_INTEGRITY_FAILURE",
+            [item["kind"] for item in controller.store.replay()],
+        )
+
+    async def test_start_job_rejects_an_already_active_task_id(self) -> None:
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        existing_job_id, _request_path, _response_path = self._activate_parent(
+            controller,
+            role="prover",
+            suffix="duplicate-start-existing",
+            parent_task_id="stable-active-task",
+        )
+        active = controller.active[existing_job_id]
+        original_config_hash = active.broker_config_sha256
+        new_job_id = "job-duplicate-start-new"
+        workspace, writable, _metadata = controller.workspace.create_job_workspace(
+            "stable-active-task", job_id=new_job_id,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "task_id .* already active"):
+            controller._start_job(
+                parent_task("stable-active-task", "prover"),
+                "bounded prompt",
+                controller._schema("worker_result.schema.json"),
+                workspace,
+                writable,
+                "research",
+                estimated_tokens=1,
+                job_id=new_job_id,
+            )
+
+        self.assertEqual(
+            file_digest(controller.workspace.mechanical_broker_config_path(
+                Path(active.workspace or "")
+            )),
+            original_config_hash,
+        )
+
 
 class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
     def test_top_level_roles_keep_their_strong_model_routes(self) -> None:
@@ -1786,7 +1935,9 @@ class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
         bad.write_text(json.dumps(raw), encoding="utf-8")
         migrated = load_config(self.project, bad)
         self.assertIsNone(migrated.max_mechanical_subworkers)
-        self.assertEqual(migrated.migrations_applied, ("7->8", "8->9"))
+        self.assertEqual(
+            migrated.migrations_applied, ("7->8", "8->9", "9->10"),
+        )
 
     def test_subprocess_runner_executes_run_local_pinned_sources(self) -> None:
         manifest_path = self.project / "autonomous/runs/pin-test/policy/MANIFEST.json"

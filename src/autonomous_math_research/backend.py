@@ -51,6 +51,73 @@ class TurnDirective:
 TurnController = Callable[[JobOutcome, int], Awaitable[TurnDirective]]
 
 
+_PROVIDER_QUOTA_CODES = frozenset({
+    "usage_limit_reached", "usage_limit_exceeded", "insufficient_quota",
+    "quota_exceeded", "billing_hard_limit_reached", "spend_limit_reached",
+})
+_PROVIDER_QUOTA_PHRASES = (
+    "you've hit your usage limit",
+    "you have hit your usage limit",
+    "exceeded your current quota",
+    "insufficient quota",
+    "billing hard limit",
+    "usage quota exhausted",
+)
+_PROVIDER_RESET_KEYS = (
+    "provider_reset_at", "reset_at", "resets_at", "resetAt", "resetsAt",
+    "reset_time", "resetTime", "next_reset_at", "nextResetAt",
+)
+
+
+def _error_nodes(value: Any) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    pending: list[Any] = [value]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            nodes.append(current)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return nodes
+
+
+def _provider_quota_details(details: dict[str, Any]) -> dict[str, Any] | None:
+    nodes = _error_nodes(details)
+    codes = {
+        str(node.get(key) or "").strip().casefold()
+        for node in nodes for key in ("code", "type", "error_code", "errorCode")
+    }
+    serialized = json.dumps(details, ensure_ascii=False).casefold()
+    if not (
+        codes & _PROVIDER_QUOTA_CODES
+        or any(phrase in serialized for phrase in _PROVIDER_QUOTA_PHRASES)
+    ):
+        return None
+    normalized = dict(details)
+    reset_at: Any = None
+    for node in nodes:
+        for key in _PROVIDER_RESET_KEYS:
+            candidate = node.get(key)
+            if (
+                isinstance(candidate, (str, int, float))
+                and not isinstance(candidate, bool)
+                and str(candidate).strip()
+            ):
+                reset_at = candidate
+                break
+        if reset_at is not None:
+            break
+    normalized["provider_reset_at"] = reset_at
+    normalized["quota_codes"] = sorted(code for code in codes if code)
+    return normalized
+
+
 def _server_error_details(raw: dict[str, Any]) -> dict[str, Any]:
     details = dict(raw)
     data = details.get("data")
@@ -119,6 +186,9 @@ def _classify_failure(exc: Exception) -> tuple[str, bool, dict[str, Any] | None]
             status = 0
         if code == "invalid_json_schema" or "invalid_json_schema" in serialized:
             return "invalid_output_schema", False, details
+        quota_details = _provider_quota_details(details)
+        if quota_details is not None:
+            return "provider_quota_exhausted", False, quota_details
         if (
             status == 429 or "rate_limit" in code or "rate_limit" in error_type
             or "rate limit" in serialized
@@ -232,6 +302,7 @@ class AppServerBackend:
         token_telemetry = "unknown"
         raw_output = ""
         turn_history: list[dict[str, Any]] = []
+        last_completed_result: dict[str, Any] = {}
         try:
             validate_output_schema_compatibility(
                 output_schema, schema_path=f"{task.output_contract} ({task.role})",
@@ -284,6 +355,7 @@ class AppServerBackend:
                     )
                 parsed = parse_structured_message(raw_output)
                 validate(parsed, output_schema)
+                last_completed_result = dict(parsed)
                 # App Server thread usage is cumulative. Keep the largest
                 # observed component rather than double-counting later turns.
                 for field_name in TokenUsage.__dataclass_fields__:
@@ -325,6 +397,7 @@ class AppServerBackend:
                     "reasoning_output_tokens": turn_usage.reasoning_output_tokens,
                     "total_tokens": turn_usage.total_tokens,
                     "token_telemetry": turn_telemetry,
+                    "token_usage": turn_usage.to_dict(),
                 }
                 turn_history.append(history_row)
                 directive = (
@@ -383,7 +456,8 @@ class AppServerBackend:
             )
             return JobOutcome(
                 job_id=job_id, task_id=task.task_id, role=task.role, claim_id=task.target_claim,
-                status="ERROR", result={}, thread_id=thread_id, turn_id=turn_id,
+                status="ERROR", result=last_completed_result,
+                thread_id=thread_id, turn_id=turn_id,
                 model=model, reasoning_effort=effort,
                 provider=self.provider_name,
                 provider_profile=route_config.get("profile"),
