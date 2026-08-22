@@ -25,6 +25,8 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 - `resources/` contains immutable wire schemas and the bundled policy pack.
 - `canonical_state.py` freezes manifest-declared startup inputs and builds the
   provenance supplied to derived planning views.
+- `canonical_transition.py` owns digest-bound, crash-replayable ClaimGraph and
+  trusted-metadata transactions.
 
 `storage_layer` is a compatibility import wrapper, not a second storage
 implementation.
@@ -36,7 +38,9 @@ the first Director:
 
 ```text
 autonomous/project.json
-    │ resolves canonical_inputs + claim/trust mirrors + optional overlay
+    │ resolves canonical_inputs + ClaimGraph + trusted metadata + optional overlay
+    ▼
+ClaimGraph/trusted/marked-Markdown consistency gate
     ▼
 byte-exact run-local snapshots
     │ path + SHA-256 + available Git HEAD
@@ -52,9 +56,13 @@ fresh Director
 The run-local `canonical_state.json` freezes each unique canonical input once
 and records its role membership. Director inputs are embedded as UTF-8 content
 in the dynamic snapshot, so the Director does not need to reopen project files.
-The claim graph and trusted-state files are snapshotted as startup provenance;
-the refresh does not rewrite them or infer mathematical/trust transitions from
-Markdown.
+The ClaimGraph is loaded into the dynamic snapshot as the sole status and proof-
+frontier authority. Trusted metadata must match its recorded graph digest when
+one is present. Ordinary Markdown remains contextual. A canonical input may
+opt into a strict machine state view with one
+`AMR-CANONICAL-STATE-BEGIN`/`END` block; a malformed or nonmatching block stops
+before backend startup. The refresh does not rewrite any of these files or
+infer mathematical/trust transitions from prose.
 
 A crash resume must match the original frozen canonical inputs. Across fresh
 epochs, a changed canonical or planning-context fingerprint invalidates pending
@@ -81,7 +89,10 @@ fresh audit through a controller-owned lease
 deterministic verification + canonical gate
     │
     ▼
-trusted claim-state transition
+atomic ClaimGraph + trusted-metadata transition
+    │ append-only authorization + before/after snapshots
+    ▼
+committed canonical state
 ```
 
 Producer transcripts are not the trust source. The auditor receives the exact
@@ -103,6 +114,16 @@ BOOTSTRAP → RUNNING → DRAINING_* → SEALED
 Once dispatch leaves `RUNNING`, a continuation cannot reopen the same epoch.
 New information becomes a constraint for a later epoch. A crash resume remains
 within the same epoch; campaign continuation creates a new one.
+
+With `amr run --auto-epochs`, an ordinary epoch-time seal immediately launches
+a new controller and epoch using the latest usable checkpoint. The campaign
+duration remains the outer budget; the last epoch is shortened to the remaining
+time. A fresh controller repeats canonical refresh, consistency checks, stale-
+planning disposal, and derived-state rebuild every time. Only the exact clean
+epoch-time boundary is auto-continuable. Quota pause, canonical/bootstrap
+failure, internal failure, stop-after-epoch steering, final-claim completion,
+and campaign-budget exhaustion terminate the loop. The existing
+`amr campaign continue` command is unchanged.
 
 ### Controller-owned research turns
 
@@ -153,6 +174,15 @@ They have stable content-derived ids, status, dependencies, and evidence paths.
 from that graph; there is no parallel `proof_state`. Legacy v1/v2 graphs gain a
 deterministic root/gap obligation on load. Only an audited canonical transition
 can discharge or refute an obligation.
+
+ClaimGraph schema v3 is also the single machine-readable claim-status source.
+The trusted-state file stores audit provenance and binds to the exact graph
+SHA-256; it is not a second frontier. Controller-authorized changes stage both
+files, append a `PREPARED` record, atomically install the staged bytes, then
+append `COMMITTED`. Recovery accepts only the recorded before or after digest
+for every target and otherwise fails closed. The retained snapshots make the
+transition reviewable and replayable without promoting a model result directly.
+Canonical Markdown is never rewritten by the controller.
 
 Status domains are intentionally separate: `MathStatus` describes the claim
 (`REFUTED` is the code name for the legacy wire value `FAILED`), `TrustStatus`
@@ -236,8 +266,9 @@ Director wave rather than by placing task ids in that field.
 `CORE_CAPSULE` is a bounded rebuildable snapshot, `RESEARCH_MAP` is a derived
 human-readable view, and `ROUTE_LEDGER` records failed approaches and explicit
 retry conditions. None of these derived views can override the canonical claim
-graph or startup-frozen canonical inputs. Both derived views carry the canonical
-state/planning-context fingerprints used to build them. The capsule's 32 KiB
+graph; startup-frozen inputs are contextual and cannot override it either. Both
+derived views carry the canonical state/planning-context fingerprints used to
+build them. The capsule's 32 KiB
 contract is enforced against the exact compact
 UTF-8 bytes written atomically. Oversized nested values and low-priority or old
 derived entries are deterministically compacted, with source, dropped, and

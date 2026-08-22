@@ -47,10 +47,20 @@ amr status --project ./research-target --run latest
 token/cost，确认 canonical inputs、protected paths、独立审计和机械子工背压。省略
 `--mock` 与 `--dry-run` 才会进入真实 provider。
 
+一次启动自动跨 epoch 运行到 campaign 总时长耗尽可使用：
+
+```console
+amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
+```
+
+它不会拉长单个 epoch；每次仍独立封存并重新执行 canonical refresh。quota pause、状态
+冲突/同步失败、内部失败、人工停止或数学完成时不会启动下一 epoch。
+
 ## 恢复与继续
 
 - `--resume` 只用于同一个尚未封存、因崩溃中断的 epoch。
 - `amr campaign continue` 从最近的封存 checkpoint 创建新 epoch。
+- `--auto-epochs` 在同一次命令中重复这一 fresh-epoch 边界，保留原 checkpoint/seal 语义。
 - 对已暂停并封存的 epoch，应先用独立的新 dry-run 验证升级后的 harness，再继续原
   campaign；不要对它使用 `--resume`，也不要把 dry-run 写入原真实 campaign。
 - 历史失败 epoch 保持不可变，新 epoch 只导入仍未终止的 frontier。

@@ -12,9 +12,15 @@ from .storage import atomic_write_json
 
 
 class ClaimGraph:
-    def __init__(self, claims: dict[str, Claim], path: Path | None = None):
+    def __init__(
+        self,
+        claims: dict[str, Claim],
+        path: Path | None = None,
+        updated_at: str | None = None,
+    ):
         self.claims = claims
         self.path = path
+        self.updated_at = updated_at
         self._ensure_proof_obligations()
         self._rebuild_dependents()
 
@@ -25,7 +31,7 @@ class ClaimGraph:
         if version not in {1, 2, 3}:
             raise ValueError(f"unsupported claim graph schema_version: {version}")
         claims = {item["claim_id"]: Claim.from_dict(item) for item in raw["claims"]}
-        return cls(claims, path)
+        return cls(claims, path, raw.get("updated_at"))
 
     def _rebuild_dependents(self) -> None:
         for claim in self.claims.values():
@@ -319,14 +325,19 @@ class ClaimGraph:
                     changed = True
         return blocked
 
+    def to_payload(self, *, updated_at: str | None = None) -> dict[str, Any]:
+        if updated_at is not None:
+            self.updated_at = updated_at
+        self._rebuild_dependents()
+        self.validate()
+        return {
+            "schema_version": 3,
+            "updated_at": self.updated_at,
+            "claims": [self.claims[key].to_dict() for key in sorted(self.claims)],
+        }
+
     def save(self, path: Path | None = None) -> None:
         target = path or self.path
         if target is None:
             raise ValueError("claim graph has no output path")
-        self._rebuild_dependents()
-        self.validate()
-        atomic_write_json(target, {
-            "schema_version": 3,
-            "updated_at": utc_now(),
-            "claims": [self.claims[key].to_dict() for key in sorted(self.claims)],
-        })
+        atomic_write_json(target, self.to_payload(updated_at=utc_now()))

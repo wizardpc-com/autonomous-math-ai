@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from pathlib import Path
@@ -10,8 +11,16 @@ from uuid import uuid4
 
 from autonomous_math_research.claim_graph import ClaimGraph
 from autonomous_math_research.backend import MockCodexBackend
+from autonomous_math_research.canonical_state import (
+    render_markdown_state_block,
+    validate_canonical_mathematical_state,
+)
+from autonomous_math_research.canonical_transition import (
+    CanonicalTransitionStore, bytes_sha256, json_bytes,
+)
 from autonomous_math_research.config import load_config
-from autonomous_math_research.controller import ActiveJob, AutonomousController
+from autonomous_math_research.controller import ActiveJob, AutonomousController, RunResult
+from autonomous_math_research.cli import _run_command
 from autonomous_math_research.engine.scheduler import DynamicScheduler
 from autonomous_math_research.eventing import CandidateInbox
 from autonomous_math_research.initializer import initialize_project
@@ -103,6 +112,13 @@ class NextArchitectureTests(unittest.TestCase):
     def test_startup_refresh_embeds_latest_frontier_after_canonical_update(self) -> None:
         progress = self.project / "state" / "PROGRESS.md"
         progress.write_text("# Progress\n\nFRONTIER-V1\n", encoding="utf-8")
+        graph_path = self.runtime / "state" / "claim_graph.json"
+        graph_payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        graph_payload["claims"][0]["current_gaps"] = ["GRAPH-FRONTIER-V1"]
+        graph_path.write_text(
+            json.dumps(graph_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         first = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=True,
             run_id="canonical-frontier-v1", campaign_id="canonical-frontier-v1",
@@ -112,6 +128,11 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertIn("FRONTIER-V1", first_snapshot)
 
         progress.write_text("# Progress\n\nFRONTIER-V2\n", encoding="utf-8")
+        graph_payload["claims"][0]["current_gaps"] = ["GRAPH-FRONTIER-V2"]
+        graph_path.write_text(
+            json.dumps(graph_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         overlay = self.project / "autonomous" / "prompts" / "director.md"
         overlay.write_text(
             "Stable constraint: exact arithmetic only. Stale frontier: FRONTIER-V1.\n",
@@ -125,6 +146,8 @@ class NextArchitectureTests(unittest.TestCase):
         snapshot_path = second._write_compact_snapshot()
         snapshot_text = snapshot_path.read_text(encoding="utf-8")
         self.assertIn("FRONTIER-V2", snapshot_text)
+        self.assertIn("GRAPH-FRONTIER-V2", snapshot_text)
+        self.assertNotIn("GRAPH-FRONTIER-V1", snapshot_text)
         self.assertNotEqual(
             first._canonical_state["canonical_state_sha256"],
             second._canonical_state["canonical_state_sha256"],
@@ -159,7 +182,7 @@ class NextArchitectureTests(unittest.TestCase):
 
         self.assertIsNone(controller._director_overlay)
         self.assertIn("AMR TOOL-LEVEL DIRECTOR POLICY", prompt)
-        self.assertIn("startup_frozen_canonical_inputs", prompt)
+        self.assertIn('"authority": "controller_claim_graph"', prompt)
         self.assertNotIn("late unpinned overlay", prompt)
 
     def test_canonical_drift_discards_previous_epoch_planning(self) -> None:
@@ -232,6 +255,24 @@ class NextArchitectureTests(unittest.TestCase):
             controller._write_compact_snapshot()
         self.assertFalse(controller._director_active)
 
+    def test_claim_graph_change_after_refresh_blocks_snapshot_and_director(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="claim-graph-race", campaign_id="claim-graph-race",
+        )
+        controller._pin_run_inputs(0.01, True)
+        graph_path = self.runtime / "state" / "claim_graph.json"
+        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        payload["claims"][0]["current_gaps"] = ["unaudited external rewrite"]
+        graph_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside an audited transition"):
+            controller._write_compact_snapshot()
+        self.assertFalse(controller._director_active)
+
     def test_startup_refresh_does_not_rewrite_canonical_files(self) -> None:
         manifest = ProjectManifest.load(self.project)
         canonical_paths = {
@@ -259,6 +300,135 @@ class NextArchitectureTests(unittest.TestCase):
         )
         self.assertEqual(run_manifest["schema_version"], 12)
         self.assertIn("canonical_state", run_manifest)
+
+    def test_stale_trusted_binding_fails_before_model_turn(self) -> None:
+        graph = self.runtime / "state" / "claim_graph.json"
+        trusted = self.runtime / "state" / "nightly_trusted.json"
+        trusted_payload = json.loads(trusted.read_text(encoding="utf-8"))
+        trusted_payload["claim_graph_sha256"] = "0" * 64
+        trusted.write_text(
+            json.dumps(trusted_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        before = {
+            graph: graph.read_bytes(),
+            trusted: trusted.read_bytes(),
+        }
+        backend = MockCodexBackend()
+        controller = AutonomousController(
+            load_config(self.project), backend=backend, mock=True,
+            run_id="stale-trusted-binding",
+            campaign_id="stale-trusted-binding",
+        )
+
+        result = asyncio.run(controller.run(0.01, dry_run=False))
+
+        self.assertTrue(result.internal_failure)
+        self.assertIn("different ClaimGraph digest", result.stopped_reason)
+        self.assertEqual(backend.calls, [])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_conflicting_marked_markdown_fails_before_model_turn(self) -> None:
+        manifest = ProjectManifest.load(self.project)
+        graph_path = manifest.resolve(manifest.claim_graph)
+        graph_payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        block = render_markdown_state_block(
+            graph_payload, file_digest(graph_path),
+        ).replace('"math_status": "OPEN"', '"math_status": "PROVED"', 1)
+        claims = self.project / "claims" / "CLAIMS.md"
+        claims.write_text(
+            claims.read_text(encoding="utf-8") + "\n\n" + block + "\n",
+            encoding="utf-8",
+        )
+        before = claims.read_bytes()
+        backend = MockCodexBackend()
+        controller = AutonomousController(
+            load_config(self.project), backend=backend, mock=True,
+            run_id="markdown-claim-conflict",
+            campaign_id="markdown-claim-conflict",
+        )
+
+        result = asyncio.run(controller.run(0.01, dry_run=False))
+
+        self.assertTrue(result.internal_failure)
+        self.assertIn("Markdown state conflicts", result.stopped_reason)
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(claims.read_bytes(), before)
+
+    def test_canonical_transition_is_auditable_and_replayable(self) -> None:
+        manifest = ProjectManifest.load(self.project)
+        graph_path = manifest.resolve(manifest.claim_graph)
+        trusted_path = manifest.resolve(manifest.trusted_state)
+        claims = self.project / "claims" / "CLAIMS.md"
+        progress = self.project / "state" / "PROGRESS.md"
+        canonical_markdown_before = {
+            claims: claims.read_bytes(),
+            progress: progress.read_bytes(),
+        }
+        graph = ClaimGraph.load(graph_path)
+        graph.claims["C_ROOT"].math_status = "PROVED"
+        graph.claims["C_ROOT"].trust_status = "AUDITED_NIGHTLY"
+        graph.claims["C_ROOT"].current_gaps = []
+        after_graph = graph.to_payload(updated_at="2026-08-22T00:00:00Z")
+        after_graph_bytes = json_bytes(after_graph)
+        after_digest = bytes_sha256(after_graph_bytes)
+        store = CanonicalTransitionStore(
+            project_root=self.project,
+            runtime_root=self.runtime,
+        )
+        targets = {
+            graph_path: after_graph_bytes,
+            trusted_path: json_bytes(
+                json.loads(trusted_path.read_text(encoding="utf-8"))
+            ),
+        }
+
+        transition_id = store.commit(
+            targets=targets,
+            authorization={
+                "kind": "AUDITED_CLAIM_TRANSITION",
+                "candidate_fingerprint": "candidate-audited",
+                "audit_pass_count": 2,
+                "audit_required": 2,
+            },
+            trusted_state_path=trusted_path,
+            claim_graph_sha256=after_digest,
+        )
+
+        records = store.records()
+        self.assertEqual([item["kind"] for item in records], ["PREPARED", "COMMITTED"])
+        self.assertEqual(records[0]["transition_id"], transition_id)
+        self.assertTrue(all(
+            (store.root / transition_id / target["before_snapshot"]).is_file()
+            and (store.root / transition_id / target["after_snapshot"]).is_file()
+            for target in records[0]["targets"]
+        ))
+        self.assertEqual(
+            json.loads(trusted_path.read_text(encoding="utf-8"))["claim_graph_sha256"],
+            after_digest,
+        )
+        validate_canonical_mathematical_state(manifest)
+        self.assertEqual(
+            {path: path.read_bytes() for path in canonical_markdown_before},
+            canonical_markdown_before,
+        )
+
+        prepared = records[0]
+        store.ledger_path.write_text(
+            json.dumps(prepared, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        graph_target = next(
+            item for item in prepared["targets"]
+            if item["path"].endswith("claim_graph.json")
+        )
+        graph_path.write_bytes(
+            (store.root / transition_id / graph_target["before_snapshot"]).read_bytes()
+        )
+
+        self.assertEqual(store.recover(), [transition_id])
+        self.assertEqual(file_digest(graph_path), after_digest)
+        self.assertEqual(store.records()[-1]["kind"], "COMMITTED")
 
     def test_run_id_rejects_path_escape(self) -> None:
         layout = ProjectLayout(self.project)
@@ -321,6 +491,49 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(scheduler.decide(
             pending_audits=16, active_audits=0, tasks=tasks, route_counts={},
         ).target_research, 2)
+
+    def test_same_thread_dispatch_uses_role_specific_turn_limit(self) -> None:
+        class SameThreadMockBackend(MockCodexBackend):
+            def supports_same_thread_continuation(self, role: str) -> bool:
+                return role in {"prover", "falsifier", "explorer"}
+
+        async def scenario() -> None:
+            config = load_config(self.project)
+            config.raw["engine"]["research_max_turns"] = {
+                "prover": 12, "falsifier": 8, "explorer": 6,
+            }
+            controller = AutonomousController(
+                config, backend=SameThreadMockBackend(), mock=True,
+                run_id="same-thread-role-limit",
+                campaign_id="same-thread-role-limit",
+            )
+            controller._pin_run_inputs(0.01, True)
+            controller.lifecycle.transition(
+                LifecyclePhase.RUNNING, reason="test same-thread dispatch",
+            )
+            controller.pending_research = [
+                research_task("same-thread-explorer", route="independent")
+            ]
+
+            await controller._launch_research(capacity=1, allow_exploration=True)
+
+            started = [
+                event for event in controller.store.replay()
+                if event["kind"] == "JOB_STARTED"
+            ]
+            self.assertEqual(len(started), 1)
+            self.assertTrue(started[0]["payload"]["same_thread_multi_turn"])
+            self.assertEqual(started[0]["payload"]["max_turns"], 6)
+            self.assertEqual(
+                started[0]["payload"]["timeout"],
+                started[0]["payload"]["per_turn_timeout"] * 6,
+            )
+            await asyncio.gather(*(
+                active.future for active in controller.active.values()
+            ))
+            await controller._collect_completed()
+
+        asyncio.run(scenario())
 
     def test_high_pressure_admits_high_gain_or_new_representation(self) -> None:
         scheduler = DynamicScheduler(max_research=8, max_audit=8)
@@ -439,6 +652,108 @@ class NextArchitectureTests(unittest.TestCase):
                 stopped_reason="invalid",
                 checkpoint_uri="epoch://invalid/state/checkpoint.json",
             )
+
+    def test_auto_epochs_continue_only_at_clean_epoch_boundaries(self) -> None:
+        config = load_config(self.project)
+        calls: list[argparse.Namespace] = []
+
+        async def execute(args: argparse.Namespace):
+            calls.append(args)
+            index = len(calls)
+            campaign_id = args.campaign_id or "auto-campaign"
+            epoch_id = f"auto-epoch-{index}"
+            store = CampaignStore(self.runtime, campaign_id)
+            store.create(
+                project_id=config.project_name,
+                campaign_hours=2 / 3600.0,
+                epoch_hours=1 / 3600.0,
+            )
+            store.append_epoch_started(
+                epoch_id=epoch_id,
+                previous_epoch_id=args.previous_epoch_id,
+                mode="mock",
+            )
+            checkpoint = self.runtime / "runs" / epoch_id / "state" / "compact_snapshot.json"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("{}\n", encoding="utf-8")
+            final = index == 2
+            reason = (
+                "campaign time budget exhausted" if final
+                else "epoch time limit reached"
+            )
+            status = "STOPPED" if final else "PAUSED"
+            store.append_epoch_sealed(
+                epoch_id=epoch_id,
+                elapsed_seconds=1.0,
+                status=status,
+                stopped_reason=reason,
+                checkpoint_uri=f"epoch://{epoch_id}/state/compact_snapshot.json",
+            )
+            return RunResult(
+                run_id=epoch_id,
+                report_path=self.runtime / f"{epoch_id}.md",
+                stopped_reason=reason,
+                job_count=0,
+                event_count=0,
+                run_mode="mock",
+                campaign_id=campaign_id,
+                epoch_id=epoch_id,
+                campaign_status=status,
+            ), config
+
+        args = argparse.Namespace(
+            project=self.project,
+            workspace_root=None,
+            hours=2 / 3600.0,
+            epoch_hours=1 / 3600.0,
+            max_director=None,
+            max_research_workers=None,
+            max_audit=None,
+            max_mechanical_subworkers=None,
+            budget=None,
+            config=None,
+            profile=None,
+            dry_run=False,
+            mock=True,
+            auto_epochs=True,
+            resume=None,
+            run_id=None,
+            recover_candidates_from=None,
+            campaign_id=None,
+            previous_epoch_id=None,
+        )
+        with (
+            patch(
+                "autonomous_math_research.cli._execute_epoch",
+                side_effect=execute,
+            ),
+            patch("builtins.print"),
+        ):
+            exit_code = asyncio.run(_run_command(args))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].campaign_id, "auto-campaign")
+        self.assertEqual(calls[1].previous_epoch_id, "auto-epoch-1")
+
+    def test_auto_epochs_stop_on_quota_or_internal_failure(self) -> None:
+        from autonomous_math_research.cli import _auto_epoch_allowed
+
+        checkpoint = type("Checkpoint", (), {"remaining_seconds": 100.0})()
+        quota = RunResult(
+            run_id="quota", report_path=self.runtime / "quota.md",
+            stopped_reason="campaign paused: provider quota exhausted",
+            job_count=0, event_count=0, run_mode="real",
+            campaign_status="PAUSED",
+        )
+        failure = RunResult(
+            run_id="failure", report_path=self.runtime / "failure.md",
+            stopped_reason="controller internal error", job_count=0, event_count=0,
+            run_mode="real", internal_failure=True, campaign_status="PAUSED",
+        )
+
+        self.assertFalse(_auto_epoch_allowed(quota, checkpoint))
+        self.assertFalse(_auto_epoch_allowed(failure, checkpoint))
 
     def test_fresh_epoch_imports_valid_pending_research(self) -> None:
         config = load_config(self.project)

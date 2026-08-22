@@ -124,7 +124,15 @@ dry-run、mock 或 real 启动时还会同步打开精确绑定本次 run 的独
 
 每次新 run 会在首轮 Director 前按 `autonomous/project.json` 冻结 canonical inputs 的
 路径、SHA-256 与可用 Git revision，并重建 run-local snapshot、`CORE_CAPSULE` 和
-`RESEARCH_MAP`。动态 canonical 内容覆盖陈旧的项目 Director/frontier 描述；不能安全
-同步的漂移会在模型 turn 前 fail closed，刷新过程不改写 canonical 项目文件。
+`RESEARCH_MAP`。实时 `ClaimGraph` 是数学状态与 proof frontier 的唯一权威；冻结的
+Markdown 仅作为上下文，不能覆盖 ClaimGraph。显式机器状态块若与 ClaimGraph 不一致，
+会在模型 turn 前 fail closed。通过 audit gate 的状态更新会原子提交 ClaimGraph 与摘要
+绑定的 trusted metadata，并保存 append-only 授权记录及前后快照；不会自动改写
+`CLAIMS.md` 或 `PROGRESS.md`。
+
+`amr run --auto-epochs` 会在普通 epoch 时间边界后自动创建全新 epoch，逐 epoch 重做
+canonical refresh 和 planning rebuild，直到 campaign 总时长耗尽。quota pause、无法安全
+处理的 drift、内部失败、人工停止或数学完成都会停止自动续跑；原有
+`amr campaign continue` 仍可用于手动继续。
 
 本项目采用 [MIT License](LICENSE)。

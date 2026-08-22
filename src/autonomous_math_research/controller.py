@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any
+from typing import Any, Iterable
 from uuid import uuid4
 
 from .app_server import redact_auth_material
@@ -19,7 +19,12 @@ from .audit_gate import AuditGate
 from .backend import AppServerBackend, CodexBackend, MockCodexBackend, TurnDirective
 from .canonical_state import (
     capture_canonical_state, director_canonical_view, director_overlay_text,
-    load_canonical_state, validate_canonical_state, verify_live_startup_sources,
+    load_canonical_state, updated_markdown_state_views,
+    validate_canonical_mathematical_state, validate_canonical_state,
+    verify_live_startup_sources,
+)
+from .canonical_transition import (
+    CanonicalTransitionStore, bytes_sha256, json_bytes,
 )
 from .claim_graph import ClaimGraph
 from .config import HarnessConfig, default_max_audit
@@ -534,6 +539,7 @@ class RunResult:
     outcome_path: Path | None = None
     campaign_id: str = ""
     epoch_id: str = ""
+    campaign_status: str = "PAUSED"
 
 
 class AutonomousController:
@@ -590,6 +596,11 @@ class AutonomousController:
             epoch_root=self.run_dir,
         )
         self.live_store = EventStore(self.run_dir / "LIVE_EVENTS.jsonl", self.run_id)
+        self.persist_shared_state = not mock
+        self.canonical_transitions = CanonicalTransitionStore(
+            project_root=config.project_root,
+            runtime_root=self.layout.autonomous_root,
+        )
         self.graph = ClaimGraph.load(self.layout.claim_graph_path)
         self.graph.validate()
         legacy_representation = RepresentationContract.legacy()
@@ -640,7 +651,6 @@ class AutonomousController:
                 "configured final conjecture claim is absent from the claim graph: "
                 f"{self.final_conjecture_claim_id}"
             )
-        self.persist_shared_state = not mock
         if mock:
             mock_graph_path = self.run_dir / "state" / "claim_graph.json"
             if resume and mock_graph_path.is_file():
@@ -1762,7 +1772,129 @@ class AutonomousController:
                 f"RUN_MANIFEST requested_routes.{role}.service_tier",
             )
 
+    def _trusted_state_payload(self, *, transition_kind: str) -> dict[str, Any]:
+        existing: dict[str, Any] = {}
+        if self.layout.trusted_state_path.is_file():
+            loaded = json.loads(
+                self.layout.trusted_state_path.read_text(encoding="utf-8")
+            )
+            if isinstance(loaded, dict):
+                existing = loaded
+        audited = set(existing.get("audited_candidate_fingerprints") or [])
+        audited.update(
+            key for key, value in self.audit_gate.states.items()
+            if value.trust_status == TrustStatus.AUDITED_NIGHTLY
+            and key not in self.conflicted_candidates
+        )
+        return {
+            "schema_version": 4,
+            "updated_at": utc_now(),
+            "source_run": self.run_id,
+            "transition_kind": transition_kind,
+            "claim_graph": (
+                "project://" + self.layout.claim_graph_path.resolve()
+                .relative_to(self.config.project_root.resolve()).as_posix()
+            ),
+            "policy_manifest_sha256": (
+                self.policy_manifest["manifest_sha256"]
+                if self.policy_manifest is not None
+                else existing.get("policy_manifest_sha256")
+            ),
+            "claim_representations": dict(sorted(self.claim_representations.items())),
+            "representation_contracts": {
+                key: self.representation_contracts[key]
+                for key in sorted(self.representation_contracts)
+            },
+            "audited_representation_bridges": [
+                list(pair) for pair in sorted(self.audited_representation_bridges)
+            ],
+            "audited_candidate_fingerprints": sorted(audited),
+            "claim_evidence_levels": {
+                claim_id: claim.evidence_level
+                for claim_id, claim in sorted(self.graph.claims.items())
+                if claim.trust_status in {
+                    TrustStatus.AUDITED_NIGHTLY,
+                    TrustStatus.FORMALLY_VERIFIED,
+                    TrustStatus.CANONICAL_TRUSTED,
+                }
+            },
+        }
+
+    def _accept_authorized_canonical_targets(
+        self, paths: Iterable[Path],
+    ) -> None:
+        self.guard.accept(paths)
+        guard_path = self.run_dir / "canonical_guard.before.json"
+        if guard_path.is_file():
+            atomic_write_json(guard_path, self.guard.baseline)
+
+    def _commit_claim_state_transition(
+        self,
+        *,
+        transition_kind: str,
+        authorization: dict[str, Any],
+    ) -> str | None:
+        if not self.persist_shared_state:
+            self.graph.save()
+            return None
+        self._assert_startup_canonical_sources()
+        manifest = self.layout.manifest
+        if manifest is None:
+            raise ValueError("project manifest is unavailable for canonical transition")
+        graph_payload = self.graph.to_payload(updated_at=utc_now())
+        graph_payload_bytes = json_bytes(graph_payload)
+        graph_digest = bytes_sha256(graph_payload_bytes)
+        markdown_updates = updated_markdown_state_views(
+            manifest,
+            graph_payload=graph_payload,
+            graph_digest=graph_digest,
+        )
+        conflicting_views = [
+            path for path, payload in markdown_updates.items()
+            if path.read_bytes() != payload
+        ]
+        if conflicting_views:
+            raise ValueError(
+                "canonical transition would make a marked Markdown state view stale; "
+                "AMR will not rewrite canonical Markdown automatically"
+            )
+        targets = {
+            self.layout.claim_graph_path: graph_payload_bytes,
+            self.layout.trusted_state_path: json_bytes(
+                self._trusted_state_payload(transition_kind=transition_kind)
+            ),
+        }
+        transition_id = self.canonical_transitions.commit(
+            targets=targets,
+            authorization={
+                "kind": transition_kind,
+                "run_id": self.run_id,
+                **authorization,
+            },
+            trusted_state_path=self.layout.trusted_state_path,
+            claim_graph_sha256=graph_digest,
+        )
+        self._accept_authorized_canonical_targets(targets)
+        self.store.append("CANONICAL_TRANSITION_COMMITTED", {
+            "transition_id": transition_id,
+            "transition_kind": transition_kind,
+            "claim_graph_sha256": graph_digest,
+            "ledger": (
+                "project://" + self.canonical_transitions.ledger_path.resolve()
+                .relative_to(self.config.project_root.resolve()).as_posix()
+            ),
+            "authorization": authorization,
+        })
+        return transition_id
+
     def _reload_startup_claim_state(self) -> None:
+        if self.persist_shared_state:
+            recovered = self.canonical_transitions.recover()
+            for transition_id in recovered:
+                self._accept_authorized_canonical_targets(
+                    self.canonical_transitions.target_paths(transition_id)
+                )
+        validate_canonical_mathematical_state(self.config.manifest)
         graph = ClaimGraph.load(self.layout.claim_graph_path)
         graph.validate()
         if self.mock:
@@ -1870,6 +2002,25 @@ class AutonomousController:
     def _assert_startup_canonical_sources(self) -> None:
         if self._canonical_state is None:
             raise ValueError("startup canonical state has not been refreshed")
+        if self.config.manifest is None:
+            raise ValueError("project manifest is unavailable during state validation")
+        committed_transition = False
+        if self.persist_shared_state:
+            self.canonical_transitions.verify_current()
+            committed_transition = any(
+                record.get("kind") == "COMMITTED"
+                for record in self.canonical_transitions.records()
+            )
+        if not committed_transition:
+            for key, path in (
+                ("claim_graph", self.layout.claim_graph_path),
+                ("trusted_state", self.layout.trusted_state_path),
+            ):
+                if file_digest(path) != self._canonical_state[key]["sha256"]:
+                    raise ValueError(
+                        f"canonical {key} changed outside an audited transition"
+                    )
+        validate_canonical_mathematical_state(self.config.manifest)
         changed = verify_live_startup_sources(
             self._canonical_state,
             project_root=self.config.project_root,
@@ -2710,7 +2861,16 @@ class AutonomousController:
                 self._queue_next_audit(event)
             else:
                 self.batched_observations.append(event)
-        self.graph.save()
+        self._commit_claim_state_transition(
+            transition_kind="RECOVERED_CANDIDATES_REGISTERED",
+            authorization={
+                "source_run_id": source_run_id,
+                "candidate_fingerprints": [
+                    event.fingerprint for event in candidates
+                ],
+                "trust_upgrade": False,
+            },
+        )
 
     def _task_timeout(self, role: str) -> float:
         return self.config.role_timeout(role)
@@ -3770,7 +3930,14 @@ class AutonomousController:
                 claim = self.graph.claims[claim_id]
                 claim.priority["score"] = max(1.0, float(claim.priority.get("score", 0.0)))
                 claim.priority["human_steering_id"] = steering_id
-                self.graph.save()
+                self._commit_claim_state_transition(
+                    transition_kind="HUMAN_PRIORITY_UPDATE",
+                    authorization={
+                        "steering_id": steering_id,
+                        "claim_id": claim_id,
+                        "trust_upgrade": False,
+                    },
+                )
             elif kind == "PAUSE_ROUTE":
                 self.route_ledger.append(
                     route_id=route_id,
@@ -3936,7 +4103,7 @@ class AutonomousController:
                 ),
                 "action": (
                     "rebuild derived planning state and launch a fresh Director "
-                    "from current startup-frozen canonical inputs"
+                    "from the current ClaimGraph and startup-frozen context"
                 ),
             })
             self._request_director(
@@ -4700,12 +4867,17 @@ class AutonomousController:
         self._assert_startup_canonical_sources()
         active_tasks = [active.task.to_dict() for active in self.active.values()]
         snapshot = self.graph.compact_snapshot(active_tasks, self.governor.snapshot(), self.recent_changes)
+        graph_payload = self.graph.to_payload()
+        graph_digest = bytes_sha256(json_bytes(graph_payload))
         canonical_view = director_canonical_view(
-            self._canonical_state, run_dir=self.run_dir,
+            self._canonical_state,
+            run_dir=self.run_dir,
+            claim_graph=graph_payload,
+            claim_graph_sha256=graph_digest,
         )
         snapshot["canonical_state"] = canonical_view
         snapshot["claim_state_provenance"] = {
-            "authority": "controller_claim_mirror",
+            "authority": "controller_claim_graph",
             "sha256": stable_hash({
                 claim_id: claim.to_dict()
                 for claim_id, claim in sorted(self.graph.claims.items())
@@ -4713,9 +4885,9 @@ class AutonomousController:
             "startup_path": self._canonical_state["claim_graph"]["path"],
             "startup_sha256": self._canonical_state["claim_graph"]["sha256"],
             "status_rule": (
-                "The live controller mirror supplies structured claim identities and "
-                "audit-gated transitions. Startup-frozen canonical inputs take "
-                "precedence for human-authored frontier and progress descriptions."
+                "ClaimGraph is the sole mathematical-status and proof-frontier "
+                "authority. Canonical Markdown is context-only unless it contains a "
+                "strict generated state block. Every status upgrade is audit-gated."
             ),
         }
         snapshot["mechanical_token_governor"] = self.mechanical_governor.snapshot()
@@ -5115,9 +5287,11 @@ class AutonomousController:
             and callable(continuation_checker)
             and continuation_checker(task.role)
         )
-        logical_timeout = timeout * (
-            self.research_turn_policy.max_turns if same_thread_research else 1
+        max_turns = (
+            self.research_turn_policy.max_turns_for(task.role)
+            if same_thread_research else 1
         )
+        logical_timeout = timeout * max_turns
         canonical_before = self._canonical_progress_marker(task.target_claim)
         broker_client_sha256: str | None = None
         broker_config_sha256: str | None = None
@@ -5194,9 +5368,7 @@ class AutonomousController:
             "claim_id": task.target_claim, "workspace": str(workspace),
             "timeout": logical_timeout, "per_turn_timeout": timeout,
             "same_thread_multi_turn": same_thread_research,
-            "max_turns": (
-                self.research_turn_policy.max_turns if same_thread_research else 1
-            ),
+            "max_turns": max_turns,
             "start_time": started_at, "workspace_metadata": workspace_metadata,
             "estimated_token_reservation": estimated_tokens,
             "model": selected_model, "reasoning_effort": selected_effort,
@@ -6217,7 +6389,15 @@ class AutonomousController:
                 continue
             self.inbox.persist(event)
             audit_state = self.audit_gate.register(event)
-            self.graph.save()
+            self._commit_claim_state_transition(
+                transition_kind="CANDIDATE_REGISTERED",
+                authorization={
+                    "controller_gate": "candidate provenance and schema validation",
+                    "candidate_fingerprint": event.fingerprint,
+                    "claim_id": event.claim_id,
+                    "trust_upgrade": False,
+                },
+            )
             self.store.append("CANDIDATE_PROCESSED", {
                 "event_id": event.event_id, "fingerprint": event.fingerprint,
                 "claim_id": event.claim_id, "parent_claim_id": event.parent_claim_id,
@@ -7524,48 +7704,28 @@ class AutonomousController:
             self.representation_contracts[event.representation_id] = (
                 event.representation_contract.to_dict()
             )
-            self.graph.save()
             self.stagnation.record(
                 event.claim_id,
                 f"AUDITED_{event.type}",
                 canonical_progress=True,
             )
-            if self.persist_shared_state:
-                atomic_write_json(self.layout.trusted_state_path, {
-                    "schema_version": 3,
-                    "updated_at": utc_now(), "source_run": self.run_id,
-                    "claim_graph": (
-                        "project://" + self.active_graph_path.resolve()
-                        .relative_to(self.config.project_root.resolve()).as_posix()
-                    ),
-                    "policy_manifest_sha256": self.policy_manifest["manifest_sha256"],
-                    "claim_representations": dict(sorted(self.claim_representations.items())),
-                    "representation_contracts": {
-                        key: self.representation_contracts[key]
-                        for key in sorted(self.representation_contracts)
-                    },
-                    "audited_representation_bridges": [
-                        list(pair) for pair in sorted(self.audited_representation_bridges)
-                    ],
-                    "audited_candidate_fingerprints": sorted(
-                        key for key, value in self.audit_gate.states.items()
-                        if value.trust_status == TrustStatus.AUDITED_NIGHTLY
-                        and key not in self.conflicted_candidates
-                    ),
-                    "claim_evidence_levels": {
-                        claim_id: claim.evidence_level
-                        for claim_id, claim in sorted(self.graph.claims.items())
-                        if claim.trust_status in {
-                            TrustStatus.AUDITED_NIGHTLY, TrustStatus.FORMALLY_VERIFIED,
-                            TrustStatus.CANONICAL_TRUSTED,
-                        }
-                    },
-                })
+            transition_id = self._commit_claim_state_transition(
+                transition_kind="AUDITED_CLAIM_TRANSITION",
+                authorization={
+                    "candidate_fingerprint": fingerprint,
+                    "claim_id": event.claim_id,
+                    "candidate_type": event.type,
+                    "audit_pass_count": self.audit_gate.pass_count(fingerprint),
+                    "audit_required": state.required,
+                    "verified_evidence_level": verified_level,
+                },
+            )
             self.store.append("TRUST_STATE_CHANGED", {
                 "claim_id": event.claim_id, "trust_status": trust,
                 "math_status": self.graph.claims[event.claim_id].math_status,
                 "evidence_level": verified_level,
                 "representation_id": event.representation_id,
+                "canonical_transition_id": transition_id,
             })
             self._record_recent_change({
                 "kind": "TRUST_STATE_CHANGED", "claim_id": event.claim_id,
@@ -7971,7 +8131,15 @@ class AutonomousController:
             if claim:
                 penalty = float(self.config.raw["stagnation"].get("priority_penalty", 0.2))
                 claim.priority["score"] = max(0.0, float(claim.priority.get("score", 0.5)) - penalty)
-                self.graph.save()
+                self._commit_claim_state_transition(
+                    transition_kind="CONTROLLER_PRIORITY_UPDATE",
+                    authorization={
+                        "claim_id": outcome.claim_id,
+                        "task_id": task.task_id,
+                        "trust_upgrade": False,
+                        "reason": "audited-state-neutral stagnation diversification",
+                    },
+                )
             constraint = self.stagnation.diversification_constraint(outcome.claim_id, task.route_family)
             self.director_constraints.append(constraint)
             self.store.append("STAGNATION_DIVERSIFY", constraint)
@@ -8173,9 +8341,21 @@ class AutonomousController:
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
             and (self.final_conjecture_proved or self.final_conjecture_refuted)
         )
+        epoch_elapsed = time.monotonic() - self._run_started_monotonic
+        campaign_budget_exhausted = False
+        if (
+            self._campaign_recorded_started
+            and not self._internal_failure
+            and reason == "epoch time limit reached"
+        ):
+            campaign_budget_exhausted = (
+                self.campaign_store.load().remaining_seconds <= epoch_elapsed + 0.01
+            )
+            if campaign_budget_exhausted:
+                reason = "campaign time budget exhausted"
         campaign_status = (
             "COMPLETED" if preliminary_completed else
-            "STOPPED" if self._stop_after_epoch else "PAUSED"
+            "STOPPED" if self._stop_after_epoch or campaign_budget_exhausted else "PAUSED"
         )
         checkpoint_path = self.run_dir / "state" / "compact_snapshot.json"
         try:
@@ -8192,7 +8372,7 @@ class AutonomousController:
             if self._campaign_recorded_started:
                 self.campaign_store.append_epoch_sealed(
                     epoch_id=self.epoch_id,
-                    elapsed_seconds=time.monotonic() - self._run_started_monotonic,
+                    elapsed_seconds=epoch_elapsed,
                     status=campaign_status,
                     stopped_reason=reason,
                     checkpoint_uri=f"epoch://{self.epoch_id}/state/{checkpoint_path.name}",
@@ -8217,14 +8397,14 @@ class AutonomousController:
             run_outcome = (
                 "failed real run" if self._internal_failure else
                 "completed real campaign" if campaign_completed else
-                "stopped real campaign after epoch" if self._stop_after_epoch else
+                "stopped real campaign after epoch" if campaign_status == "STOPPED" else
                 "paused real campaign epoch"
             )
         elif execution_mode == "mock":
             run_outcome = (
                 "failed mock run" if self._internal_failure else
                 "completed mock campaign" if campaign_completed else
-                "stopped mock campaign after epoch" if self._stop_after_epoch else
+                "stopped mock campaign after epoch" if campaign_status == "STOPPED" else
                 "paused mock campaign epoch"
             )
         else:
@@ -8340,6 +8520,7 @@ class AutonomousController:
             outcome_path=outcome_path,
             campaign_id=self.campaign_id,
             epoch_id=self.epoch_id,
+            campaign_status=campaign_status,
         )
 
 

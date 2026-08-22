@@ -28,6 +28,19 @@ Git revision、结构化 claim/trust mirror 与可选 Director overlay。崩溃 
 使用原冻结输入；新 epoch 遇到安全可同步的 canonical 更新时丢弃旧 pending planning 并
 重建动态 snapshot，若仍有无法安全重绑定的 audit frontier 则 fail closed。刷新只写入
 run-local derived state，不改写 `CLAIMS.md`、`PROGRESS.md` 或数学/trust 状态。
+实时 `ClaimGraph` 是数学状态和 proof frontier 的唯一机器权威；trusted metadata 绑定
+ClaimGraph 摘要。Markdown 只有在显式包含 AMR 机器状态块时才参与严格一致性检查，普通
+叙述只是上下文。
+
+无人值守跨 epoch 使用显式 CLI 模式：
+
+```console
+amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
+```
+
+每个新 epoch 保留独立 checkpoint/seal，并重新执行完整启动刷新。只有普通 epoch 时间
+边界会自动续跑；quota pause、fail-closed 状态错误、内部失败、人工停止、数学完成或 campaign
+总时长耗尽都会停止循环。原有 `amr campaign continue` 保持兼容。
 
 `engine` 还声明同线程研究 continuation：`research_max_turns.prover`、
 `.falsifier`、`.explorer` 分别配置，内置默认均为 12；

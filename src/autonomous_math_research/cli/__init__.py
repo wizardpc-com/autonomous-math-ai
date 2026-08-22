@@ -121,6 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--profile", type=Path)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--mock", action="store_true")
+    run.add_argument(
+        "--auto-epochs",
+        action="store_true",
+        help=(
+            "automatically start fresh epochs at ordinary epoch time boundaries "
+            "until the campaign time budget is exhausted"
+        ),
+    )
     run.add_argument("--resume", nargs="?", const="latest")
     run.add_argument("--run-id", help=argparse.SUPPRESS)
     run.add_argument("--campaign-id", help=argparse.SUPPRESS)
@@ -331,7 +339,7 @@ def _mechanical_cap_override(value: str | int | None) -> int | str | None:
     return parsed
 
 
-async def _run_command(args: argparse.Namespace) -> int:
+async def _execute_epoch(args: argparse.Namespace):
     project = _resolve_run_project(args)
     run_id = args.run_id
     resume = bool(args.resume)
@@ -374,6 +382,12 @@ async def _run_command(args: argparse.Namespace) -> int:
     if campaign_hours <= 0 or epoch_hours <= 0:
         raise ValueError("campaign and epoch hours must be positive")
     epoch_hours = min(epoch_hours, campaign_hours)
+    configured_epoch_hours = epoch_hours
+    if args.campaign_id and args.previous_epoch_id:
+        checkpoint = CampaignStore(
+            ProjectLayout(project).autonomous_root, args.campaign_id,
+        ).load()
+        configured_epoch_hours = checkpoint.epoch_hours
     max_audit_override = _resolve_max_audit_override(
         args.max_research_workers, args.max_audit,
     )
@@ -417,10 +431,14 @@ async def _run_command(args: argparse.Namespace) -> int:
         campaign_id=args.campaign_id,
         previous_epoch_id=args.previous_epoch_id,
         campaign_hours=campaign_hours,
-        epoch_hours=epoch_hours,
+        epoch_hours=configured_epoch_hours,
     )
     result = await controller.run(epoch_hours, dry_run=args.dry_run)
-    print(json.dumps({
+    return result, config
+
+
+def _run_result_payload(result, config) -> dict[str, object]:
+    return {
         "run_id": result.run_id, "project": config.project_name,
         "report": str(result.report_path),
         "outcome": str(result.outcome_path) if result.outcome_path else None,
@@ -436,7 +454,68 @@ async def _run_command(args: argparse.Namespace) -> int:
         "internal_failure": result.internal_failure,
         "campaign_id": result.campaign_id,
         "epoch_id": result.epoch_id,
-    }, ensure_ascii=False, indent=2))
+        "campaign_status": result.campaign_status,
+    }
+
+
+def _auto_epoch_allowed(result, checkpoint) -> bool:
+    return bool(
+        not result.internal_failure
+        and result.run_mode not in {"dry-run"}
+        and result.campaign_status == "PAUSED"
+        and result.stopped_reason == "epoch time limit reached"
+        and checkpoint.remaining_seconds > 0
+    )
+
+
+async def _run_command(args: argparse.Namespace) -> int:
+    auto_epochs = bool(getattr(args, "auto_epochs", False))
+    if auto_epochs and (args.resume or args.dry_run):
+        raise ValueError("--auto-epochs cannot be combined with --resume or --dry-run")
+    result, config = await _execute_epoch(args)
+    results = [result]
+    while auto_epochs:
+        campaign = CampaignStore(
+            ProjectLayout(config.project_root).autonomous_root,
+            result.campaign_id,
+        )
+        checkpoint = campaign.load()
+        if not _auto_epoch_allowed(result, checkpoint):
+            break
+        previous_epoch_id = campaign.latest_continuable_epoch()
+        if previous_epoch_id != result.epoch_id:
+            raise ValueError("automatic epoch continuation source is not current")
+        forwarded = argparse.Namespace(
+            project=config.project_root,
+            workspace_root=args.workspace_root,
+            hours=checkpoint.campaign_hours,
+            epoch_hours=min(
+                checkpoint.epoch_hours,
+                checkpoint.remaining_seconds / 3600.0,
+            ),
+            max_director=args.max_director,
+            max_research_workers=args.max_research_workers,
+            max_audit=args.max_audit,
+            max_mechanical_subworkers=args.max_mechanical_subworkers,
+            budget=args.budget,
+            config=args.config,
+            profile=args.profile,
+            dry_run=False,
+            mock=args.mock,
+            auto_epochs=False,
+            resume=None,
+            run_id=None,
+            recover_candidates_from=None,
+            campaign_id=result.campaign_id,
+            previous_epoch_id=previous_epoch_id,
+        )
+        result, config = await _execute_epoch(forwarded)
+        results.append(result)
+    payload = _run_result_payload(result, config)
+    if auto_epochs:
+        payload["epochs_run"] = len(results)
+        payload["epoch_ids"] = [item.epoch_id for item in results]
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 2 if result.internal_failure else 0
 
 
@@ -465,6 +544,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         epoch_hours=epoch_hours, max_director=None, max_research_workers=None,
         max_audit=None, max_mechanical_subworkers=None, budget=None, config=None,
         profile=args.profile, dry_run=args.dry_run, mock=args.mock, resume=None,
+        auto_epochs=False,
         run_id=None, recover_candidates_from=None, campaign_id=args.campaign,
         previous_epoch_id=previous_epoch_id,
     )

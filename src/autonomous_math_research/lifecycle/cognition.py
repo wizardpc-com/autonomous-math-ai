@@ -274,7 +274,7 @@ def write_research_map(
         "# Research Map",
         "",
         "> Derived navigation only; claim graph and independent audits remain authoritative.",
-        "> Startup-frozen canonical inputs override stale planning descriptions.",
+        "> ClaimGraph supplies the current frontier; startup-frozen inputs are context only.",
         "",
         "| Claim | Math | Trust | Evidence | Representation |",
         "|---|---|---|---|---|",

@@ -27,11 +27,24 @@ explicit `--hours` and `--epoch-hours` remain highest priority.
 
 Startup canonical refresh has no configuration switch and cannot be disabled by
 a project or user profile. `amr run` pins manifest-declared canonical inputs,
-their SHA-256 values, available Git revision, structured claim/trust mirrors,
-and the optional Director overlay before any model turn. Crash resume requires
+their SHA-256 values, available Git revision, the authoritative ClaimGraph,
+digest-bound trusted metadata, and the optional Director overlay before any
+model turn. Crash resume requires
 the original pinned inputs. A new epoch discards stale pending planning after a
 safe canonical change, while unresolved audit state that cannot be rebound stops
 fail-closed. The refresh writes only run-local derived state.
+
+Unattended epoch continuation is an explicit CLI mode rather than mutable
+project policy:
+
+```console
+amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
+```
+
+It preserves the configured epoch seal boundary and repeats full startup
+refresh in every new epoch. Only an ordinary epoch-time boundary continues
+automatically; quota pause, fail-closed state/bootstrap errors, internal
+failure, operator stop, completion, or exhausted campaign time stops the loop.
 
 The `engine` section also controls controller-owned research continuation:
 

@@ -129,9 +129,16 @@ recovery, audit leases, and policy enforcement.
 
 Before every new run, AMR freezes the manifest-declared canonical inputs with
 path, SHA-256, and available Git revision, then rebuilds the run-local Director
-snapshot, `CORE_CAPSULE`, and `RESEARCH_MAP`. Current canonical input content
-overrides stale project-Director or prior-planning prose. Unsafe drift stops
+snapshot, `CORE_CAPSULE`, and `RESEARCH_MAP`. The live `ClaimGraph` is the sole
+mathematical-status and proof-frontier authority; frozen Markdown is contextual
+input and cannot override it. Optional machine-readable Markdown state blocks
+must match the graph byte-for-byte or startup fails closed. Unsafe drift stops
 before a model turn; startup refresh never rewrites canonical project files.
+
+Audit-gated claim changes atomically commit the ClaimGraph and its digest-bound
+trusted metadata. Each transition keeps append-only authorization plus before
+and after snapshots for audit and crash replay. It never rewrites `CLAIMS.md`
+or `PROGRESS.md` automatically.
 
 `amr init` generates a neutral example that can live in any directory. The
 engine does not require this source repository, a particular parent directory,
@@ -154,6 +161,12 @@ Epoch transitions are monotone. On budget exhaustion, operator stop, or
 internal failure, the controller stops dispatching and drains healthy in-flight
 work before sealing. It does not turn an internal failure into queue exhaustion
 or silently discard pending candidates.
+
+`amr run --auto-epochs` starts a fresh sealed epoch after each ordinary epoch
+time boundary until the campaign duration is exhausted. Every epoch repeats
+canonical refresh and planning reconstruction. Quota pause, unsafe drift,
+internal failure, operator stop, or a resolved final claim stops the automatic
+loop. `amr campaign continue` remains the manual continuation path.
 
 The Director's falsification, representation-bridge, audit, kill-gate, and route
 novelty rules live in AMR. A project `director.md` is an optional stable

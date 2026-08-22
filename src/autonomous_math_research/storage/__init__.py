@@ -229,6 +229,26 @@ class CanonicalGuard:
         )
         return changed
 
+    def accept(self, paths: Iterable[Path]) -> None:
+        """Advance the baseline only for controller-authorized target files."""
+        protected_roots = [
+            (self.project_root / relative).resolve() for relative in self.protected
+        ]
+        for raw_path in paths:
+            path = raw_path.resolve()
+            if not path.is_relative_to(self.project_root):
+                raise ValueError("authorized canonical target escapes the project")
+            if not any(
+                path == root or path.is_relative_to(root)
+                for root in protected_roots
+            ):
+                continue
+            key = path.relative_to(self.project_root).as_posix()
+            if path.is_file():
+                self.baseline[key] = file_digest(path)
+            else:
+                self.baseline.pop(key, None)
+
 
 def claim_graph_digest(path: Path) -> str:
     return file_digest(path)

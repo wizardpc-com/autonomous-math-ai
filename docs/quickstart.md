@@ -129,6 +129,17 @@ A live campaign is started by omitting `--mock` and `--dry-run`:
 amr run --project ./research-target --hours 12 --epoch-hours 2
 ```
 
+To run fresh sealed epochs unattended until the same 12-hour campaign budget is
+exhausted:
+
+```console
+amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
+```
+
+Automatic continuation occurs only after a clean epoch-time boundary. Quota
+pause, unsafe canonical state, internal failure, operator stop, or mathematical
+completion returns control instead of starting another epoch.
+
 This command is intentionally shown but should not be run until the preceding
 checks are complete.
 
@@ -136,6 +147,8 @@ checks are complete.
 
 - `--resume` is only for the same crashed epoch.
 - `amr campaign continue` creates a new epoch from a sealed checkpoint.
+- `--auto-epochs` repeatedly performs that fresh-epoch boundary during one
+  invocation without changing the checkpoint/seal model.
 - A paused, sealed epoch must be continued, not resumed; validate the updated
   harness with a separate new dry run before continuing the real campaign.
 - Budget or epoch drain stops new dispatch and waits for healthy in-flight work.

@@ -33,16 +33,24 @@ No package code assumes a source checkout or fixed collection layout.
 is required. At each new run, AMR resolves every listed file, reads it once,
 records its project-relative path and SHA-256, copies the exact bytes into the
 run, and records the containing Git `HEAD` when available. The Director-role
-files are embedded in the startup-generated dynamic snapshot. They are the
-current source for frontier and progress descriptions even when a project
-prompt or an older derived planning file says otherwise.
+files are embedded in the startup-generated dynamic snapshot as contextual
+material. They cannot override the dynamic ClaimGraph frontier even when they
+contain stale status prose.
 
-`claim_graph` and `trusted_state` remain explicit structured controller mirrors.
-They are frozen as startup provenance and loaded into the dynamic view, but the
-refresh never edits them, `CLAIMS.md`, `PROGRESS.md`, mathematical status, or
-trust status. AMR does not attempt a conjecture-specific Markdown-to-claim-graph
-migration. A state change that cannot be represented safely therefore fails
-closed instead of guessing.
+`claim_graph` is the single machine-readable mathematical-status and proof-
+frontier authority. `trusted_state` records audit provenance and, after the
+first controller transition, binds to the exact ClaimGraph SHA-256. Legacy
+unbound trusted files remain readable for compatibility. A canonical Markdown
+input can opt into strict consistency checking by containing exactly one
+`<!-- AMR-CANONICAL-STATE-BEGIN -->` / `<!-- AMR-CANONICAL-STATE-END -->`
+generated JSON block. Unmarked Markdown is prose context, not a second state
+store. A malformed or conflicting marked view fails before any model turn.
+
+Startup refresh never edits the graph, trusted metadata, `CLAIMS.md`, or
+`PROGRESS.md`. Audit-gated controller transitions atomically update only the
+graph and trusted metadata, with append-only authorization and before/after
+snapshots under `runtime_root/state/canonical_transitions`. AMR never promotes
+candidate output on its own and never rewrites canonical Markdown.
 
 `prompt_root/director.md` is optional. When present it is a stable
 project-specific constraints overlay only. Generic falsification, representation,
