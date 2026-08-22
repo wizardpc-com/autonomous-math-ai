@@ -8,6 +8,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Attempt-scoped crash recovery events, run-manifest runtime provenance, and
+  unattended `--resume --auto-epochs` continuation.
+
 - Configuration schema v11 with an explicit provider-execution fallback policy;
   older configs migrate in memory.
 - Configuration schema v10 with per-role research turn bounds and normalized
@@ -31,6 +34,12 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   diagnostic-only reasoning health monitor.
 
 ### Changed
+
+- Resume now hydrates campaign identity before controller construction,
+  rebuilds derived frontier state from append-only evidence, preserves the
+  original failure and absolute deadline, and never seals or rewrites planning
+  state after a pre-recovery failure. Monitor exits retain actionable failure
+  reasons and artifact paths.
 
 - Mechanical Spark execution failures now continue once on the configured Luna
   medium fallback, while policy, schema, protocol, and artifact failures remain

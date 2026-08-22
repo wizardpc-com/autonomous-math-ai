@@ -97,12 +97,19 @@ def build_status(
     campaign_id: str | None = None
     epoch_id: str | None = None
     campaign_status: str | None = None
+    report_path: str | None = None
+    outcome_path: str | None = None
     last_rates: dict[str, Any] | None = None
     problems: list[dict[str, Any]] = []
     for event in records:
         kind = str(event.get("kind", ""))
         payload = event.get("payload") or {}
-        if kind == "RUN_STARTED":
+        if kind in {"RUN_STARTED", "ATTEMPT_STARTED"}:
+            if kind == "ATTEMPT_STARTED":
+                stop_reason = None
+                run_outcome = None
+                internal_failure = None
+                campaign_status = None
             execution_mode = str(
                 payload.get("execution_mode")
                 or payload.get("mode")
@@ -127,7 +134,7 @@ def build_status(
             if not payload.get("cache_reused"):
                 mechanical_usage.append(dict(payload.get("token_usage") or {}))
                 mechanical_telemetry.append(str(payload.get("token_telemetry") or "unknown"))
-        elif kind == "RUN_STOPPED":
+        elif kind in {"RUN_STOPPED", "ATTEMPT_FAILED"}:
             stop_reason = str(payload.get("reason") or "stopped")
             execution_mode = str(
                 payload.get("execution_mode") or payload.get("mode") or execution_mode or ""
@@ -140,6 +147,8 @@ def build_status(
             campaign_id = str(payload.get("campaign_id") or "") or campaign_id
             epoch_id = str(payload.get("epoch_id") or "") or epoch_id
             campaign_status = str(payload.get("campaign_status") or "") or campaign_status
+            report_path = str(payload.get("report") or "") or report_path
+            outcome_path = str(payload.get("outcome") or "") or outcome_path
         if kind in {
             "DIRECTOR_REJECTED", "TASK_REJECTED", "AUDIT_ERROR",
             "CANDIDATE_QUARANTINED", "CANONICAL_GUARD_FAILED",
@@ -151,6 +160,7 @@ def build_status(
             "MECHANICAL_SUBTASK_FAILED", "MECHANICAL_LIFECYCLE_INVARIANT_FAILED",
             "UNAUTHORIZED_DELEGATION_ATTEMPT", "MECHANICAL_BROKER_INTEGRITY_FAILURE",
             "MECHANICAL_ROUTE_CACHE_PERSIST_FAILED",
+            "ATTEMPT_FAILED",
         }:
             problems.append({
                 "sequence": event.get("sequence"), "kind": kind,
@@ -234,6 +244,8 @@ def build_status(
         "campaign_id": campaign_id or run_dir.name,
         "epoch_id": epoch_id or run_dir.name,
         "campaign_status": campaign_status,
+        "report": report_path,
+        "outcome": outcome_path,
         "state": "STOPPED" if stop_reason is not None else "RUNNING",
         "stop_reason": stop_reason,
         "execution_mode": execution_mode,
@@ -401,8 +413,12 @@ def format_event(event: dict[str, Any]) -> str:
             ("audit", payload.get("max_audit")),
             ("mechanical", "unbounded" if mechanical_cap is None else mechanical_cap),
         ]
-    elif kind == "RUN_STOPPED":
-        fields = [("reason", payload.get("reason"))]
+    elif kind in {"RUN_STOPPED", "ATTEMPT_FAILED"}:
+        fields = [
+            ("reason", payload.get("reason")),
+            ("report", payload.get("report")),
+            ("outcome", payload.get("outcome")),
+        ]
     else:
         for key in (
             "role", "task_id", "claim_id", "event_id", "verdict", "trust_status",
@@ -998,6 +1014,7 @@ def format_chat_lifecycle_event(event: dict[str, Any]) -> str | None:
         "JOB_CANCEL_FAILED", "CONTROLLER_ERROR", "BACKEND_CLOSE_FAILED", "BOOTSTRAP_FAILED",
         "RESEARCH_JOB_FAILED", "TASK_RETAINED_AFTER_ERROR", "AUDIT_RETAINED_AFTER_ERROR",
         "CONTROLLER_INVARIANT_FAILED", "DIRECTOR_AUDIT_REQUEST_REJECTED", "CANDIDATE_REJECTED",
+        "ATTEMPT_FAILED",
     }:
         detail = payload.get("error") or payload.get("reason") or payload.get("changed") or kind
         return f"{prefix('警告')} {_compact(detail, 240)}"
@@ -1010,6 +1027,10 @@ def format_chat_lifecycle_event(event: dict[str, Any]) -> str | None:
         return f"{prefix('错误')} 启动前输出 schema 检查失败；模型未启动。{_compact(detail, 240)}"
     if kind == "RUN_STOPPED":
         return f"{prefix('结束')} 自主研究已停止：{_reason_text(payload.get('reason'))}"
+    if kind == "ATTEMPT_STARTED":
+        return f"{prefix('恢复')} Controller attempt 已启动，正在执行启动完整性检查"
+    if kind == "RECOVERY_COMPLETED":
+        return f"{prefix('恢复')} 崩溃状态重建完成，研究可以安全继续"
     return None
 
 
@@ -1690,6 +1711,8 @@ class _MonitorDashboardState:
         self.event_count += 1
         kind = str(event.get("kind") or "")
         payload = event.get("payload") or {}
+        if kind in {"RUN_STARTED", "ATTEMPT_STARTED"}:
+            self.state = "RUNNING"
         if kind == "RUN_STARTED":
             self.started_at = _parse_timestamp(event.get("timestamp"))
             self.global_budget = payload.get("global_budget")
@@ -1809,7 +1832,7 @@ class _MonitorDashboardState:
             self.state = "DRAINING"
         elif kind == "TOKEN_BUDGET_DRAIN_COMPLETED":
             self.state = "FINALIZING"
-        elif kind == "RUN_STOPPED":
+        elif kind in {"RUN_STOPPED", "ATTEMPT_FAILED"}:
             self.state = "STOPPED"
             self.stop_reason = str(payload.get("reason") or "stopped")
 
@@ -2477,6 +2500,34 @@ def _print_watch_event(
         terminal_ui.set_event_context(None)
 
 
+def _watch_terminal_message(
+    payload: dict[str, Any], *, chat: bool, already_stopped: bool,
+) -> str:
+    reason = _compact(payload.get("reason") or payload.get("stop_reason") or "stopped", 240)
+    internal_failure = bool(payload.get("internal_failure"))
+    report = _compact(payload.get("report"), 180)
+    outcome = _compact(payload.get("outcome"), 180)
+    if not chat:
+        state = "failed" if internal_failure else "stopped"
+        prefix = "Run is already" if already_stopped else "Run"
+        return (
+            f"{prefix} {state}; reason={reason}; report={report}; outcome={outcome}."
+        )
+    clock = datetime.now().astimezone().strftime("%H:%M:%S")
+    state = "内部失败" if internal_failure else "正常结束"
+    return (
+        f"{clock} [监视器｜退出] {state}｜原因：{reason}｜"
+        f"报告：{report}｜结果：{outcome}"
+    )
+
+
+def _hold_failed_monitor() -> None:
+    try:
+        input("监视器因内部失败而停留；按 Enter 关闭窗口。")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def watch_run(
     run_dir: Path,
     *,
@@ -2490,6 +2541,7 @@ def watch_run(
     ui_mode: str = "auto",
     color_mode: str = "auto",
     fold_repeats: bool = True,
+    hold_on_error: bool | None = None,
 ) -> int:
     if tail < 0:
         raise ValueError("--tail must be non-negative")
@@ -2510,6 +2562,7 @@ def watch_run(
     initial_lifecycle = load_events(path)
     initial_live = load_events(live_path) if live_path.is_file() else []
     is_tty = bool(getattr(base_stream, "isatty", lambda: False)())
+    effective_hold_on_error = is_tty if hold_on_error is None else hold_on_error
     use_tui = bool(
         chat and not raw_json and ui_mode != "plain"
         and (ui_mode == "tui" or (is_tty and snapshot["state"] == "RUNNING"))
@@ -2592,15 +2645,12 @@ def watch_run(
                 "[监视器｜等待] 正在等待多 Agent 活动流；旧运行可能不支持该视图。",
                 file=stream,
             )
-        if snapshot["state"] == "STOPPED" or any(
-            event.get("kind") == "RUN_STOPPED" for event, is_live in combined if not is_live
-        ):
+        if snapshot["state"] == "STOPPED":
             if renderer is not None:
                 renderer.close()
-            exit_message = (
-                f"{datetime.now().astimezone().strftime('%H:%M:%S')} "
-                "[监视器｜退出] 该研究运行已经结束。"
-            ) if chat and not raw_json else "Run is already stopped; watcher exiting."
+            exit_message = _watch_terminal_message(
+                snapshot, chat=chat and not raw_json, already_stopped=True,
+            )
             if terminal_ui is not None:
                 terminal_ui.refresh(dashboard_lines())
                 terminal_ui.close()
@@ -2610,7 +2660,9 @@ def watch_run(
                 )
             else:
                 print(exit_message, file=stream, flush=True)
-            return 0
+            if effective_hold_on_error and snapshot.get("internal_failure"):
+                _hold_failed_monitor()
+            return 2 if snapshot.get("internal_failure") else 0
         stream.flush()
         last_event_at = time.monotonic()
         next_heartbeat = last_event_at + heartbeat_seconds if heartbeat_seconds else float("inf")
@@ -2635,15 +2687,16 @@ def watch_run(
                     stream, event, live=is_live, raw_json=raw_json, chat=chat,
                     renderer=renderer,
                 )
-                if not is_live and event.get("kind") == "RUN_STOPPED":
+                if not is_live and event.get("kind") in {"RUN_STOPPED", "ATTEMPT_FAILED"}:
                     stopped = True
+                    terminal_payload = event.get("payload") or {}
             if stopped:
                 if renderer is not None:
                     renderer.close()
-                exit_message = (
-                    f"{datetime.now().astimezone().strftime('%H:%M:%S')} "
-                    "[监视器｜退出] 研究运行已结束。"
-                ) if chat and not raw_json else "Run stopped; watcher exiting."
+                exit_message = _watch_terminal_message(
+                    terminal_payload, chat=chat and not raw_json,
+                    already_stopped=False,
+                )
                 if terminal_ui is not None:
                     terminal_ui.refresh(dashboard_lines())
                     terminal_ui.close()
@@ -2653,7 +2706,9 @@ def watch_run(
                     )
                 else:
                     print(exit_message, file=stream, flush=True)
-                return 0
+                if effective_hold_on_error and terminal_payload.get("internal_failure"):
+                    _hold_failed_monitor()
+                return 2 if terminal_payload.get("internal_failure") else 0
             if updates:
                 last_event_at = time.monotonic()
                 next_heartbeat = last_event_at + heartbeat_seconds if heartbeat_seconds else float("inf")

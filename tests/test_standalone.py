@@ -21,8 +21,8 @@ from autonomous_math_research.controller import (
 from autonomous_math_research.lifecycle.campaign import CampaignStore
 from autonomous_math_research.lifecycle.state import LifecyclePhase, MonotoneLifecycle
 from autonomous_math_research.resources import policy_resource, schema_resource
-from autonomous_math_research.monitor import resolve_run
-from autonomous_math_research.storage import ProjectLayout, file_digest
+from autonomous_math_research.monitor import resolve_run, watch_run
+from autonomous_math_research.storage import EventStore, ProjectLayout, file_digest
 from autonomous_math_research.storage_layer.steering import append_steering, ingest_asset
 
 
@@ -63,6 +63,72 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(result["jobs_started"], 0)
         self.assertFalse(result["internal_failure"])
+
+    def test_monitor_persists_attempt_failure_reason_and_paths(self) -> None:
+        run_dir = self.root / "monitor-attempt-failure"
+        run_dir.mkdir()
+        store = EventStore(run_dir / "EVENTS.jsonl", run_dir.name)
+        store.append("ATTEMPT_STARTED", {
+            "attempt_id": "attempt-1", "campaign_id": "campaign-1",
+            "epoch_id": run_dir.name, "mode": "mock",
+        })
+        store.append("ATTEMPT_FAILED", {
+            "attempt_id": "attempt-1", "internal_failure": True,
+            "reason": "resume manifest mismatch",
+            "report": "E:/reports/NIGHTLY_REPORT.md",
+            "outcome": "E:/outcomes/OUTCOME.md",
+        })
+        output = StringIO()
+
+        code = watch_run(
+            run_dir, chat=True, output=output, ui_mode="plain",
+            color_mode="never", hold_on_error=False,
+        )
+
+        rendered = output.getvalue()
+        self.assertEqual(code, 2)
+        self.assertIn("内部失败", rendered)
+        self.assertIn("resume manifest mismatch", rendered)
+        self.assertIn("E:/reports/NIGHTLY_REPORT.md", rendered)
+        self.assertIn("E:/outcomes/OUTCOME.md", rendered)
+
+    def test_campaign_continue_reports_exact_resume_command_for_unsealed_epoch(self) -> None:
+        self._init()
+        store = CampaignStore(
+            ProjectLayout(self.project).autonomous_root, "unsealed-campaign",
+        )
+        store.create(project_id="neutral-project")
+        store.append_epoch_started(
+            epoch_id="unsealed-epoch", previous_epoch_id=None, mode="mock",
+        )
+
+        code, payload = self._cli([
+            "campaign", "continue", "--project", str(self.project),
+            "--campaign", "unsealed-campaign",
+        ])
+
+        self.assertEqual(code, 2)
+        self.assertIn("--resume \"unsealed-epoch\"", payload["error"])
+
+    def test_campaign_continue_rejects_superseded_legacy_ghost(self) -> None:
+        self._init()
+        store = CampaignStore(
+            ProjectLayout(self.project).autonomous_root, "ghost-campaign",
+        )
+        store.create(project_id="neutral-project")
+        store.mark_superseded(
+            by_campaign_id="original-campaign",
+            epoch_id="ghost-epoch",
+            reason="legacy metadata reconciliation",
+        )
+
+        code, payload = self._cli([
+            "campaign", "continue", "--project", str(self.project),
+            "--campaign", "ghost-campaign",
+        ])
+
+        self.assertEqual(code, 2)
+        self.assertIn("superseded campaign cannot be continued", payload["error"])
 
     def test_campaign_continue_forwards_a_complete_run_namespace(self) -> None:
         self._init()

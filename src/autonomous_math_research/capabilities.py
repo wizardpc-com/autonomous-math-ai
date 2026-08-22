@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
 import shutil
 import subprocess
@@ -60,6 +61,7 @@ def inspect_generated_schema(codex: str = "codex", work_root: Path | None = None
         return {
             "codex_version": local_codex_version(executable),
             "schema_file": path.name,
+            "schema_sha256": sha256(path.read_bytes()).hexdigest(),
             "methods": {name: f'"{name}"' in encoded for name in REQUIRED_METHODS},
             "notifications": {name: f'"{name}"' in encoded for name in REQUIRED_NOTIFICATIONS},
             "thread_token_usage_fields": _definition_properties(raw, "TokenUsageBreakdown"),

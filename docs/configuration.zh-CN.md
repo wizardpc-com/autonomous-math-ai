@@ -42,6 +42,17 @@ amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
 边界会自动续跑；quota pause、fail-closed 状态错误、内部失败、人工停止、数学完成或 campaign
 总时长耗尽都会停止循环。原有 `amr campaign continue` 保持兼容。
 
+崩溃后可在同一次无人值守命令中先恢复原 epoch，再继续 fresh epoch：
+
+```console
+amr run --project ./research-target --resume EPOCH_ID --auto-epochs
+```
+
+resume 从原 RUN_MANIFEST 恢复 campaign 归属、时长和绝对 deadline；冲突的时长、
+campaign、mode 或 pinned config 覆盖会在 recovery 前 fail closed。pre-recovery 失败只
+终止本次 controller attempt，不封存 epoch，也不覆盖 planning snapshot。存在未封存
+epoch 时，`amr campaign continue` 会返回准确的 resume 命令。
+
 `engine` 还声明同线程研究 continuation：`research_max_turns.prover`、
 `.falsifier`、`.explorer` 分别配置，内置默认均为 12；
 `reasoning_health_short_tokens` 默认 600；

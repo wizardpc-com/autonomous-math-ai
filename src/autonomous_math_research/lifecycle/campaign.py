@@ -12,7 +12,9 @@ from ..storage import append_jsonl, atomic_write_json, read_jsonl, validate_stor
 CAMPAIGN_SCHEMA_VERSION = 1
 DEFAULT_CAMPAIGN_HOURS = 12.0
 DEFAULT_EPOCH_HOURS = 2.0
-CAMPAIGN_STATUSES = frozenset({"ACTIVE", "PAUSED", "STOPPED", "COMPLETED"})
+CAMPAIGN_STATUSES = frozenset({
+    "ACTIVE", "PAUSED", "STOPPED", "COMPLETED", "SUPERSEDED",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +116,11 @@ class CampaignStore:
             raise ValueError(f"campaign is not continuable: {current.status}")
         if epoch_id in current.epochs:
             return
+        active_epoch = self.unsealed_epoch()
+        if active_epoch is not None:
+            raise ValueError(
+                f"campaign has an unsealed epoch and cannot start another: {active_epoch}"
+            )
         append_jsonl(self.epochs_path, {
             "schema_version": 1,
             "kind": "EPOCH_STARTED",
@@ -165,6 +172,60 @@ class CampaignStore:
 
     def events(self) -> list[dict[str, Any]]:
         return read_jsonl(self.epochs_path)
+
+    def unsealed_epoch(self) -> str | None:
+        records = self.events()
+        started = [
+            str(record.get("epoch_id") or "")
+            for record in records if record.get("kind") == "EPOCH_STARTED"
+        ]
+        sealed = {
+            str(record.get("epoch_id") or "")
+            for record in records if record.get("kind") == "EPOCH_SEALED"
+        }
+        active = [epoch_id for epoch_id in started if epoch_id not in sealed]
+        if len(active) > 1:
+            raise ValueError("campaign has multiple unsealed epochs")
+        return active[0] if active else None
+
+    def require_unsealed_epoch(
+        self, *, epoch_id: str, previous_epoch_id: str | None,
+    ) -> None:
+        validate_storage_id(epoch_id, "epoch_id")
+        records = self.events()
+        starts = [
+            record for record in records
+            if record.get("kind") == "EPOCH_STARTED" and record.get("epoch_id") == epoch_id
+        ]
+        if len(starts) != 1:
+            raise ValueError("resumed epoch must have exactly one campaign start record")
+        if starts[0].get("previous_epoch_id") != previous_epoch_id:
+            raise ValueError("resumed epoch predecessor does not match the campaign ledger")
+        if self.unsealed_epoch() != epoch_id:
+            raise ValueError(f"epoch is not the active unsealed campaign epoch: {epoch_id}")
+
+    def mark_superseded(
+        self, *, by_campaign_id: str, epoch_id: str, reason: str,
+    ) -> None:
+        validate_storage_id(by_campaign_id, "by_campaign_id")
+        validate_storage_id(epoch_id, "epoch_id")
+        current = self.load()
+        if current.status == "SUPERSEDED":
+            return
+        if current.status not in {"ACTIVE", "PAUSED", "STOPPED"}:
+            raise ValueError(f"campaign cannot be superseded from {current.status}")
+        append_jsonl(self.epochs_path, {
+            "schema_version": 1,
+            "kind": "CAMPAIGN_SUPERSEDED",
+            "campaign_id": self.campaign_id,
+            "epoch_id": epoch_id,
+            "by_campaign_id": by_campaign_id,
+            "reason": reason,
+            "timestamp": utc_now(),
+        })
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "SUPERSEDED"
+        atomic_write_json(self.manifest_path, manifest)
 
     def latest_continuable_epoch(self) -> str | None:
         """Return the newest sealed checkpoint that can safely seed an epoch.

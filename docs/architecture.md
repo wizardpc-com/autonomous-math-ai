@@ -104,6 +104,14 @@ A campaign is a long-horizon research effort. It contains append-only epochs;
 each epoch contains top-level jobs and isolated mechanical subtasks. Epochs are
 the units of sealing, recovery, policy pinning, and handoff.
 
+A controller process is an attempt within an epoch. `ATTEMPT_STARTED`,
+`RECOVERY_COMPLETED`, and `ATTEMPT_FAILED` record that process lifecycle without
+pretending that the epoch ended. Resume validates the original `RUN_MANIFEST`,
+including campaign identity and absolute deadline, before constructing a
+controller or writing a campaign record. A failure before recovery leaves the
+epoch unsealed and does not rewrite `compact_snapshot`, `CORE_CAPSULE`, or
+`RESEARCH_MAP`.
+
 The lifecycle is monotone:
 
 ```text
@@ -124,6 +132,10 @@ epoch-time boundary is auto-continuable. Quota pause, canonical/bootstrap
 failure, internal failure, stop-after-epoch steering, final-claim completion,
 and campaign-budget exhaustion terminate the loop. The existing
 `amr campaign continue` command is unchanged.
+
+The same loop may follow a crash recovery with
+`amr run --resume EPOCH_ID --auto-epochs`: the resumed epoch must first recover
+and seal cleanly before a fresh epoch is admitted.
 
 ### Controller-owned research turns
 
@@ -162,9 +174,14 @@ start or completion id remains an unmanaged continuation and fails closed.
 Cancellation and a failed `turn/start` response attempt to interrupt any remote
 turn already observed before releasing controller ownership.
 
-Crash recovery never guesses how far an interrupted proof got. It preserves
-completed-turn events, interrupts the stale remote turn, and requeues the exact
-task under the existing bounded retry policy.
+Crash recovery never guesses how far an interrupted proof got or trusts the
+latest derived snapshot. It reconstructs the Director watermark and frontier
+from append-only events, digest-bound research checkpoints, and the startup
+canonical snapshot; stale jobs receive an explicit terminal reconciliation
+before their exact tasks are requeued under the existing bounded retry policy.
+The rebuilt snapshot records its attempt, generation, event watermark, and
+canonical/planning hashes. The original absolute epoch deadline remains
+authoritative, so restarting a controller cannot extend an epoch.
 
 ### Canonical proof frontier
 
@@ -254,6 +271,13 @@ Events and route records are append-only. Candidate artifacts are copied into
 content-addressed bundles before audit. Durable references use `project://`,
 `campaign://`, or `epoch://` URIs, so evidence does not depend on a machine's
 absolute path.
+
+New `RUN_MANIFEST` records use schema v13 and pin the AMR version and source
+digest, Python version, Git revision when available, Codex CLI version, and App
+Server schema/required-protocol digests. AMR source changes fail resume closed.
+A Codex CLI/schema change is accepted only when the required protocol digest is
+unchanged and the compatible change is appended to the epoch events. Schema-v12
+manifests remain resumable under an explicit legacy-provenance event.
 
 Director `required_files` accepts those durable URIs as well as legacy
 project-relative or project-contained absolute paths. The controller resolves

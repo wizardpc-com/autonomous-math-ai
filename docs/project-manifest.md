@@ -58,6 +58,13 @@ audit, kill-gate, novelty, and bounded-routing behavior belongs to AMR. Existing
 project manifests and Director files continue to load, but any stale frontier or
 progress prose in the overlay is subordinate to the dynamic canonical snapshot.
 
+No project-manifest migration is required for crash recovery. The separate
+run-local `RUN_MANIFEST` is schema v13 for new epochs and pins campaign/epoch
+identity, absolute timing, AMR source provenance, and Codex App Server protocol
+provenance. Resume validates that record before any campaign write. Existing
+schema-v12 run manifests remain readable; they are marked as legacy-unpinned in
+the append-only event log rather than rewritten.
+
 `amr init <directory> [--project-id ID] [--final-claim-id ID]` creates a neutral
 complete skeleton. `amr validate --strict` additionally requires every scaffold
 directory and checklist, exact claim-ID agreement, nonempty canonical inputs,

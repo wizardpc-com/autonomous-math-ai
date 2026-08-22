@@ -46,6 +46,20 @@ refresh in every new epoch. Only an ordinary epoch-time boundary continues
 automatically; quota pause, fail-closed state/bootstrap errors, internal
 failure, operator stop, completion, or exhausted campaign time stops the loop.
 
+After a crash, the same unattended mode can continue from the interrupted
+epoch:
+
+```console
+amr run --project ./research-target --resume EPOCH_ID --auto-epochs
+```
+
+Resume restores campaign identity, duration, and the absolute epoch deadline
+from the run manifest. Conflicting duration, campaign, mode, or pinned
+configuration values fail before recovery. A pre-recovery failure is
+attempt-terminal only: it neither seals the epoch nor replaces its planning
+snapshot. `amr campaign continue` reports the exact resume command while an
+unsealed epoch exists.
+
 The `engine` section also controls controller-owned research continuation:
 
 - `research_max_turns.prover`, `.falsifier`, and `.explorer` (each defaulting

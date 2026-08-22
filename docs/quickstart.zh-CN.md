@@ -61,6 +61,12 @@ amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
 - `--resume` 只用于同一个尚未封存、因崩溃中断的 epoch。
 - `amr campaign continue` 从最近的封存 checkpoint 创建新 epoch。
 - `--auto-epochs` 在同一次命令中重复这一 fresh-epoch 边界，保留原 checkpoint/seal 语义。
+- 崩溃恢复后继续无人值守可用
+  `amr run --project PATH --resume EPOCH_ID --auto-epochs`；只有原 epoch 安全恢复并封存后
+  才会启动下一 epoch。
+- 若 `campaign continue` 发现未封存 epoch，会直接给出对应的 `--resume` 命令。
 - 对已暂停并封存的 epoch，应先用独立的新 dry-run 验证升级后的 harness，再继续原
   campaign；不要对它使用 `--resume`，也不要把 dry-run 写入原真实 campaign。
 - 历史失败 epoch 保持不可变，新 epoch 只导入仍未终止的 frontier。
+- 监视窗口会持久显示内部失败原因及 report/outcome 路径；交互窗口默认在失败时停留，
+  可用 `amr watch --no-hold-on-error ...` 关闭该行为。

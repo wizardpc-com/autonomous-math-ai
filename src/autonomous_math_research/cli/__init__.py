@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 import runpy
@@ -9,7 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ..app_server import AppServerClient
 from ..catalog import rebuild_catalog
@@ -43,6 +45,73 @@ from ..validation import validate_project
 
 
 AUTONOMOUS_REQUIRED_FILES = ("autonomous/project.json",)
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeContext:
+    run_id: str
+    campaign_id: str
+    previous_epoch_id: str | None
+    campaign_hours: float
+    epoch_hours: float
+    mock: bool
+    manifest: dict[str, Any]
+
+    @classmethod
+    def load(cls, project: Path, run_id: str) -> "ResumeContext":
+        run_root = ProjectLayout(project).run_dir(run_id)
+        manifest_path = run_root / "RUN_MANIFEST.json"
+        if not manifest_path.is_file():
+            raise ValueError("cannot resume a legacy run without RUN_MANIFEST.json")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        AutonomousController._verify_run_manifest(manifest)
+        if manifest.get("run_id") != run_id:
+            raise ValueError("RUN_MANIFEST run_id does not match its storage directory")
+        execution = manifest["execution"]
+        duration_hours = float(execution["limits"]["duration_seconds"]) / 3600.0
+        campaign = manifest.get("campaign") or {
+            "campaign_id": run_id,
+            "epoch_id": run_id,
+            "previous_epoch_id": None,
+            "campaign_hours": duration_hours,
+            "epoch_hours": duration_hours,
+        }
+        if campaign.get("epoch_id") != run_id:
+            raise ValueError("RUN_MANIFEST epoch_id does not match its storage directory")
+        return cls(
+            run_id=run_id,
+            campaign_id=str(campaign["campaign_id"]),
+            previous_epoch_id=(
+                str(campaign["previous_epoch_id"])
+                if campaign.get("previous_epoch_id") is not None else None
+            ),
+            campaign_hours=float(campaign["campaign_hours"]),
+            epoch_hours=float(campaign["epoch_hours"]),
+            mock=execution.get("mode") == "mock",
+            manifest=manifest,
+        )
+
+    def apply(self, args: argparse.Namespace) -> None:
+        checks = (
+            ("--hours", args.hours, self.campaign_hours),
+            ("--epoch-hours", args.epoch_hours, self.epoch_hours),
+            ("--campaign-id", args.campaign_id, self.campaign_id),
+            ("--previous-epoch-id", args.previous_epoch_id, self.previous_epoch_id),
+        )
+        for label, supplied, pinned in checks:
+            if supplied is None:
+                continue
+            if isinstance(pinned, float):
+                matches = abs(float(supplied) - pinned) <= 1e-9
+            else:
+                matches = str(supplied) == str(pinned)
+            if not matches:
+                raise ValueError(f"{label} differs from the pinned resumed epoch")
+        if args.mock and not self.mock:
+            raise ValueError("cannot change a pinned real run into mock mode")
+        args.mock = self.mock
+        args.campaign_id = self.campaign_id
+        args.previous_epoch_id = self.previous_epoch_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -258,6 +327,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-fold", action="store_true",
         help="do not fold repeated low-information tool activity in the TUI",
     )
+    watch.add_argument(
+        "--hold-on-error", action=argparse.BooleanOptionalAction, default=None,
+        help="keep an interactive monitor window open after an internal failure",
+    )
 
     status = sub.add_parser("status", help="show a read-only run status snapshot")
     status.add_argument("--project", type=Path, required=True)
@@ -288,6 +361,20 @@ def _latest_run(project: Path) -> str:
     for path in root.iterdir():
         if not path.is_dir() or not (path / "EVENTS.jsonl").exists():
             continue
+        manifest_path = path / "RUN_MANIFEST.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            AutonomousController._verify_run_manifest(manifest)
+            campaign = manifest.get("campaign")
+            if isinstance(campaign, dict):
+                store = CampaignStore(
+                    ProjectLayout(project.resolve()).autonomous_root,
+                    str(campaign["campaign_id"]),
+                )
+                if store.manifest_path.is_file():
+                    if store.unsealed_epoch() == path.name:
+                        candidates.append(path)
+                    continue
         events = read_jsonl(path / "EVENTS.jsonl")
         kinds = {event.get("kind") for event in events}
         if "RUN_STARTED" in kinds and "RUN_STOPPED" not in kinds:
@@ -349,7 +436,10 @@ async def _execute_epoch(args: argparse.Namespace):
         raise ValueError("--resume cannot be combined with --recover-candidates-from")
     if args.resume:
         run_id = _latest_run(project) if args.resume == "latest" else args.resume
+    if run_id is None:
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     config_path = args.config
+    resume_context: ResumeContext | None = None
     if resume and run_id:
         if args.dry_run:
             raise ValueError("--resume --dry-run is forbidden; resume must reconcile stale turns and state")
@@ -361,23 +451,19 @@ async def _execute_epoch(args: argparse.Namespace):
             if args.config and file_digest(args.config.resolve()) != file_digest(pinned):
                 raise ValueError("explicit resume config differs from the pinned run config")
             config_path = pinned
-        manifest_path = run_root / "RUN_MANIFEST.json"
-        if not manifest_path.is_file():
-            raise ValueError("cannot resume a legacy run without RUN_MANIFEST.json")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        pinned_mock = manifest.get("execution", {}).get("mode") == "mock"
-        if args.mock and not pinned_mock:
-            raise ValueError("cannot change a pinned real run into mock mode")
-        args.mock = pinned_mock
+        resume_context = ResumeContext.load(project, run_id)
+        resume_context.apply(args)
     config = load_config(
         project, config_path, workspace_root=args.workspace_root,
         require_manifest=True, profile_path=args.profile,
     )
     campaign_hours = (
-        float(args.hours) if args.hours is not None else config.campaign_hours
+        resume_context.campaign_hours if resume_context is not None else
+        (float(args.hours) if args.hours is not None else config.campaign_hours)
     )
     epoch_hours = (
-        float(args.epoch_hours) if args.epoch_hours is not None else config.epoch_hours
+        resume_context.epoch_hours if resume_context is not None else
+        (float(args.epoch_hours) if args.epoch_hours is not None else config.epoch_hours)
     )
     if campaign_hours <= 0 or epoch_hours <= 0:
         raise ValueError("campaign and epoch hours must be positive")
@@ -420,6 +506,13 @@ async def _execute_epoch(args: argparse.Namespace):
         )
     else:
         backend = None
+    print(json.dumps({
+        "event": "amr_epoch_starting",
+        "run_id": run_id,
+        "campaign_id": args.campaign_id or run_id,
+        "resume": resume,
+        "mode": "mock" if args.mock else ("dry-run" if args.dry_run else "real"),
+    }, ensure_ascii=False), file=sys.stderr, flush=True)
     controller = AutonomousController(
         config, backend=backend, run_id=run_id, global_budget=args.budget,
         max_director=args.max_director,
@@ -470,8 +563,8 @@ def _auto_epoch_allowed(result, checkpoint) -> bool:
 
 async def _run_command(args: argparse.Namespace) -> int:
     auto_epochs = bool(getattr(args, "auto_epochs", False))
-    if auto_epochs and (args.resume or args.dry_run):
-        raise ValueError("--auto-epochs cannot be combined with --resume or --dry-run")
+    if auto_epochs and args.dry_run:
+        raise ValueError("--auto-epochs cannot be combined with --dry-run")
     result, config = await _execute_epoch(args)
     results = [result]
     while auto_epochs:
@@ -524,7 +617,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
     layout = ProjectLayout(project)
     campaign = CampaignStore(layout.autonomous_root, args.campaign)
     checkpoint = campaign.load()
-    if checkpoint.status in {"COMPLETED", "STOPPED"}:
+    if checkpoint.status in {"COMPLETED", "STOPPED", "SUPERSEDED"}:
         raise ValueError(f"{checkpoint.status.lower()} campaign cannot be continued")
     if checkpoint.remaining_seconds <= 0:
         raise ValueError("campaign time budget is exhausted")
@@ -532,6 +625,12 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         float(args.epoch_hours or checkpoint.epoch_hours),
         checkpoint.remaining_seconds / 3600.0,
     )
+    unsealed_epoch = campaign.unsealed_epoch()
+    if unsealed_epoch is not None:
+        raise ValueError(
+            "campaign has an unsealed epoch; recover it before continuing: "
+            f"amr run --project \"{project}\" --resume \"{unsealed_epoch}\""
+        )
     previous_epoch_id = campaign.latest_continuable_epoch()
     if checkpoint.epochs and previous_epoch_id is None:
         raise ValueError(
@@ -848,6 +947,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 chat_tail=args.chat_tail, raw_json=args.json,
                 ui_mode=args.ui, color_mode=args.color,
                 fold_repeats=not args.no_fold,
+                hold_on_error=args.hold_on_error,
             )
         except KeyboardInterrupt:
             print("\n监视器已关闭；研究主进程仍会继续运行。")

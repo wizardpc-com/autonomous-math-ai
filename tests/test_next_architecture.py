@@ -20,7 +20,9 @@ from autonomous_math_research.canonical_transition import (
 )
 from autonomous_math_research.config import load_config
 from autonomous_math_research.controller import ActiveJob, AutonomousController, RunResult
-from autonomous_math_research.cli import _run_command
+from autonomous_math_research.cli import (
+    ResumeContext, _execute_epoch, _latest_run, _run_command,
+)
 from autonomous_math_research.engine.scheduler import DynamicScheduler
 from autonomous_math_research.eventing import CandidateInbox
 from autonomous_math_research.initializer import initialize_project
@@ -36,7 +38,9 @@ from autonomous_math_research.lifecycle.state import (
     LifecyclePhase,
     MonotoneLifecycle,
 )
-from autonomous_math_research.models import CandidateEvent, Claim, JobOutcome, ResearchTask
+from autonomous_math_research.models import (
+    CandidateEvent, Claim, JobOutcome, ResearchTask, stable_hash,
+)
 from autonomous_math_research.project import (
     ProjectManifest,
     discover_workspace_root,
@@ -102,6 +106,112 @@ class NextArchitectureTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root)
+
+    def _resume_args(self, run_id: str, *, auto_epochs: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(
+            project=self.project, workspace_root=None, hours=None, epoch_hours=None,
+            max_director=None, max_research_workers=None, max_audit=None,
+            max_mechanical_subworkers=None, budget=None, config=None, profile=None,
+            dry_run=False, mock=False, auto_epochs=auto_epochs, resume=run_id,
+            run_id=None, recover_candidates_from=None, campaign_id=None,
+            previous_epoch_id=None,
+        )
+
+    def _prepare_crashed_second_epoch(
+        self, *, legacy_ghost: bool = False, campaign_hours: float = 0.001,
+    ) -> tuple[AutonomousController, CampaignStore, ResearchTask]:
+        config = load_config(self.project)
+        campaign_id = "resume-campaign"
+        first_epoch = "resume-epoch-one"
+        second_epoch = "resume-epoch-two"
+        first_controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id=first_epoch, campaign_id=campaign_id,
+            campaign_hours=campaign_hours, epoch_hours=0.00001,
+        )
+        first_controller._pin_run_inputs(0.00001, False)
+        first_controller._write_compact_snapshot()
+        campaign = CampaignStore(self.runtime, campaign_id)
+        campaign.create(
+            project_id=config.project_name,
+            campaign_hours=campaign_hours,
+            epoch_hours=0.00001,
+        )
+        campaign.append_epoch_started(
+            epoch_id=first_epoch, previous_epoch_id=None, mode="mock",
+        )
+        campaign.append_epoch_sealed(
+            epoch_id=first_epoch, elapsed_seconds=0.001, status="PAUSED",
+            stopped_reason="epoch time limit reached",
+            checkpoint_uri=f"epoch://{first_epoch}/state/compact_snapshot.json",
+        )
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id=second_epoch, campaign_id=campaign_id,
+            previous_epoch_id=first_epoch, campaign_hours=campaign_hours,
+            epoch_hours=0.00001,
+        )
+        controller._pin_run_inputs(0.00001, False)
+        baseline = controller.guard.snapshot()
+        (controller.run_dir / "canonical_guard.before.json").write_text(
+            json.dumps(baseline, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        campaign.append_epoch_started(
+            epoch_id=second_epoch, previous_epoch_id=first_epoch, mode="mock",
+        )
+        task = research_task("resume-stale-frontier", route="resume-route")
+        controller.store.append("RUN_STARTED", {
+            "execution_mode": "mock", "campaign_id": campaign_id,
+            "epoch_id": second_epoch,
+        })
+        controller.store.append("EPOCH_CHECKPOINT_IMPORTED", {
+            "campaign_id": campaign_id, "source_epoch_id": first_epoch,
+            "research_tasks": 0, "candidate_frontier": 0,
+        })
+        controller.store.append("TASK_ACCEPTED", {
+            "task_id": task.task_id, "fingerprint": task.fingerprint,
+            "representation_id": task.representation_id, "task": task.to_dict(),
+        })
+        controller.store.append("JOB_STARTED", {
+            "job_id": "stale-research-job", "task_id": task.task_id,
+            "role": task.role, "claim_id": task.target_claim,
+        })
+        controller.store.append("DIRECTOR_REPLAN_REQUESTED", {
+            "state_version": 28, "requested_version": 28,
+            "reason": "pre-crash frontier",
+        })
+        corrupt_snapshot = controller.run_dir / "state" / "compact_snapshot.json"
+        corrupt_snapshot.write_text(json.dumps({
+            "pending_research": [], "pending_audits": [], "active_tasks": [],
+            "controller_watermark": {
+                "state_version": 0, "director_requested_version": 0,
+                "director_applied_version": -1,
+            },
+        }) + "\n", encoding="utf-8")
+        if legacy_ghost:
+            ghost = CampaignStore(self.runtime, second_epoch)
+            ghost.create(
+                project_id=config.project_name,
+                campaign_hours=campaign_hours, epoch_hours=0.00001,
+            )
+            ghost.append_epoch_started(
+                epoch_id=second_epoch, previous_epoch_id=None, mode="mock",
+            )
+            ghost.append_epoch_sealed(
+                epoch_id=second_epoch, elapsed_seconds=1.0, status="PAUSED",
+                stopped_reason="mechanical subtask lifecycle invariant failed",
+                checkpoint_uri=f"epoch://{second_epoch}/state/compact_snapshot.json",
+            )
+            controller.store.append("RUN_INPUT_PINNING_FAILED", {
+                "error": "RUN_MANIFEST immutable inputs do not match the resumed controller",
+            })
+            controller.store.append("RUN_STOPPED", {
+                "reason": "mechanical subtask lifecycle invariant failed",
+                "internal_failure": True, "campaign_id": second_epoch,
+                "epoch_id": second_epoch, "campaign_status": "PAUSED",
+            })
+        return controller, campaign, task
 
     def test_project_manifest_works_outside_harness_repository(self) -> None:
         (self.project / ".git").mkdir()
@@ -298,7 +408,8 @@ class NextArchitectureTests(unittest.TestCase):
         run_manifest = json.loads(
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(run_manifest["schema_version"], 12)
+        self.assertEqual(run_manifest["schema_version"], 13)
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.1")
         self.assertIn("canonical_state", run_manifest)
 
     def test_stale_trusted_binding_fails_before_model_turn(self) -> None:
@@ -653,6 +764,205 @@ class NextArchitectureTests(unittest.TestCase):
                 checkpoint_uri="epoch://invalid/state/checkpoint.json",
             )
 
+    def test_resume_context_hydrates_all_campaign_identity_before_controller(self) -> None:
+        controller, _, _ = self._prepare_crashed_second_epoch()
+        context = ResumeContext.load(self.project, controller.run_id)
+        args = self._resume_args(controller.run_id)
+
+        context.apply(args)
+
+        self.assertEqual(context.campaign_id, "resume-campaign")
+        self.assertEqual(context.previous_epoch_id, "resume-epoch-one")
+        self.assertEqual(args.campaign_id, "resume-campaign")
+        self.assertEqual(args.previous_epoch_id, "resume-epoch-one")
+        self.assertTrue(args.mock)
+
+    def test_pre_recovery_failure_preserves_snapshot_and_unsealed_epoch(self) -> None:
+        controller, campaign, _ = self._prepare_crashed_second_epoch()
+        snapshot = controller.run_dir / "state" / "compact_snapshot.json"
+        snapshot_before = file_digest(snapshot)
+        canonical_paths = [
+            self.project / "claims" / "CLAIMS.md",
+            self.project / "state" / "PROGRESS.md",
+            self.runtime / "state" / "claim_graph.json",
+            self.runtime / "state" / "nightly_trusted.json",
+        ]
+        canonical_before = {path: file_digest(path) for path in canonical_paths}
+
+        with patch.object(
+            AutonomousController, "_pin_run_inputs",
+            side_effect=ValueError("injected pinning failure"),
+        ):
+            result, _ = asyncio.run(_execute_epoch(self._resume_args(controller.run_id)))
+
+        self.assertTrue(result.internal_failure)
+        self.assertIn("injected pinning failure", result.stopped_reason)
+        self.assertEqual(file_digest(snapshot), snapshot_before)
+        self.assertEqual(campaign.unsealed_epoch(), controller.run_id)
+        self.assertFalse(any(
+            item.get("kind") == "EPOCH_SEALED"
+            and item.get("epoch_id") == controller.run_id
+            for item in campaign.events()
+        ))
+        kinds = [event["kind"] for event in controller.store.replay()]
+        self.assertEqual(kinds[-1], "ATTEMPT_FAILED")
+        self.assertNotIn("RUN_STOPPED", kinds)
+        self.assertEqual(
+            {path: file_digest(path) for path in canonical_paths}, canonical_before,
+        )
+
+    def test_legacy_wrong_campaign_resume_rebuilds_frontier_append_only(self) -> None:
+        controller, campaign, task = self._prepare_crashed_second_epoch(
+            legacy_ghost=True,
+        )
+        self.assertEqual(_latest_run(self.project), controller.run_id)
+        canonical_paths = [
+            self.project / "claims" / "CLAIMS.md",
+            self.project / "state" / "PROGRESS.md",
+            self.runtime / "state" / "claim_graph.json",
+            self.runtime / "state" / "nightly_trusted.json",
+        ]
+        canonical_before = {path: file_digest(path) for path in canonical_paths}
+
+        result, _ = asyncio.run(_execute_epoch(self._resume_args(controller.run_id)))
+
+        self.assertFalse(result.internal_failure, result.stopped_reason)
+        self.assertEqual(result.campaign_id, "resume-campaign")
+        self.assertIsNone(campaign.unsealed_epoch())
+        sealed = next(
+            item for item in campaign.events()
+            if item.get("kind") == "EPOCH_SEALED"
+            and item.get("epoch_id") == controller.run_id
+        )
+        self.assertGreaterEqual(sealed["elapsed_seconds"], 0.03)
+        self.assertTrue(sealed["checkpoint_usable"])
+        self.assertEqual(
+            CampaignStore(self.runtime, controller.run_id).load().status,
+            "SUPERSEDED",
+        )
+        events = controller.store.replay()
+        kinds = [event["kind"] for event in events]
+        self.assertIn("RESUME_METADATA_REBOUND", kinds)
+        self.assertIn("RECOVERY_COMPLETED", kinds)
+        stale_cancel = next(
+            event for event in events
+            if event["kind"] == "JOB_CANCELLED"
+            and event["payload"].get("job_id") == "stale-research-job"
+        )
+        self.assertEqual(stale_cancel["payload"]["failure_kind"], "controller_restart")
+        snapshot = json.loads(
+            (controller.run_dir / "state" / "compact_snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertGreaterEqual(
+            snapshot["controller_watermark"]["director_requested_version"], 28,
+        )
+        self.assertGreaterEqual(snapshot["snapshot_provenance"]["generation"], 29)
+        self.assertTrue(snapshot["snapshot_provenance"]["rebuilt_from_events"])
+        frontier_ids = {
+            item["task_id"] for item in snapshot.get("pending_research", [])
+        }
+        self.assertIn(task.task_id, frontier_ids)
+        self.assertEqual(
+            {path: file_digest(path) for path in canonical_paths}, canonical_before,
+        )
+
+    def test_crashed_second_epoch_resume_seals_and_auto_starts_next_epoch(self) -> None:
+        controller, campaign, _ = self._prepare_crashed_second_epoch(
+            legacy_ghost=True, campaign_hours=0.00002,
+        )
+        args = self._resume_args(controller.run_id, auto_epochs=True)
+
+        with patch("builtins.print") as output:
+            exit_code = asyncio.run(_run_command(args))
+
+        payload = json.loads(output.call_args_list[-1].args[0])
+        starts = [
+            event for event in campaign.events()
+            if event.get("kind") == "EPOCH_STARTED"
+        ]
+        seals = [
+            event for event in campaign.events()
+            if event.get("kind") == "EPOCH_SEALED"
+        ]
+        resumed_seal = next(
+            event for event in seals
+            if event.get("epoch_id") == controller.run_id
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["epochs_run"], 2)
+        self.assertEqual(payload["epoch_ids"][0], controller.run_id)
+        self.assertEqual(len(starts), 3)
+        self.assertEqual(len(seals), 3)
+        self.assertTrue(resumed_seal["checkpoint_usable"])
+        self.assertEqual(starts[-1]["previous_epoch_id"], controller.run_id)
+
+    def test_manifest_v12_remains_resume_compatible(self) -> None:
+        controller, _, _ = self._prepare_crashed_second_epoch()
+        manifest_path = controller.run_dir / "RUN_MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("runtime_provenance")
+        manifest["schema_version"] = 12
+        unsigned = dict(manifest)
+        unsigned.pop("manifest_sha256")
+        manifest["manifest_sha256"] = stable_hash(unsigned)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        context = ResumeContext.load(self.project, controller.run_id)
+
+        self.assertEqual(context.campaign_id, "resume-campaign")
+
+    def test_manifest_v13_source_change_fails_closed_without_sealing(self) -> None:
+        controller, campaign, _ = self._prepare_crashed_second_epoch()
+        manifest_path = controller.run_dir / "RUN_MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["runtime_provenance"]["source_sha256"] = "0" * 64
+        unsigned = dict(manifest)
+        unsigned.pop("manifest_sha256")
+        manifest["manifest_sha256"] = stable_hash(unsigned)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        result, _ = asyncio.run(_execute_epoch(self._resume_args(controller.run_id)))
+
+        self.assertTrue(result.internal_failure)
+        self.assertIn("runtime provenance differs", result.stopped_reason)
+        self.assertEqual(campaign.unsealed_epoch(), controller.run_id)
+
+    def test_codex_schema_change_is_accepted_only_with_same_required_protocol(self) -> None:
+        controller, _, _ = self._prepare_crashed_second_epoch()
+        manifest = json.loads(
+            (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        current = dict(manifest["runtime_provenance"])
+        current["codex_cli_version"] = "codex-cli compatible-update"
+        current["app_server_schema_sha256"] = "1" * 64
+        resumed = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            resume=True, run_id=controller.run_id,
+            campaign_id="resume-campaign", previous_epoch_id="resume-epoch-one",
+            campaign_hours=0.001, epoch_hours=0.00001,
+        )
+
+        with patch(
+            "autonomous_math_research.controller.capture_runtime_provenance",
+            return_value=current,
+        ):
+            resumed._pin_run_inputs(0.00001, False)
+
+        compatible = [
+            event for event in resumed.store.replay()
+            if event["kind"] == "RUNTIME_PROVENANCE_CHANGED_COMPATIBLE"
+        ]
+        self.assertEqual(len(compatible), 1)
+
     def test_auto_epochs_continue_only_at_clean_epoch_boundaries(self) -> None:
         config = load_config(self.project)
         calls: list[argparse.Namespace] = []
@@ -716,7 +1026,7 @@ class NextArchitectureTests(unittest.TestCase):
             dry_run=False,
             mock=True,
             auto_epochs=True,
-            resume=None,
+            resume="resumed-auto-epoch",
             run_id=None,
             recover_candidates_from=None,
             campaign_id=None,

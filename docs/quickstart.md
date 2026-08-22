@@ -149,11 +149,18 @@ checks are complete.
 - `amr campaign continue` creates a new epoch from a sealed checkpoint.
 - `--auto-epochs` repeatedly performs that fresh-epoch boundary during one
   invocation without changing the checkpoint/seal model.
+- `amr run --project PATH --resume EPOCH_ID --auto-epochs` safely recovers the
+  interrupted epoch before entering the same fresh-epoch loop.
+- If `campaign continue` finds an unsealed epoch, it prints the exact resume
+  command instead of selecting an older checkpoint.
 - A paused, sealed epoch must be continued, not resumed; validate the updated
   harness with a separate new dry run before continuing the real campaign.
 - Budget or epoch drain stops new dispatch and waits for healthy in-flight work.
 - Failed runs remain immutable evidence; recovery imports into a new append-only
   context rather than rewriting the old run.
+- Interactive monitor windows persist the failure reason and report/outcome
+  paths and hold on internal failure by default; pass `--no-hold-on-error` for
+  headless operation.
 
 ## Human steering and assets
 

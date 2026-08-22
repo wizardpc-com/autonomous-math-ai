@@ -70,6 +70,7 @@ from .prompts import (
     director_prompt,
     worker_prompt,
 )
+from .provenance import capture_runtime_provenance
 from .policy import pin_policy_manifest, policy_view_for_role
 from .provider_backend import ProviderRouterBackend
 from .provider_config import mapped_reasoning_effort, validate_service_tier
@@ -575,6 +576,11 @@ class AutonomousController:
         self.epoch_id = self.run_id
         self.previous_epoch_id = previous_epoch_id
         self._previous_epoch_checkpoint_imported = previous_epoch_id is None
+        self._attempt_id = uuid4().hex
+        self._attempt_started_sequence = 0
+        self._recovery_completed = not resume
+        self._bootstrap_completed = False
+        self._secondary_failures: list[dict[str, Any]] = []
         self.campaign_hours = float(campaign_hours)
         self.epoch_hours = float(epoch_hours)
         if self.campaign_hours <= 0 or self.epoch_hours <= 0:
@@ -836,6 +842,7 @@ class AutonomousController:
         self._director_requested_version = 0
         self._director_snapshot_version = 0
         self._director_applied_version = -1
+        self._snapshot_generation = 0
         self._director_not_before = 0.0
         self._replan_after_wave = False
         self.director_constraints: list[dict[str, Any]] = []
@@ -855,6 +862,7 @@ class AutonomousController:
         self.policy_manifest: dict[str, Any] | None = None
         self.policy_status: dict[str, Any] | None = None
         self._run_manifest: dict[str, Any] = {}
+        self._runtime_provenance: dict[str, Any] | None = None
         self._canonical_state: dict[str, Any] | None = None
         self._director_overlay: str | None = None
         self._latest_rate_limits: dict[str, Any] | None = None
@@ -1630,9 +1638,11 @@ class AutonomousController:
             top_level.add("requested_providers")
         if version >= 12:
             top_level.add("canonical_state")
+        if version >= 13:
+            top_level.add("runtime_provenance")
         if set(existing) != top_level:
             raise ValueError(f"RUN_MANIFEST fields are invalid: {sorted(set(existing) ^ top_level)}")
-        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
+        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
             raise ValueError("unsupported or legacy RUN_MANIFEST schema")
         fingerprinted = dict(existing)
         reported = str(fingerprinted.pop("manifest_sha256", ""))
@@ -1689,6 +1699,18 @@ class AutonomousController:
             }
         ):
             raise ValueError("RUN_MANIFEST canonical_state fields are invalid")
+        if version >= 13 and (
+            not isinstance(existing.get("runtime_provenance"), dict)
+            or set(existing["runtime_provenance"]) != {
+                "amr_version", "python_version", "source_root",
+                "source_git_revision", "source_tree_dirty", "source_sha256",
+                "codex_cli_version", "app_server_schema_sha256",
+                "app_server_required_protocol_sha256",
+            }
+            or not str(existing["runtime_provenance"].get("amr_version") or "")
+            or not str(existing["runtime_provenance"].get("source_sha256") or "")
+        ):
+            raise ValueError("RUN_MANIFEST runtime_provenance fields are invalid")
         output_schemas = existing.get("output_schemas")
         if not isinstance(output_schemas, dict) or set(output_schemas) != {
             "director_plan.schema.json", "worker_result.schema.json", "audit_result.schema.json",
@@ -2057,6 +2079,9 @@ class AutonomousController:
             raise ValueError("pinned mechanical broker client snapshot is invalid")
         self._mechanical_broker_client_source = broker_source
         self._mechanical_broker_client_sha256 = str(broker_entry["sha256"])
+        self._runtime_provenance = capture_runtime_provenance(
+            include_codex=not self.mock and not dry_run,
+        )
         config_snapshot = self.run_dir / "config" / "config.yaml"
         config_snapshot.parent.mkdir(parents=True, exist_ok=True)
         if config_snapshot.exists():
@@ -2090,7 +2115,7 @@ class AutonomousController:
             raise ValueError("hours must be positive")
         self._effective_run_hours = requested_hours
         payload = {
-            "schema_version": 12,
+            "schema_version": 13,
             "run_id": self.run_id,
             "campaign": {
                 "campaign_id": self.campaign_id,
@@ -2162,6 +2187,7 @@ class AutonomousController:
                 ],
                 "git_revision": self._canonical_state["git_revision"],
             },
+            "runtime_provenance": self._runtime_provenance,
             "candidate_recovery": {"source_run_id": self.recover_candidates_from},
             "output_schemas": output_schemas,
         }
@@ -2238,6 +2264,44 @@ class AutonomousController:
             expected_mode = "mock" if self.mock else "real"
             if existing["execution"].get("mode") != expected_mode:
                 raise ValueError("resume execution mode differs from the pinned run mode")
+            version = int(existing.get("schema_version", 0))
+            if version >= 13:
+                pinned_runtime = existing["runtime_provenance"]
+                for key in ("amr_version", "source_sha256"):
+                    if pinned_runtime.get(key) != self._runtime_provenance.get(key):
+                        raise ValueError(
+                            f"resume AMR runtime provenance differs: {key}"
+                        )
+                pinned_protocol = pinned_runtime.get(
+                    "app_server_required_protocol_sha256"
+                )
+                current_protocol = self._runtime_provenance.get(
+                    "app_server_required_protocol_sha256"
+                )
+                if pinned_protocol != current_protocol:
+                    raise ValueError("resume App Server protocol is incompatible")
+                changed_runtime = {
+                    key: {
+                        "pinned": pinned_runtime.get(key),
+                        "current": self._runtime_provenance.get(key),
+                    }
+                    for key in (
+                        "python_version", "source_root", "source_git_revision",
+                        "source_tree_dirty", "codex_cli_version",
+                        "app_server_schema_sha256",
+                    )
+                    if pinned_runtime.get(key) != self._runtime_provenance.get(key)
+                }
+                if changed_runtime:
+                    self.store.append(
+                        "RUNTIME_PROVENANCE_CHANGED_COMPATIBLE", changed_runtime,
+                    )
+            else:
+                self.store.append("RUNTIME_PROVENANCE_UNPINNED_LEGACY", {
+                    "manifest_schema_version": version,
+                    "current": self._runtime_provenance,
+                    "action": "resume under legacy compatibility rules",
+                })
             original = self._normalized_manifest_limits(existing)
             legacy_total = existing["execution"]["limits"].get(
                 "max_total_model_concurrency"
@@ -3396,6 +3460,37 @@ class AutonomousController:
                     "retry_class": self._retry_class(failure_kind),
                     "failure_kind": failure_kind,
                 })
+            observed_usage = self.governor.by_job.get(job_id, {})
+            stale_record = {
+                "job_id": job_id,
+                "task_id": task_id,
+                "claim_id": started[job_id].get("claim_id"),
+                "role": started[job_id].get("role"),
+                "status": "CANCELLED",
+                "thread_id": (binding or {}).get("thread_id"),
+                "turn_id": (binding or {}).get("turn_id"),
+                "token_usage": {
+                    key: int(observed_usage.get(key, 0) or 0)
+                    for key in (
+                        "input_tokens", "cached_input_tokens", "uncached_input_tokens",
+                        "cache_write_input_tokens", "output_tokens",
+                        "reasoning_output_tokens", "total_tokens",
+                    )
+                },
+                "token_telemetry": (
+                    "observed" if observed_usage.get("total_tokens") else "unknown"
+                ),
+                "cost_usd": observed_usage.get("cost_usd"),
+                "failure_kind": "controller_restart",
+                "retryable": bool(task and retry < max_retries),
+                "useful": False,
+                "end_time": utc_now(),
+                "elapsed_seconds": 0.0,
+                "exit_reason": "controller restart reconciled stale job",
+            }
+            self.completed_jobs.append(stale_record)
+            self.cancelled_jobs.add(job_id)
+            self.store.append("JOB_CANCELLED", stale_record)
         pending_ids = {task.task_id for task in self.pending_research}
         for task_id, retry_sequence in last_retry_sequence_by_task.items():
             if (
@@ -4381,52 +4476,148 @@ class AutonomousController:
                 immediate=True,
             )
 
+    def _attempt_failure_result(self, reason: str) -> RunResult:
+        self._internal_failure = True
+        report_path = self.layout.nightly_root / self.run_id / "NIGHTLY_REPORT.md"
+        outcome_path = self.layout.outcomes_root / self.run_id / "OUTCOME.md"
+        try:
+            campaign_status = self.campaign_store.load().status
+        except (OSError, ValueError, json.JSONDecodeError):
+            campaign_status = "PAUSED"
+        payload = {
+            "attempt_id": self._attempt_id,
+            "reason": reason,
+            "internal_failure": True,
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "recovery_completed": self._recovery_completed,
+            "campaign_status": campaign_status,
+            "report": str(report_path) if report_path.is_file() else None,
+            "outcome": str(outcome_path) if outcome_path.is_file() else None,
+            "action": "epoch remains unsealed and resumable",
+        }
+        self.live_store.append("LIVE_ATTEMPT_FAILED", payload)
+        self.store.append("ATTEMPT_FAILED", payload)
+        events = self.store.replay()
+        lifecycle = job_lifecycle_metrics(events)
+        mechanical = mechanical_lifecycle_metrics(events)
+        return RunResult(
+            run_id=self.run_id,
+            report_path=report_path,
+            stopped_reason=reason,
+            job_count=lifecycle.jobs_terminal,
+            event_count=len(events),
+            jobs_started=lifecycle.jobs_started,
+            jobs_completed=lifecycle.jobs_completed,
+            jobs_cancelled=lifecycle.jobs_cancelled,
+            jobs_terminal=lifecycle.jobs_terminal,
+            mechanical_subtasks_requested=mechanical.requested,
+            mechanical_attempts_started=mechanical.attempts_started,
+            mechanical_subtasks_terminal=mechanical.terminal,
+            internal_failure=True,
+            run_mode="dry-run" if self._dry_run else ("mock" if self.mock else "real"),
+            outcome_path=outcome_path if outcome_path.is_file() else None,
+            campaign_id=self.campaign_id,
+            epoch_id=self.epoch_id,
+            campaign_status=campaign_status,
+        )
+
+    def _reconcile_legacy_failed_resume(self) -> None:
+        records = [
+            event for event in self.store.replay()
+            if int(event.get("sequence", 0)) < self._attempt_started_sequence
+        ]
+        wrong_stops = [
+            event for event in records
+            if event.get("kind") == "RUN_STOPPED"
+            and str((event.get("payload") or {}).get("campaign_id") or "")
+            not in {"", self.campaign_id}
+        ]
+        if not wrong_stops:
+            return
+        stop = wrong_stops[-1]
+        stop_sequence = int(stop.get("sequence", 0))
+        pin_failures = [
+            event for event in records
+            if event.get("kind") == "RUN_INPUT_PINNING_FAILED"
+            and int(event.get("sequence", 0)) < stop_sequence
+        ]
+        if not pin_failures:
+            raise ValueError("mismatched historical campaign stop has no pinning failure")
+        pin_sequence = int(pin_failures[-1].get("sequence", 0))
+        if any(
+            event.get("kind") == "RECOVERY_COMPLETED"
+            and pin_sequence < int(event.get("sequence", 0)) < stop_sequence
+            for event in records
+        ):
+            raise ValueError("mismatched historical campaign stop occurred after recovery")
+        ghost_id = str((stop.get("payload") or {})["campaign_id"])
+        ghost = CampaignStore(self.layout.autonomous_root, ghost_id)
+        if not ghost.manifest_path.is_file():
+            raise ValueError("mismatched historical campaign has no reconciliation ledger")
+        ghost_checkpoint = ghost.load()
+        ghost_events = ghost.events()
+        if (
+            ghost_checkpoint.project_id != self.config.project_name
+            or ghost_checkpoint.epochs != (self.epoch_id,)
+            or sum(item.get("kind") == "EPOCH_STARTED" for item in ghost_events) != 1
+            or sum(item.get("kind") == "EPOCH_SEALED" for item in ghost_events) != 1
+        ):
+            raise ValueError("mismatched historical campaign is not a safe bootstrap ghost")
+        ghost.mark_superseded(
+            by_campaign_id=self.campaign_id,
+            epoch_id=self.epoch_id,
+            reason="legacy resume constructed the controller before hydrating RUN_MANIFEST",
+        )
+        self.store.append("RESUME_METADATA_REBOUND", {
+            "attempt_id": self._attempt_id,
+            "from_campaign_id": ghost_id,
+            "to_campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "pinning_failure_sequence": pin_sequence,
+            "wrong_stop_sequence": stop_sequence,
+            "action": "append-only reconciliation; historical events retained",
+        })
+
     async def run(self, hours: float | None, dry_run: bool = False) -> RunResult:
         self._dry_run = bool(dry_run)
-        campaign = self.campaign_store.create(
-            project_id=self.config.project_name,
-            campaign_hours=self.campaign_hours,
-            epoch_hours=self.epoch_hours,
-        )
-        if campaign.project_id != self.config.project_name:
-            raise ValueError("campaign belongs to a different project")
-        if (
-            abs(campaign.campaign_hours - self.campaign_hours) > 1e-9
-            or abs(campaign.epoch_hours - self.epoch_hours) > 1e-9
-        ):
-            raise ValueError("campaign duration settings differ from the sealed campaign")
-        if self.previous_epoch_id is not None:
-            self.campaign_store.require_current_continuation_source(
-                self.previous_epoch_id
-            )
         mode = "dry-run" if dry_run else ("mock" if self.mock else "real")
-        self.campaign_store.append_epoch_started(
-            epoch_id=self.epoch_id,
-            previous_epoch_id=self.previous_epoch_id,
-            mode=mode,
-        )
-        self._campaign_recorded_started = True
-        self._hydrate_applied_campaign_inputs()
+        attempt = self.store.append("ATTEMPT_STARTED", {
+            "attempt_id": self._attempt_id,
+            "resume": self.resume,
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "mode": mode,
+        })
+        self._attempt_started_sequence = int(attempt["sequence"])
         guard_path = self.run_dir / "canonical_guard.before.json"
-        if self.resume:
-            if not guard_path.is_file():
-                raise ValueError("cannot resume without the original canonical guard baseline")
-            baseline = json.loads(guard_path.read_text(encoding="utf-8"))
-            if not isinstance(baseline, dict) or not all(
-                isinstance(key, str) and isinstance(value, str) for key, value in baseline.items()
-            ):
-                raise ValueError("canonical guard baseline is invalid")
-            self.guard.baseline = dict(baseline)
-            changed_before_recovery = self.guard.verify()
-            if changed_before_recovery:
-                self.store.append("RESUME_CANONICAL_GUARD_FAILED", {
-                    "changed": changed_before_recovery,
-                    "action": "stopped before recovery or backend start",
-                })
-                return self._finish(f"resume refused: canonical guard failed: {changed_before_recovery}")
-        else:
-            baseline = self.guard.snapshot()
-            atomic_write_json(guard_path, baseline)
+        try:
+            if self.resume:
+                if not guard_path.is_file():
+                    raise ValueError("cannot resume without the original canonical guard baseline")
+                baseline = json.loads(guard_path.read_text(encoding="utf-8"))
+                if not isinstance(baseline, dict) or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in baseline.items()
+                ):
+                    raise ValueError("canonical guard baseline is invalid")
+                self.guard.baseline = dict(baseline)
+                changed_before_recovery = self.guard.verify()
+                if changed_before_recovery:
+                    self.store.append("RESUME_CANONICAL_GUARD_FAILED", {
+                        "changed": changed_before_recovery,
+                        "action": "stopped before recovery or backend start",
+                    })
+                    return self._attempt_failure_result(
+                        f"resume refused: canonical guard failed: {changed_before_recovery}"
+                    )
+            else:
+                baseline = self.guard.snapshot()
+                atomic_write_json(guard_path, baseline)
+        except Exception as exc:
+            return self._attempt_failure_result(
+                f"bootstrap failed: canonical guard: {_sanitize_live_text(exc)[:500]}"
+            )
         try:
             self._refresh_canonical_state()
         except Exception as exc:
@@ -4434,10 +4625,9 @@ class AutonomousController:
                 "error": _sanitize_live_text(exc),
                 "action": "stopped before recovery, backend start, or model turn",
             })
-            return self._finish(
+            return self._attempt_failure_result(
                 "bootstrap failed: canonical-state refresh: "
-                f"{_sanitize_live_text(exc)[:500]}",
-                internal_failure=True,
+                f"{_sanitize_live_text(exc)[:500]}"
             )
         try:
             deadline_epoch = self._pin_run_inputs(hours, dry_run)
@@ -4446,14 +4636,70 @@ class AutonomousController:
                 "error": _sanitize_live_text(exc),
                 "action": "stopped before recovery, backend start, or model turn",
             })
-            return self._finish(
+            return self._attempt_failure_result(
                 "bootstrap failed: run-input pinning: "
-                f"{_sanitize_live_text(exc)[:500]}",
-                internal_failure=True,
+                f"{_sanitize_live_text(exc)[:500]}"
             )
-        if self.resume:
-            self.recover()
-        self.store.append("RUN_STARTED", {
+        try:
+            campaign = (
+                self.campaign_store.load()
+                if self.resume else self.campaign_store.create(
+                    project_id=self.config.project_name,
+                    campaign_hours=self.campaign_hours,
+                    epoch_hours=self.epoch_hours,
+                )
+            )
+            if campaign.project_id != self.config.project_name:
+                raise ValueError("campaign belongs to a different project")
+            if (
+                abs(campaign.campaign_hours - self.campaign_hours) > 1e-9
+                or abs(campaign.epoch_hours - self.epoch_hours) > 1e-9
+            ):
+                raise ValueError("campaign duration settings differ from the pinned campaign")
+            if self.resume:
+                self.campaign_store.require_unsealed_epoch(
+                    epoch_id=self.epoch_id,
+                    previous_epoch_id=self.previous_epoch_id,
+                )
+                self._campaign_recorded_started = True
+                self._reconcile_legacy_failed_resume()
+            else:
+                if self.previous_epoch_id is not None:
+                    self.campaign_store.require_current_continuation_source(
+                        self.previous_epoch_id
+                    )
+                self.campaign_store.append_epoch_started(
+                    epoch_id=self.epoch_id,
+                    previous_epoch_id=self.previous_epoch_id,
+                    mode=mode,
+                )
+                self._campaign_recorded_started = True
+            self._hydrate_applied_campaign_inputs()
+            if self.resume:
+                self.recover()
+                recovered_kinds = {
+                    event.get("kind") for event in self.store.replay()
+                    if int(event.get("sequence", 0)) < self._attempt_started_sequence
+                }
+                self._previous_epoch_checkpoint_imported = bool(
+                    self.previous_epoch_id is None
+                    or "EPOCH_CHECKPOINT_IMPORTED" in recovered_kinds
+                )
+                self._recovery_completed = True
+                self.store.append("RECOVERY_COMPLETED", {
+                    "attempt_id": self._attempt_id,
+                    "campaign_id": self.campaign_id,
+                    "epoch_id": self.epoch_id,
+                    "event_watermark": self.store.replay()[-1]["sequence"],
+                    "pending_research": len(self.pending_research),
+                    "pending_audits": len(self.pending_audits),
+                    "active_mechanical": len(self.active_mechanical),
+                })
+        except Exception as exc:
+            return self._attempt_failure_result(
+                f"bootstrap failed: recovery: {_sanitize_live_text(exc)[:500]}"
+            )
+        run_started_payload = {
             "hours": self._effective_run_hours,
             "requested_hours_override": hours,
             "deadline_epoch": deadline_epoch, "dry_run": dry_run,
@@ -4487,7 +4733,9 @@ class AutonomousController:
             "previous_epoch_id": self.previous_epoch_id,
             "campaign_hours": self.campaign_hours,
             "epoch_hours": self.epoch_hours,
-        })
+        }
+        if not self.resume:
+            self.store.append("RUN_STARTED", run_started_payload)
         self.live_store.append("LIVE_MONITOR_READY", {
             "schema_version": 1, "resume": self.resume,
             "captures": [
@@ -4540,8 +4788,9 @@ class AutonomousController:
             "reason": self.lifecycle.reason,
         })
         try:
-            self._import_previous_epoch_checkpoint()
-            self._previous_epoch_checkpoint_imported = True
+            if not self._previous_epoch_checkpoint_imported:
+                self._import_previous_epoch_checkpoint()
+                self._previous_epoch_checkpoint_imported = True
         except Exception as exc:
             self.store.append("EPOCH_CHECKPOINT_IMPORT_FAILED", {
                 "campaign_id": self.campaign_id,
@@ -4589,6 +4838,7 @@ class AutonomousController:
                 f"{_sanitize_live_text(exc)[:500]}",
                 internal_failure=True,
             )
+        self._bootstrap_completed = True
         self.store.append("CANONICAL_STATE_REFRESHED", {
             "canonical_state_sha256": self._canonical_state[
                 "canonical_state_sha256"
@@ -4904,6 +5154,27 @@ class AutonomousController:
             "director_requested_version": self._director_requested_version,
             "director_applied_version": self._director_applied_version,
             "generated_at": utc_now(),
+        }
+        self._snapshot_generation = max(
+            self._snapshot_generation, self._director_requested_version,
+        ) + 1
+        replayed = self.store.replay()
+        snapshot["snapshot_provenance"] = {
+            "schema_version": 1,
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "attempt_id": self._attempt_id,
+            "generation": self._snapshot_generation,
+            "event_watermark": (
+                int(replayed[-1].get("sequence", 0)) if replayed else 0
+            ),
+            "canonical_state_sha256": self._canonical_state[
+                "canonical_state_sha256"
+            ],
+            "planning_context_sha256": self._canonical_state[
+                "planning_context_sha256"
+            ],
+            "rebuilt_from_events": self.resume and self._recovery_completed,
         }
         snapshot["mechanical_subworkers"] = {
             "enabled": self.mechanical_worker_enabled,
@@ -8284,7 +8555,12 @@ class AutonomousController:
         })
         if changed:
             self.store.append("CANONICAL_GUARD_FAILED", {"changed": changed})
-            if "canonical guard failed" not in reason:
+            canonical_reason = f"canonical guard failed: {changed}"
+            if self._internal_failure:
+                self._secondary_failures.append({
+                    "kind": "CANONICAL_GUARD_FAILED", "detail": canonical_reason,
+                })
+            elif "canonical guard failed" not in reason:
                 reason = f"canonical guard failed: {changed}"
             self._internal_failure = True
         lifecycle = job_lifecycle_metrics(self.store.replay())
@@ -8294,19 +8570,33 @@ class AutonomousController:
             or lifecycle.duplicate_terminal_job_ids
             or lifecycle.orphan_terminal_job_ids
         ):
+            lifecycle_reason = f"job lifecycle invariant failed: {lifecycle.to_dict()}"
+            if self._internal_failure:
+                self._secondary_failures.append({
+                    "kind": "JOB_LIFECYCLE_INVARIANT_FAILED",
+                    "detail": lifecycle_reason,
+                })
+            else:
+                reason = lifecycle_reason
             self._internal_failure = True
-            reason = f"job lifecycle invariant failed: {lifecycle.to_dict()}"
             self.store.append("JOB_LIFECYCLE_INVARIANT_FAILED", lifecycle.to_dict())
         if (
             mechanical_lifecycle.active_subtasks
             or mechanical_lifecycle.duplicate_terminal_subtasks
             or mechanical_lifecycle.orphan_terminal_subtasks
         ):
-            self._internal_failure = True
-            reason = (
+            mechanical_reason = (
                 "mechanical subtask lifecycle invariant failed: "
                 f"{mechanical_lifecycle.to_dict()}"
             )
+            if self._internal_failure:
+                self._secondary_failures.append({
+                    "kind": "MECHANICAL_LIFECYCLE_INVARIANT_FAILED",
+                    "detail": mechanical_reason,
+                })
+            else:
+                reason = mechanical_reason
+            self._internal_failure = True
             self.store.append(
                 "MECHANICAL_LIFECYCLE_INVARIANT_FAILED",
                 mechanical_lifecycle.to_dict(),
@@ -8341,7 +8631,17 @@ class AutonomousController:
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
             and (self.final_conjecture_proved or self.final_conjecture_refuted)
         )
-        epoch_elapsed = time.monotonic() - self._run_started_monotonic
+        execution = self._run_manifest.get("execution") or {}
+        limits = execution.get("limits") or {}
+        if execution.get("started_epoch") is not None and limits.get(
+            "duration_seconds"
+        ) is not None:
+            epoch_elapsed = min(
+                float(limits["duration_seconds"]),
+                max(0.0, time.time() - float(execution["started_epoch"])),
+            )
+        else:
+            epoch_elapsed = time.monotonic() - self._run_started_monotonic
         campaign_budget_exhausted = False
         if (
             self._campaign_recorded_started
@@ -8359,16 +8659,8 @@ class AutonomousController:
         )
         checkpoint_path = self.run_dir / "state" / "compact_snapshot.json"
         try:
-            if self.policy_manifest is not None:
+            if self._bootstrap_completed and self.policy_manifest is not None:
                 checkpoint_path = self._write_compact_snapshot()
-            elif not checkpoint_path.exists():
-                atomic_write_json(checkpoint_path, {
-                    "schema_version": 1,
-                    "campaign_id": self.campaign_id,
-                    "epoch_id": self.epoch_id,
-                    "lifecycle_phase": self.lifecycle.phase,
-                    "reason": reason,
-                })
             if self._campaign_recorded_started:
                 self.campaign_store.append_epoch_sealed(
                     epoch_id=self.epoch_id,
@@ -8376,12 +8668,23 @@ class AutonomousController:
                     status=campaign_status,
                     stopped_reason=reason,
                     checkpoint_uri=f"epoch://{self.epoch_id}/state/{checkpoint_path.name}",
-                    checkpoint_usable=self._previous_epoch_checkpoint_imported,
+                    checkpoint_usable=bool(
+                        self._bootstrap_completed
+                        and self._recovery_completed
+                        and self._previous_epoch_checkpoint_imported
+                        and checkpoint_path.is_file()
+                    ),
                 )
         except Exception as exc:
+            seal_reason = f"campaign seal failed: {_sanitize_live_text(exc)[:800]}"
+            if self._internal_failure:
+                self._secondary_failures.append({
+                    "kind": "CAMPAIGN_SEAL_FAILED", "detail": seal_reason,
+                })
+            else:
+                reason = seal_reason
             self._internal_failure = True
             campaign_status = "PAUSED"
-            reason = f"campaign seal failed: {_sanitize_live_text(exc)[:800]}"
             self.store.append("CAMPAIGN_SEAL_FAILED", {
                 "campaign_id": self.campaign_id,
                 "epoch_id": self.epoch_id,
@@ -8409,6 +8712,18 @@ class AutonomousController:
             )
         else:
             run_outcome = "failed dry-run" if self._internal_failure else "dry-run validation"
+        outcome_dir = self.layout.outcomes_root / self.run_id
+        outcome_path = outcome_dir / "OUTCOME.md"
+        report_dir = self.layout.nightly_root / self.run_id
+        report_path = report_dir / "NIGHTLY_REPORT.md"
+        attempt_kind = "ATTEMPT_FAILED" if self._internal_failure else "ATTEMPT_COMPLETED"
+        self.store.append(attempt_kind, {
+            "attempt_id": self._attempt_id,
+            "reason": reason,
+            "internal_failure": self._internal_failure,
+            "recovery_completed": self._recovery_completed,
+            "campaign_status": campaign_status,
+        })
         stop_payload = {
             "reason": reason, "internal_failure": self._internal_failure,
             "execution_mode": execution_mode, "run_outcome": run_outcome,
@@ -8417,15 +8732,13 @@ class AutonomousController:
             "campaign_status": campaign_status,
             "token_governor": self.governor.snapshot(),
             "mechanical_token_governor": self.mechanical_governor.snapshot(),
+            "secondary_failures": list(self._secondary_failures),
+            "report": str(report_path),
+            "outcome": str(outcome_path),
             **lifecycle.to_dict(),
         }
-        outcome_dir = self.layout.outcomes_root / self.run_id
-        outcome_path = outcome_dir / "OUTCOME.md"
-        stop_payload["outcome"] = f"project://{outcome_path.relative_to(self.config.project_root).as_posix()}"
         self.live_store.append("LIVE_RUN_STOPPED", stop_payload)
         self.store.append("RUN_STOPPED", stop_payload)
-        report_dir = self.layout.nightly_root / self.run_id
-        report_path = report_dir / "NIGHTLY_REPORT.md"
         events = self.store.replay()
         lifecycle = job_lifecycle_metrics(events)
         mechanical_lifecycle = mechanical_lifecycle_metrics(events)
