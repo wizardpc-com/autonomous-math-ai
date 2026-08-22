@@ -17,6 +17,10 @@ from uuid import uuid4
 from .app_server import redact_auth_material
 from .audit_gate import AuditGate
 from .backend import AppServerBackend, CodexBackend, MockCodexBackend, TurnDirective
+from .canonical_state import (
+    capture_canonical_state, director_canonical_view, director_overlay_text,
+    load_canonical_state, validate_canonical_state, verify_live_startup_sources,
+)
 from .claim_graph import ClaimGraph
 from .config import HarnessConfig, default_max_audit
 from .contracts import (
@@ -841,6 +845,8 @@ class AutonomousController:
         self.policy_manifest: dict[str, Any] | None = None
         self.policy_status: dict[str, Any] | None = None
         self._run_manifest: dict[str, Any] = {}
+        self._canonical_state: dict[str, Any] | None = None
+        self._director_overlay: str | None = None
         self._latest_rate_limits: dict[str, Any] | None = None
         self._last_rate_check = 0.0
         self.stale_remote_turns: list[tuple[str, str, str]] = []
@@ -1612,9 +1618,11 @@ class AutonomousController:
             top_level.add("campaign")
         if version >= 11:
             top_level.add("requested_providers")
+        if version >= 12:
+            top_level.add("canonical_state")
         if set(existing) != top_level:
             raise ValueError(f"RUN_MANIFEST fields are invalid: {sorted(set(existing) ^ top_level)}")
-        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11}:
+        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
             raise ValueError("unsupported or legacy RUN_MANIFEST schema")
         fingerprinted = dict(existing)
         reported = str(fingerprinted.pop("manifest_sha256", ""))
@@ -1663,6 +1671,14 @@ class AutonomousController:
                 raise ValueError("RUN_MANIFEST campaign values are invalid")
         if version >= 11 and not isinstance(existing.get("requested_providers"), dict):
             raise ValueError("RUN_MANIFEST requested_providers is invalid")
+        if version >= 12 and (
+            not isinstance(existing.get("canonical_state"), dict)
+            or set(existing["canonical_state"]) != {
+                "manifest", "manifest_sha256", "canonical_state_sha256",
+                "planning_context_sha256", "git_revision",
+            }
+        ):
+            raise ValueError("RUN_MANIFEST canonical_state fields are invalid")
         output_schemas = existing.get("output_schemas")
         if not isinstance(output_schemas, dict) or set(output_schemas) != {
             "director_plan.schema.json", "worker_result.schema.json", "audit_result.schema.json",
@@ -1746,7 +1762,127 @@ class AutonomousController:
                 f"RUN_MANIFEST requested_routes.{role}.service_tier",
             )
 
+    def _reload_startup_claim_state(self) -> None:
+        graph = ClaimGraph.load(self.layout.claim_graph_path)
+        graph.validate()
+        if self.mock:
+            graph.path = self.run_dir / "state" / "claim_graph.json"
+            graph.save()
+        self.graph = graph
+        legacy = RepresentationContract.legacy()
+        legacy_id = legacy.representation_id
+        self.claim_representations = {
+            claim_id: legacy_id for claim_id in self.graph.claims
+        }
+        self.representation_contracts = {legacy_id: legacy.to_dict()}
+        self.audited_representation_bridges = set()
+        if self.layout.trusted_state_path.is_file():
+            trusted = json.loads(
+                self.layout.trusted_state_path.read_text(encoding="utf-8")
+            )
+            for representation_id, raw_contract in dict(
+                trusted.get("representation_contracts") or {}
+            ).items():
+                contract = RepresentationContract.from_dict(raw_contract)
+                if (
+                    not isinstance(representation_id, str)
+                    or contract.representation_id != representation_id
+                ):
+                    raise ValueError("trusted representation contract id is invalid")
+                self.representation_contracts[representation_id] = contract.to_dict()
+            for claim_id, representation_id in dict(
+                trusted.get("claim_representations") or {}
+            ).items():
+                if claim_id in self.claim_representations and isinstance(
+                    representation_id, str
+                ):
+                    self.claim_representations[claim_id] = representation_id
+            for pair in trusted.get("audited_representation_bridges") or []:
+                if (
+                    isinstance(pair, list) and len(pair) == 2
+                    and all(isinstance(item, str) and item for item in pair)
+                ):
+                    self.audited_representation_bridges.add(tuple(sorted(pair)))
+        if (
+            self.final_conjecture_claim_id
+            and self.final_conjecture_claim_id not in self.graph.claims
+        ):
+            raise ValueError(
+                "configured final conjecture claim is absent from the refreshed "
+                f"claim graph: {self.final_conjecture_claim_id}"
+            )
+
+    def _refresh_canonical_state(self) -> None:
+        state_path = self.run_dir / "state" / "canonical_state.json"
+        if self.resume:
+            if not state_path.is_file():
+                raise ValueError(
+                    "cannot safely resume without startup canonical-state provenance"
+                )
+            state = load_canonical_state(state_path, epoch_id=self.epoch_id)
+            validate_canonical_state(state, run_dir=self.run_dir)
+            changed = verify_live_startup_sources(
+                state, project_root=self.config.project_root, run_dir=self.run_dir,
+            )
+            if changed:
+                raise ValueError(
+                    "startup canonical inputs changed since the run was frozen: "
+                    f"{changed}"
+                )
+            self._canonical_state = state
+            self._director_overlay = director_overlay_text(
+                state, run_dir=self.run_dir,
+            )
+            return
+
+        current_manifest = self.layout.manifest
+        if current_manifest is None or self.config.manifest is None:
+            raise ValueError("project manifest is unavailable during canonical refresh")
+        if current_manifest != self.config.manifest:
+            raise ValueError(
+                "project manifest changed after configuration load; restart amr run"
+            )
+        self._reload_startup_claim_state()
+        previous_state: dict[str, Any] | None = None
+        if self.previous_epoch_id is not None:
+            previous_run = self.layout.run_dir(self.previous_epoch_id)
+            previous_path = previous_run / "state" / "canonical_state.json"
+            if not previous_path.is_file():
+                raise ValueError(
+                    "previous epoch lacks canonical-state provenance; stale planning "
+                    "cannot be synchronized safely"
+                )
+            previous_state = load_canonical_state(
+                previous_path, epoch_id=self.previous_epoch_id,
+            )
+            validate_canonical_state(previous_state, run_dir=previous_run)
+        state = capture_canonical_state(
+            manifest=current_manifest,
+            run_dir=self.run_dir,
+            epoch_id=self.epoch_id,
+            workspace_root=self.config.workspace_root or self.config.project_root,
+            previous_state=previous_state,
+        )
+        validate_canonical_state(state, run_dir=self.run_dir)
+        self._canonical_state = state
+        self._director_overlay = director_overlay_text(state, run_dir=self.run_dir)
+
+    def _assert_startup_canonical_sources(self) -> None:
+        if self._canonical_state is None:
+            raise ValueError("startup canonical state has not been refreshed")
+        changed = verify_live_startup_sources(
+            self._canonical_state,
+            project_root=self.config.project_root,
+            run_dir=self.run_dir,
+        )
+        if changed:
+            raise ValueError(
+                "canonical input changed after startup refresh: " + repr(changed)
+            )
+
     def _pin_run_inputs(self, hours: float | None, dry_run: bool) -> float:
+        if self._canonical_state is None:
+            self._refresh_canonical_state()
         self.policy_manifest, self.policy_status = pin_policy_manifest(
             self.config, self.policy_manifest_path, resume=self.resume
         )
@@ -1803,7 +1939,7 @@ class AutonomousController:
             raise ValueError("hours must be positive")
         self._effective_run_hours = requested_hours
         payload = {
-            "schema_version": 11,
+            "schema_version": 12,
             "run_id": self.run_id,
             "campaign": {
                 "campaign_id": self.campaign_id,
@@ -1862,6 +1998,19 @@ class AutonomousController:
                 ),
                 "initial_sha256": file_digest(self.layout.claim_graph_path),
             },
+            "canonical_state": {
+                "manifest": f"epoch://{self.epoch_id}/state/canonical_state.json",
+                "manifest_sha256": file_digest(
+                    self.run_dir / "state" / "canonical_state.json"
+                ),
+                "canonical_state_sha256": self._canonical_state[
+                    "canonical_state_sha256"
+                ],
+                "planning_context_sha256": self._canonical_state[
+                    "planning_context_sha256"
+                ],
+                "git_revision": self._canonical_state["git_revision"],
+            },
             "candidate_recovery": {"source_run_id": self.recover_candidates_from},
             "output_schemas": output_schemas,
         }
@@ -1886,6 +2035,7 @@ class AutonomousController:
                 "output_schema_hashes": {
                     name: entry["sha256"] for name, entry in payload["output_schemas"].items()
                 },
+                "canonical_state": payload["canonical_state"],
             }
             observed = {
                 "run_id": existing.get("run_id"),
@@ -1919,6 +2069,7 @@ class AutonomousController:
                     for name, entry in existing.get("output_schemas", {}).items()
                     if isinstance(entry, dict)
                 },
+                "canonical_state": existing.get("canonical_state"),
             }
             if int(existing.get("schema_version", 0)) < 10:
                 immutable_checks.pop("campaign", None)
@@ -1926,6 +2077,9 @@ class AutonomousController:
             if int(existing.get("schema_version", 0)) < 11:
                 immutable_checks.pop("requested_providers", None)
                 observed.pop("requested_providers", None)
+            if int(existing.get("schema_version", 0)) < 12:
+                immutable_checks.pop("canonical_state", None)
+                observed.pop("canonical_state", None)
             if observed != immutable_checks:
                 raise ValueError("RUN_MANIFEST immutable inputs do not match the resumed controller")
             if bool(existing["execution"].get("dry_run")) or dry_run:
@@ -3743,6 +3897,54 @@ class AutonomousController:
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
         if not isinstance(snapshot, dict):
             raise ValueError("previous epoch compact snapshot is invalid")
+        previous_canonical = snapshot.get("canonical_state")
+        if not isinstance(previous_canonical, dict):
+            raise ValueError(
+                "previous epoch planning mirror lacks canonical-state provenance"
+            )
+        previous_context = str(
+            previous_canonical.get("planning_context_sha256") or ""
+        )
+        current_context = str(
+            (self._canonical_state or {}).get("planning_context_sha256") or ""
+        )
+        if not previous_context or not current_context:
+            raise ValueError("canonical planning-context provenance is incomplete")
+        if previous_context != current_context:
+            unsafe_audit_state = bool(
+                snapshot.get("candidate_audit_frontier")
+                or snapshot.get("pending_audits")
+                or any(
+                    item.get("status") in {"PENDING", "ACTIVE", "RETRY_WAIT"}
+                    for item in self.audit_leases.snapshot()
+                )
+            )
+            if unsafe_audit_state:
+                raise ValueError(
+                    "canonical state drifted while an audit frontier remains; "
+                    "automatic synchronization is unsafe"
+                )
+            self.store.append("STALE_PLANNING_STATE_DISCARDED", {
+                "source_epoch_id": self.previous_epoch_id,
+                "previous_planning_context_sha256": previous_context,
+                "current_planning_context_sha256": current_context,
+                "discarded_pending_research": len(
+                    snapshot.get("pending_research") or []
+                ),
+                "discarded_recent_changes": len(
+                    snapshot.get("recent_changes") or []
+                ),
+                "action": (
+                    "rebuild derived planning state and launch a fresh Director "
+                    "from current startup-frozen canonical inputs"
+                ),
+            })
+            self._request_director(
+                "startup canonical state superseded the previous planning mirror",
+                meaningful_change=True,
+                immediate=True,
+            )
+            return
 
         recovered_active_leases = self.audit_leases.recover_stale_active()
         if recovered_active_leases:
@@ -4038,7 +4240,6 @@ class AutonomousController:
         )
         self._campaign_recorded_started = True
         self._hydrate_applied_campaign_inputs()
-        deadline_epoch = self._pin_run_inputs(hours, dry_run)
         guard_path = self.run_dir / "canonical_guard.before.json"
         if self.resume:
             if not guard_path.is_file():
@@ -4059,6 +4260,30 @@ class AutonomousController:
         else:
             baseline = self.guard.snapshot()
             atomic_write_json(guard_path, baseline)
+        try:
+            self._refresh_canonical_state()
+        except Exception as exc:
+            self.store.append("CANONICAL_STATE_REFRESH_FAILED", {
+                "error": _sanitize_live_text(exc),
+                "action": "stopped before recovery, backend start, or model turn",
+            })
+            return self._finish(
+                "bootstrap failed: canonical-state refresh: "
+                f"{_sanitize_live_text(exc)[:500]}",
+                internal_failure=True,
+            )
+        try:
+            deadline_epoch = self._pin_run_inputs(hours, dry_run)
+        except Exception as exc:
+            self.store.append("RUN_INPUT_PINNING_FAILED", {
+                "error": _sanitize_live_text(exc),
+                "action": "stopped before recovery, backend start, or model turn",
+            })
+            return self._finish(
+                "bootstrap failed: run-input pinning: "
+                f"{_sanitize_live_text(exc)[:500]}",
+                internal_failure=True,
+            )
         if self.resume:
             self.recover()
         self.store.append("RUN_STARTED", {
@@ -4069,6 +4294,13 @@ class AutonomousController:
             "resume": self.resume,
             "config": self._run_manifest["config"]["source"],
             "canonical_claim_graph": self._run_manifest["canonical_claim_graph"]["path"],
+            "canonical_state": self._run_manifest["canonical_state"]["manifest"],
+            "canonical_state_sha256": self._run_manifest["canonical_state"][
+                "canonical_state_sha256"
+            ],
+            "planning_context_sha256": self._run_manifest["canonical_state"][
+                "planning_context_sha256"
+            ],
             "project_name": self.config.project_name,
             "final_conjecture_claim_id": self.final_conjecture_claim_id,
             "policy_manifest": self._run_manifest["research_policy"]["manifest"],
@@ -4178,10 +4410,32 @@ class AutonomousController:
                 "candidate_count": len(recovered_candidates),
                 "action": "validated without starting a model turn",
             })
+        try:
+            startup_snapshot = self._write_compact_snapshot()
+        except Exception as exc:
+            self.store.append("CANONICAL_STATE_SYNCHRONIZATION_FAILED", {
+                "error": _sanitize_live_text(exc),
+                "action": "stopped before backend start or model turn",
+            })
+            return self._finish(
+                "bootstrap failed: canonical-state synchronization: "
+                f"{_sanitize_live_text(exc)[:500]}",
+                internal_failure=True,
+            )
+        self.store.append("CANONICAL_STATE_REFRESHED", {
+            "canonical_state_sha256": self._canonical_state[
+                "canonical_state_sha256"
+            ],
+            "planning_context_sha256": self._canonical_state[
+                "planning_context_sha256"
+            ],
+            "planning_mirror": self._canonical_state["planning_mirror"],
+            "snapshot": str(startup_snapshot),
+            "canonical_files_modified": False,
+        })
         if dry_run:
-            snapshot = self._write_compact_snapshot()
             self.store.append("DRY_RUN_VALIDATED", {
-                "snapshot": str(snapshot),
+                "snapshot": str(startup_snapshot),
                 "recoverable_candidates": len(recovered_candidates),
             })
             return self._finish("dry-run validation complete")
@@ -4443,8 +4697,27 @@ class AutonomousController:
         return self._finish(stopped_reason)
 
     def _write_compact_snapshot(self) -> Path:
+        self._assert_startup_canonical_sources()
         active_tasks = [active.task.to_dict() for active in self.active.values()]
         snapshot = self.graph.compact_snapshot(active_tasks, self.governor.snapshot(), self.recent_changes)
+        canonical_view = director_canonical_view(
+            self._canonical_state, run_dir=self.run_dir,
+        )
+        snapshot["canonical_state"] = canonical_view
+        snapshot["claim_state_provenance"] = {
+            "authority": "controller_claim_mirror",
+            "sha256": stable_hash({
+                claim_id: claim.to_dict()
+                for claim_id, claim in sorted(self.graph.claims.items())
+            }),
+            "startup_path": self._canonical_state["claim_graph"]["path"],
+            "startup_sha256": self._canonical_state["claim_graph"]["sha256"],
+            "status_rule": (
+                "The live controller mirror supplies structured claim identities and "
+                "audit-gated transitions. Startup-frozen canonical inputs take "
+                "precedence for human-authored frontier and progress descriptions."
+            ),
+        }
         snapshot["mechanical_token_governor"] = self.mechanical_governor.snapshot()
         snapshot["research_target"] = {
             "project_name": self.config.project_name,
@@ -4569,6 +4842,7 @@ class AutonomousController:
             audit_leases=self.audit_leases.snapshot(),
             route_records=route_records,
             representations=self.claim_representations,
+            canonical_state=canonical_view,
         )
         write_research_map(
             state_root / "RESEARCH_MAP.json",
@@ -4576,6 +4850,7 @@ class AutonomousController:
             graph=self.graph,
             route_records=route_records,
             representations=self.claim_representations,
+            canonical_state=canonical_view,
         )
         return path
 
@@ -4693,7 +4968,19 @@ class AutonomousController:
             if not self.pending_research and not self.pending_audits:
                 self.scheduler_stop_reason = "fresh Director cannot start within remaining token budget"
             return
-        snapshot = self._write_compact_snapshot()
+        try:
+            snapshot = self._write_compact_snapshot()
+        except Exception as exc:
+            reason = (
+                "canonical-state synchronization failed before Director launch: "
+                f"{_sanitize_live_text(exc)[:500]}"
+            )
+            self.store.append("DIRECTOR_CANONICAL_STATE_FAILED", {
+                "error": _sanitize_live_text(exc),
+                "action": "fail closed without launching a Director",
+            })
+            self._begin_internal_failure_drain(reason, source="canonical_state")
+            return
         snapshot_version = self._director_requested_version
         task = ResearchTask(
             task_id=f"director-{uuid4().hex[:12]}", role=Role.DIRECTOR,
@@ -4717,6 +5004,7 @@ class AutonomousController:
         prompt = director_prompt(
             self.config.project_root, snapshot, self.director_constraints,
             self._policy_view(Role.DIRECTOR),
+            project_overlay=self._director_overlay,
         )
         self.director_needed = False
         self._director_active = True

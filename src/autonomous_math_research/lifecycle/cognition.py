@@ -146,6 +146,7 @@ def write_core_capsule(
     audit_leases: list[dict[str, Any]],
     route_records: list[dict[str, Any]],
     representations: dict[str, str],
+    canonical_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stats = {"truncated_values": 0}
     frontier_source = [
@@ -199,6 +200,9 @@ def write_core_capsule(
         "schema_version": 1,
         "generated_at": utc_now(),
         "authority": "derived_noncanonical",
+        "canonical_state": _bounded_capsule_value(
+            canonical_state or {}, stats,
+        ),
         **bounded,
         "compaction": {
             "source_counts": source_counts,
@@ -239,6 +243,7 @@ def write_research_map(
     graph: ClaimGraph,
     route_records: list[dict[str, Any]],
     representations: dict[str, str],
+    canonical_state: dict[str, Any] | None = None,
 ) -> None:
     claims = [
         {
@@ -255,6 +260,12 @@ def write_research_map(
         "schema_version": 1,
         "generated_at": utc_now(),
         "authority": "derived_noncanonical",
+        "canonical_state_sha256": (
+            canonical_state or {}
+        ).get("canonical_state_sha256"),
+        "planning_context_sha256": (
+            canonical_state or {}
+        ).get("planning_context_sha256"),
         "claims": claims,
         "routes": route_records,
     }
@@ -263,6 +274,7 @@ def write_research_map(
         "# Research Map",
         "",
         "> Derived navigation only; claim graph and independent audits remain authoritative.",
+        "> Startup-frozen canonical inputs override stale planning descriptions.",
         "",
         "| Claim | Math | Trust | Evidence | Representation |",
         "|---|---|---|---|---|",

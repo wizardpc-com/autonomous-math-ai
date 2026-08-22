@@ -23,9 +23,45 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
   credential-reference declarations before any model turn.
 - `cli/` owns the `amr` command surface.
 - `resources/` contains immutable wire schemas and the bundled policy pack.
+- `canonical_state.py` freezes manifest-declared startup inputs and builds the
+  provenance supplied to derived planning views.
 
 `storage_layer` is a compatibility import wrapper, not a second storage
 implementation.
+
+## Startup canonical-state refresh
+
+Every new `amr run` performs a zero-model-turn refresh before backend startup or
+the first Director:
+
+```text
+autonomous/project.json
+    │ resolves canonical_inputs + claim/trust mirrors + optional overlay
+    ▼
+byte-exact run-local snapshots
+    │ path + SHA-256 + available Git HEAD
+    ▼
+canonical_state.json
+    │ drift/integrity gate
+    ▼
+compact_snapshot + CORE_CAPSULE + RESEARCH_MAP
+    ▼
+fresh Director
+```
+
+The run-local `canonical_state.json` freezes each unique canonical input once
+and records its role membership. Director inputs are embedded as UTF-8 content
+in the dynamic snapshot, so the Director does not need to reopen project files.
+The claim graph and trusted-state files are snapshotted as startup provenance;
+the refresh does not rewrite them or infer mathematical/trust transitions from
+Markdown.
+
+A crash resume must match the original frozen canonical inputs. Across fresh
+epochs, a changed canonical or planning-context fingerprint invalidates pending
+research planning and forces a rebuild. If an unresolved audit frontier cannot
+be safely rebound to the changed state, startup fails closed before any model
+turn. Canonical inputs are rechecked before every Director snapshot, closing the
+read-to-launch race.
 
 ## Trust path
 
@@ -160,6 +196,13 @@ Incremental Director work is coalesced and debounced behind a version watermark.
 The Director does not wait for all research and audit jobs to drain and cannot
 block their normal dispatch.
 
+Falsification-first ordering, representation bridges, audit gates, route kill
+gates, route novelty, task deduplication, and bounded stop conditions are
+tool-level Director policy. `prompts/director.md` is only an optional stable
+project-constraint overlay. The dynamic canonical snapshot has explicit
+precedence over that overlay and every prior planning mirror for current
+frontier, open/closed claims, and recent progress.
+
 A task id is a stable binding to one task fingerprint within an epoch. The
 controller rejects changed task content that reuses an accepted id and has a
 final dispatch-time guard against concurrently active duplicate ids. Each job
@@ -193,7 +236,9 @@ Director wave rather than by placing task ids in that field.
 `CORE_CAPSULE` is a bounded rebuildable snapshot, `RESEARCH_MAP` is a derived
 human-readable view, and `ROUTE_LEDGER` records failed approaches and explicit
 retry conditions. None of these derived views can override the canonical claim
-graph. The capsule's 32 KiB contract is enforced against the exact compact
+graph or startup-frozen canonical inputs. Both derived views carry the canonical
+state/planning-context fingerprints used to build them. The capsule's 32 KiB
+contract is enforced against the exact compact
 UTF-8 bytes written atomically. Oversized nested values and low-priority or old
 derived entries are deterministically compacted, with source, dropped, and
 truncation counts retained in the capsule; high-priority frontier entries are

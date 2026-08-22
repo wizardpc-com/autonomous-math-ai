@@ -22,6 +22,13 @@ v9 新增了 `campaign.hours`（默认 12）和 `campaign.epoch_hours`（默认 
 未传对应参数时读取项目值；显式 `--hours`、`--epoch-hours` 保持最高优先级。
 `config summary` 会脱敏输出项目、campaign、并发、预算、逐角色路由和机械路由摘要。
 
+启动 canonical refresh 没有可关闭的配置开关，项目配置或用户 profile 均不能绕过。
+`amr run` 在任何模型 turn 之前冻结 manifest 声明的 canonical inputs、SHA-256、可用的
+Git revision、结构化 claim/trust mirror 与可选 Director overlay。崩溃 resume 必须继续
+使用原冻结输入；新 epoch 遇到安全可同步的 canonical 更新时丢弃旧 pending planning 并
+重建动态 snapshot，若仍有无法安全重绑定的 audit frontier 则 fail closed。刷新只写入
+run-local derived state，不改写 `CLAIMS.md`、`PROGRESS.md` 或数学/trust 状态。
+
 `engine` 还声明同线程研究 continuation：`research_max_turns.prover`、
 `.falsifier`、`.explorer` 分别配置，内置默认均为 12；
 `reasoning_health_short_tokens` 默认 600；

@@ -25,6 +25,14 @@ concurrency, budgets, each role route, and mechanical routing. Schema v9 added
 the corresponding CLI flags are absent, `amr run` uses these project values;
 explicit `--hours` and `--epoch-hours` remain highest priority.
 
+Startup canonical refresh has no configuration switch and cannot be disabled by
+a project or user profile. `amr run` pins manifest-declared canonical inputs,
+their SHA-256 values, available Git revision, structured claim/trust mirrors,
+and the optional Director overlay before any model turn. Crash resume requires
+the original pinned inputs. A new epoch discards stale pending planning after a
+safe canonical change, while unresolved audit state that cannot be rebound stops
+fail-closed. The refresh writes only run-local derived state.
+
 The `engine` section also controls controller-owned research continuation:
 
 - `research_max_turns.prover`, `.falsifier`, and `.explorer` (each defaulting

@@ -32,11 +32,12 @@ from autonomous_math_research.project import (
     ProjectManifest,
     discover_workspace_root,
 )
+from autonomous_math_research.prompts import director_prompt
 from autonomous_math_research.representation import (
     RepresentationContract,
     require_compatible_representations,
 )
-from autonomous_math_research.storage import ProjectLayout
+from autonomous_math_research.storage import ProjectLayout, file_digest
 from autonomous_math_research.storage_layer.artifacts import ArtifactStore
 from autonomous_math_research.storage_layer.steering import (
     append_steering,
@@ -98,6 +99,166 @@ class NextArchitectureTests(unittest.TestCase):
         manifest = ProjectManifest.load(self.project)
         self.assertEqual(manifest.project_id, "external-neutral-project")
         self.assertEqual(discover_workspace_root(self.project), self.project)
+
+    def test_startup_refresh_embeds_latest_frontier_after_canonical_update(self) -> None:
+        progress = self.project / "state" / "PROGRESS.md"
+        progress.write_text("# Progress\n\nFRONTIER-V1\n", encoding="utf-8")
+        first = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="canonical-frontier-v1", campaign_id="canonical-frontier-v1",
+        )
+        first._pin_run_inputs(0.01, True)
+        first_snapshot = first._write_compact_snapshot().read_text(encoding="utf-8")
+        self.assertIn("FRONTIER-V1", first_snapshot)
+
+        progress.write_text("# Progress\n\nFRONTIER-V2\n", encoding="utf-8")
+        overlay = self.project / "autonomous" / "prompts" / "director.md"
+        overlay.write_text(
+            "Stable constraint: exact arithmetic only. Stale frontier: FRONTIER-V1.\n",
+            encoding="utf-8",
+        )
+        second = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="canonical-frontier-v2", campaign_id="canonical-frontier-v2",
+        )
+        second._pin_run_inputs(0.01, True)
+        snapshot_path = second._write_compact_snapshot()
+        snapshot_text = snapshot_path.read_text(encoding="utf-8")
+        self.assertIn("FRONTIER-V2", snapshot_text)
+        self.assertNotEqual(
+            first._canonical_state["canonical_state_sha256"],
+            second._canonical_state["canonical_state_sha256"],
+        )
+        prompt = director_prompt(
+            self.project, snapshot_path, [], second._policy_view("director"),
+            project_overlay=second._director_overlay,
+        )
+        self.assertIn("FRONTIER-V1", prompt)
+        self.assertIn("FRONTIER-V2", prompt)
+        self.assertGreater(prompt.rfind("FRONTIER-V2"), prompt.rfind("FRONTIER-V1"))
+        capsule = (second.run_dir / "state" / "CORE_CAPSULE.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FRONTIER-V2", capsule)
+
+    def test_project_director_overlay_is_optional(self) -> None:
+        (self.project / "autonomous" / "prompts" / "director.md").unlink()
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="no-director-overlay", campaign_id="no-director-overlay",
+        )
+        controller._pin_run_inputs(0.01, True)
+        snapshot_path = controller._write_compact_snapshot()
+        (self.project / "autonomous" / "prompts" / "director.md").write_text(
+            "late unpinned overlay\n", encoding="utf-8",
+        )
+        prompt = director_prompt(
+            self.project, snapshot_path, [], controller._policy_view("director"),
+            project_overlay=controller._director_overlay,
+        )
+
+        self.assertIsNone(controller._director_overlay)
+        self.assertIn("AMR TOOL-LEVEL DIRECTOR POLICY", prompt)
+        self.assertIn("startup_frozen_canonical_inputs", prompt)
+        self.assertNotIn("late unpinned overlay", prompt)
+
+    def test_canonical_drift_discards_previous_epoch_planning(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="planning-before-refresh", campaign_id="planning-refresh",
+        )
+        first._pin_run_inputs(0.01, True)
+        first.pending_research = [research_task("stale-frontier-task")]
+        first._write_compact_snapshot()
+
+        (self.project / "state" / "PROGRESS.md").write_text(
+            "# Progress\n\nA new canonical frontier supersedes the old plan.\n",
+            encoding="utf-8",
+        )
+        second = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="planning-after-refresh", campaign_id="planning-refresh",
+            previous_epoch_id="planning-before-refresh",
+        )
+        second._pin_run_inputs(0.01, True)
+        second._import_previous_epoch_checkpoint()
+
+        self.assertEqual(second.pending_research, [])
+        discarded = [
+            event for event in second.store.replay()
+            if event["kind"] == "STALE_PLANNING_STATE_DISCARDED"
+        ]
+        self.assertEqual(len(discarded), 1)
+        self.assertEqual(discarded[0]["payload"]["discarded_pending_research"], 1)
+
+    def test_canonical_drift_with_audit_frontier_fails_closed(self) -> None:
+        first = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="audit-before-refresh", campaign_id="audit-refresh",
+        )
+        first._pin_run_inputs(0.01, True)
+        snapshot_path = first._write_compact_snapshot()
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        snapshot["candidate_audit_frontier"] = [{"sealed": "candidate"}]
+        snapshot_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (self.project / "state" / "PROGRESS.md").write_text(
+            "# Progress\n\nCanonical state changed during an audit frontier.\n",
+            encoding="utf-8",
+        )
+        second = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="audit-after-refresh", campaign_id="audit-refresh",
+            previous_epoch_id="audit-before-refresh",
+        )
+        second._pin_run_inputs(0.01, True)
+        with self.assertRaisesRegex(ValueError, "automatic synchronization is unsafe"):
+            second._import_previous_epoch_checkpoint()
+        self.assertEqual(second.pending_research, [])
+
+    def test_canonical_change_after_refresh_blocks_snapshot_and_director(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="canonical-race", campaign_id="canonical-race",
+        )
+        controller._pin_run_inputs(0.01, True)
+        (self.project / "state" / "PROGRESS.md").write_text(
+            "# Progress\n\nChanged after refresh.\n", encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "changed after startup refresh"):
+            controller._write_compact_snapshot()
+        self.assertFalse(controller._director_active)
+
+    def test_startup_refresh_does_not_rewrite_canonical_files(self) -> None:
+        manifest = ProjectManifest.load(self.project)
+        canonical_paths = {
+            manifest.path,
+            manifest.resolve(manifest.claim_graph),
+            manifest.resolve(manifest.trusted_state),
+            *(
+                manifest.resolve(item)
+                for items in manifest.canonical_inputs.values()
+                for item in items
+            ),
+        }
+        before = {path: file_digest(path) for path in canonical_paths}
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="canonical-read-only", campaign_id="canonical-read-only",
+        )
+        result = asyncio.run(controller.run(0.01, dry_run=True))
+        after = {path: file_digest(path) for path in canonical_paths}
+
+        self.assertFalse(result.internal_failure)
+        self.assertEqual(after, before)
+        run_manifest = json.loads(
+            (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(run_manifest["schema_version"], 12)
+        self.assertIn("canonical_state", run_manifest)
 
     def test_run_id_rejects_path_escape(self) -> None:
         layout = ProjectLayout(self.project)

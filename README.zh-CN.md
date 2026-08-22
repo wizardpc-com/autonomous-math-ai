@@ -122,4 +122,9 @@ CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超
 dry-run、mock 或 real 启动时还会同步打开精确绑定本次 run 的独立监视窗口。密钥只能
 使用凭据引用，不能写入入口或项目配置。
 
+每次新 run 会在首轮 Director 前按 `autonomous/project.json` 冻结 canonical inputs 的
+路径、SHA-256 与可用 Git revision，并重建 run-local snapshot、`CORE_CAPSULE` 和
+`RESEARCH_MAP`。动态 canonical 内容覆盖陈旧的项目 Director/frontier 描述；不能安全
+同步的漂移会在模型 turn 前 fail closed，刷新过程不改写 canonical 项目文件。
+
 本项目采用 [MIT License](LICENSE)。

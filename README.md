@@ -127,6 +127,12 @@ prompts, a claim graph, trusted-state metadata, and protected canonical inputs.
 The installed package owns wire schemas, lifecycle rules, scheduling, storage,
 recovery, audit leases, and policy enforcement.
 
+Before every new run, AMR freezes the manifest-declared canonical inputs with
+path, SHA-256, and available Git revision, then rebuilds the run-local Director
+snapshot, `CORE_CAPSULE`, and `RESEARCH_MAP`. Current canonical input content
+overrides stale project-Director or prior-planning prose. Unsafe drift stops
+before a model turn; startup refresh never rewrites canonical project files.
+
 `amr init` generates a neutral example that can live in any directory. The
 engine does not require this source repository, a particular parent directory,
 or a conjecture-specific policy file.
@@ -149,7 +155,10 @@ internal failure, the controller stops dispatching and drains healthy in-flight
 work before sealing. It does not turn an internal failure into queue exhaustion
 or silently discard pending candidates.
 
-The Director receives a controller-owned compatibility view for claim
+The Director's falsification, representation-bridge, audit, kill-gate, and route
+novelty rules live in AMR. A project `director.md` is an optional stable
+constraints overlay, not a frontier source. The Director receives a
+controller-owned compatibility view for claim
 representations and audited bridges. If every proposed task fails semantic
 admission, route bookkeeping is retained and the controller requests one bounded
 repair plan. A second plan with no runnable research or audit work pauses the

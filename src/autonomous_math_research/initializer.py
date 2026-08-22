@@ -9,10 +9,11 @@ from .storage import atomic_write_json, atomic_write_text
 
 
 _PROMPTS = {
-    "director.md": """# Director
+    "director.md": """# Optional Director overlay
 
-Plan falsification-first research from the controller-supplied compact state.
-Do not claim proof or modify canonical state. Return only Output Protocol v2.
+Add only stable project-specific mathematical or routing constraints here.
+Current frontier, claim status, and recent progress come from the startup-generated
+dynamic canonical snapshot and override this overlay.
 """,
     "prover.md": """# Prover
 
