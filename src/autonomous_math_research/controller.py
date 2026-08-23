@@ -28,7 +28,7 @@ from .canonical_transition import (
     CanonicalTransitionStore, bytes_sha256, json_bytes,
 )
 from .claim_graph import ClaimGraph
-from .config import HarnessConfig, default_max_audit
+from .config import CONFIG_SCHEMA_VERSION, HarnessConfig, default_max_audit
 from .contracts import (
     LOCAL_STRUCTURAL_FAILURES,
     MODEL_PROTOCOL_FAILURES,
@@ -86,7 +86,11 @@ from .policy import (
     pin_policy_manifest, policy_view_for_role,
 )
 from .provider_backend import ProviderRouterBackend
-from .provider_config import mapped_reasoning_effort, validate_service_tier
+from .provider_config import (
+    allowed_observed_service_tiers, mapped_reasoning_effort,
+    validate_service_tier,
+)
+from .profiles import migrate_config
 from .reporting import write_report
 from .representation import RepresentationContract, require_compatible_representations
 from .reasoning_health import ReasoningHealthMonitor
@@ -107,7 +111,7 @@ from .token_governor import TokenGovernor
 from .workspace import WorkspaceManager
 
 
-DEFAULT_RUN_HOURS = 12.0
+DEFAULT_RUN_HOURS = 5.0
 CONTINUATION_CHECKPOINT_REASONS = frozenset({
     "bounded same-thread turn limit reached",
     "controller token budget reached",
@@ -1800,8 +1804,9 @@ class AutonomousController:
         for name, entry in output_schemas.items():
             if not isinstance(entry, dict) or set(entry) != {"source", "snapshot", "sha256"}:
                 raise ValueError(f"RUN_MANIFEST output schema entry is invalid: {name}")
-        if existing.get("requested_service_tier") is not None:
-            raise ValueError("RUN_MANIFEST requested a forbidden service tier")
+        manifest_tier = existing.get("requested_service_tier")
+        if manifest_tier not in {None, "fast"}:
+            raise ValueError("RUN_MANIFEST requested an invalid service tier")
         execution = existing["execution"]
         if execution.get("mode") not in {"real", "mock"}:
             raise ValueError("RUN_MANIFEST has an invalid execution mode")
@@ -1874,6 +1879,17 @@ class AutonomousController:
                 route.get("service_tier"), capabilities,
                 f"RUN_MANIFEST requested_routes.{role}.service_tier",
             )
+            route_tier = route.get("service_tier")
+            if manifest_tier == "fast" and route_tier != "fast":
+                raise ValueError(
+                    "RUN_MANIFEST fast mode does not cover every main role"
+                )
+            if manifest_tier is None and isinstance(route_tier, str) and (
+                route_tier.casefold() in {"fast", "priority", "auto"}
+            ):
+                raise ValueError(
+                    "RUN_MANIFEST route requests fast without explicit fast mode"
+                )
 
     def _trusted_state_payload(self, *, transition_kind: str) -> dict[str, Any]:
         existing: dict[str, Any] = {}
@@ -2168,16 +2184,29 @@ class AutonomousController:
         self._mechanical_broker_client_sha256 = str(broker_entry["sha256"])
         self._runtime_provenance = capture_runtime_provenance(
             include_codex=not self.mock and not dry_run,
+            require_fast_service_tier=(
+                not self.mock
+                and not dry_run
+                and self.config.fast_mode
+                and any(
+                    self.config.raw["providers"][str(route["provider"])]["adapter"]
+                    == "codex_app_server"
+                    for route in self.config.raw["models"].values()
+                )
+            ),
         )
         config_snapshot = self.run_dir / "config" / "config.yaml"
         config_snapshot.parent.mkdir(parents=True, exist_ok=True)
         if config_snapshot.exists():
-            if json.loads(config_snapshot.read_text(encoding="utf-8")) != self.config.raw:
+            pinned_config = json.loads(config_snapshot.read_text(encoding="utf-8"))
+            migrated_pinned_config, _ = migrate_config(pinned_config)
+            if migrated_pinned_config != self.config.raw:
                 raise ValueError("resume config does not match the pinned run config")
         else:
             if self.resume:
                 raise ValueError("cannot resume a legacy run without a pinned config snapshot")
             atomic_write_json(config_snapshot, self.config.raw)
+            pinned_config = self.config.raw
         schema_snapshot_root = self.run_dir / "config" / "output_schemas"
         schema_snapshot_root.mkdir(parents=True, exist_ok=True)
         output_schemas: dict[str, dict[str, str]] = {}
@@ -2234,7 +2263,7 @@ class AutonomousController:
             },
             "requested_routes": self.config.raw["models"],
             "requested_providers": self.config.raw["providers"],
-            "requested_service_tier": None,
+            "requested_service_tier": self.config.requested_service_tier,
             "observed_service_tier": None,
             "execution": {
                 "mode": "mock" if self.mock else "real",
@@ -2283,14 +2312,27 @@ class AutonomousController:
             existing = json.loads(manifest_path.read_text(encoding="utf-8"))
             self._verify_run_manifest(existing)
             self._run_manifest = existing
+            legacy_config_snapshot = int(
+                pinned_config.get("schema_version", 0)
+            ) < CONFIG_SCHEMA_VERSION
             immutable_checks = {
                 "run_id": self.run_id,
                 "config_sha256": payload["config"]["sha256"],
                 "policy_sha256": payload["research_policy"]["manifest_sha256"],
                 "stable_core": payload["research_policy"]["stable_core"],
-                "requested_routes": payload["requested_routes"],
-                "requested_providers": payload["requested_providers"],
-                "requested_service_tier": None,
+                "requested_routes": (
+                    pinned_config.get("models")
+                    if legacy_config_snapshot else payload["requested_routes"]
+                ),
+                "requested_providers": (
+                    pinned_config.get("providers")
+                    if legacy_config_snapshot else payload["requested_providers"]
+                ),
+                "requested_service_tier": (
+                    None
+                    if legacy_config_snapshot
+                    else payload["requested_service_tier"]
+                ),
                 "canonical_claim_graph_path": payload["canonical_claim_graph"]["path"],
                 "candidate_recovery": payload["candidate_recovery"],
                 "research_target": payload["research_target"],
@@ -7592,13 +7634,15 @@ class AutonomousController:
             # and before JOB_COMPLETED is persisted.  A later mutation would
             # leave the append-only event looking successful.
             observed_tier = str(outcome.observed_service_tier or "unobservable")
-            requested_tier = self.config.route_for(active.task.role).get("service_tier")
-            allowed_observed = (
-                {"none", "unobservable"}
-                if requested_tier in {None, ""}
-                else {str(requested_tier)}
+            requested_tier = active.requested_service_tier
+            allowed_observed = allowed_observed_service_tiers(requested_tier)
+            tier_mismatch = observed_tier not in allowed_observed
+            telemetry_required = bool(
+                outcome.succeeded
+                or outcome.failure_kind == "service_tier_policy"
+                or observed_tier != "unobservable"
             )
-            if observed_tier not in allowed_observed:
+            if tier_mismatch and telemetry_required:
                 self.stop_for_review = (
                     "service tier policy violation: "
                     f"requested={requested_tier!r}, observed={observed_tier!r}"
@@ -7624,10 +7668,7 @@ class AutonomousController:
                     outcome.provider and active.provider
                     and outcome.provider != active.provider
                 )
-                or (
-                    outcome.requested_service_tier is not None
-                    and outcome.requested_service_tier != requested_tier
-                )
+                or outcome.requested_service_tier != requested_tier
             )
             if route_mismatch:
                 original_failure = None if outcome.succeeded else {
@@ -9302,7 +9343,7 @@ class AutonomousController:
                 "policy_source_drift": bool(
                     self.policy_status and self.policy_status["source_drift"]
                 ),
-                "requested_service_tier": None,
+                "requested_service_tier": self.config.requested_service_tier,
                 "observed_service_tiers": sorted({
                     str(job.get("observed_service_tier") or "unobservable")
                     for job in self.completed_jobs

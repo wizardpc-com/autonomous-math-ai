@@ -16,7 +16,8 @@ Changes must preserve these invariants:
 - mechanical workers are bounded, one-shot, non-recursive, and strategy-free;
 - mock and live paths use the same protocol/schema checks;
 - missing telemetry is not reported as a confirmed zero;
-- no route uses fast or priority service.
+- main-role Fast requires an explicit pinned `execution.fast_mode=true`; all
+  other Fast/priority use, including every mechanical route, is rejected.
 
 Changes that relax a schema, silently swallow an error, rewrite evidence, or
 turn an internal failure into a normal terminal state will not be accepted.

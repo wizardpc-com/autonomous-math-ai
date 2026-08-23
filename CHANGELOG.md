@@ -18,6 +18,10 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Neutral certified-checker and frozen empirical-protocol fixtures and their
   documentation-only manifest schema.
 
+- Configuration schema v12 with one explicit `execution.fast_mode` switch for
+  all controller-owned main roles. Fast remains off by default; mechanical
+  workers remain pinned to a null tier.
+
 - Artifact-finalization progress events, structured operator-interrupt
   terminals, and `campaign continue --auto-epochs`.
 
@@ -52,6 +56,15 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   schema-v5 pinned-policy resume behavior; the `autonomous-math-ai`
   distribution, `autonomous_math_research` namespace, and `amr` command names
   are unchanged. Empirical outcomes never become mathematical `PROVED` state.
+
+- Fast requests now pin `serviceTier=fast` on thread and every turn, while
+  accepting an observed `priority` alias only for an explicit Fast request.
+  Runtime schema preflight rechecks the required App Server fields every epoch,
+  resumed auto-epoch campaigns retain their pinned Fast selection, and
+  pre-response transport/quota failures preserve their original cause.
+
+- New configurations default campaigns to five hours; explicit project,
+  profile, and CLI duration overrides remain authoritative.
 
 - Incremental Director turns now receive a sub-4-KiB routing envelope instead
   of inline snapshots or transcripts. Complete current context is stored in a

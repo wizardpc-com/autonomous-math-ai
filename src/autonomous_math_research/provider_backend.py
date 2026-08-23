@@ -21,6 +21,9 @@ from .backend import (
 )
 from .config import HarnessConfig
 from .models import JobOutcome, ResearchTask, TokenUsage
+from .provider_config import (
+    allowed_observed_service_tiers, normalize_observed_service_tier,
+)
 from .schema import validate, validate_output_schema_compatibility
 
 
@@ -297,8 +300,16 @@ class OpenAICompatibleBackend:
                 raise ModelRoutePolicyError("provider_response", model, observed_model)
             observed_tier = response.get("service_tier", response.get("serviceTier"))
             requested_tier = route.get("service_tier")
-            if observed_tier not in {None, ""} and observed_tier != requested_tier:
-                raise ServiceTierPolicyError("provider_response", observed_tier)
+            observed_tier_label = (
+                "unobservable"
+                if "service_tier" not in response and "serviceTier" not in response
+                else normalize_observed_service_tier(observed_tier)
+            )
+            if observed_tier_label not in allowed_observed_service_tiers(requested_tier):
+                raise ServiceTierPolicyError(
+                    "provider_response", observed_tier_label,
+                    requested_service_tier=requested_tier,
+                )
             raw_output = _response_text(response, api_style)
             parsed = parse_structured_message(raw_output)
             validate(parsed, output_schema)
@@ -319,7 +330,7 @@ class OpenAICompatibleBackend:
                 model=model, reasoning_effort=effort,
                 provider=self.provider_name, provider_profile=route.get("profile"),
                 requested_service_tier=requested_tier,
-                observed_service_tier=(str(observed_tier) if observed_tier else None),
+                observed_service_tier=observed_tier_label,
                 token_usage=usage, token_telemetry=token_telemetry,
                 cost_usd=cost_usd, cost_telemetry=cost_telemetry,
                 artifact_paths=list(parsed.get("artifact_paths", [])),

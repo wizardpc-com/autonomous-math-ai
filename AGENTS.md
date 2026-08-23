@@ -18,7 +18,10 @@
 - Model output is never proof by itself. Trusted state changes require the
   deterministic controller and audit/canonical gates.
 - Do not read, print, persist, or request authentication secrets.
-- Never use fast or priority service tiers.
+- Fast is permitted only when `execution.fast_mode=true` is explicitly pinned
+  for the run. Request only `fast`; accept `priority` solely as its observed
+  server alias. Otherwise reject fast/priority/ultrafast, and keep mechanical
+  tiers null.
 
 ## Validation
 

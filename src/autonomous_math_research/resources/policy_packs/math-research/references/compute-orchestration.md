@@ -13,9 +13,10 @@ Keep the problem, notation, known results, failed routes, artifacts, and strateg
 | Local compute | installed CAS/compiler/solver on the user's machine | First route for a known deterministic command; batch or shard, verify, persist |
 | Compute agent | primary `gpt-5.3-codex-spark` / `high` / null; permanent-unavailable fallback `gpt-5.6-luna` / `medium` / null | Prepare/adapt one bounded mechanical packet through the controller broker; verify, return, stop; never recurse |
 
-All settings are requested and capability-preflighted. A role route may use only
-a provider-declared safe tier; fast, priority, and auto are forbidden. Every
-bundled mechanical route explicitly uses `service_tier=null`. The broker never
+All settings are requested and capability-preflighted. Main roles use Fast only
+when the run pins `execution.fast_mode=true`; `priority` is observation-only
+and `auto` is forbidden. Every bundled mechanical route explicitly uses
+`service_tier=null` in either mode. The broker never
 launches a separate paid probe turn: its first real primary task is the
 availability check.
 

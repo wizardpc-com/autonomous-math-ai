@@ -33,7 +33,8 @@ High-impact security concerns include:
 - forging audit identity, representation compatibility, or artifact hashes;
 - recursive or unbrokered subprocess delegation;
 - leaking environment credentials into prompts, logs, or artifacts;
-- bypassing the no-fast/no-priority route policy;
+- bypassing the explicit main-role Fast opt-in or the mechanical
+  no-fast/no-priority route policy;
 - rewriting append-only evidence or recovery history.
 
 The project is a research orchestration harness, not a sandbox for hostile

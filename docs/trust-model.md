@@ -105,6 +105,16 @@ or priority service.
 Mechanical results are evidence for the parent role, never an automatic proof
 or audit verdict.
 
+## Service-tier boundary
+
+Main-role Fast execution requires the pinned configuration switch
+`execution.fast_mode=true`. AMR requests only `fast`; a returned `priority` is
+accepted only as its documented observation alias. Missing or conflicting
+thread-start confirmation fails before the first turn. When the switch is off,
+any nonempty Fast/priority observation fails closed. This operational option
+does not alter evidence, audit, mathematical status, or trust gates, and it
+never applies to mechanical workers.
+
 “Unbounded” mechanical concurrency removes only a configured seat count. It
 does not bypass the broker's separate token/cost governor, resource capacity,
 provider rate limits, queue depth, dispatch batch, timeout, recovery, or

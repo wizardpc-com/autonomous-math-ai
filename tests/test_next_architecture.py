@@ -367,6 +367,10 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(second.pending_research, [])
 
     @patch(
+        "autonomous_math_research.provenance._codex_capability",
+        return_value={},
+    )
+    @patch(
         "autonomous_math_research.provenance._codex_identity",
         return_value={
             "codex_cli_version": "test-codex",
@@ -375,7 +379,7 @@ class NextArchitectureTests(unittest.TestCase):
         },
     )
     def test_audited_transition_rebases_open_audit_checkpoint_and_legacy_v1(
-        self, _codex_identity_mock,
+        self, _codex_identity_mock, _codex_capability_mock,
     ) -> None:
         config = load_config(self.project)
         first = AutonomousController(
@@ -402,7 +406,40 @@ class NextArchitectureTests(unittest.TestCase):
             },
         )
         snapshot_path = first._write_compact_snapshot()
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        compact_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        archive_reference = compact_snapshot["full_context_archive"]
+        archive_path = snapshot_path.parent / archive_reference["relative_path"]
+        snapshot = json.loads(archive_path.read_text(encoding="utf-8"))
+
+        def persist_snapshot() -> None:
+            compact_snapshot["snapshot_provenance"] = dict(
+                snapshot["snapshot_provenance"]
+            )
+            for key in (
+                "canonical_state_sha256",
+                "planning_context_sha256",
+                "claim_graph_sha256",
+                "trusted_state_sha256",
+                "canonical_transition_id",
+            ):
+                if key in snapshot["canonical_state"]:
+                    compact_snapshot["canonical_state"][key] = snapshot[
+                        "canonical_state"
+                    ][key]
+                else:
+                    compact_snapshot["canonical_state"].pop(key, None)
+            archive_path.write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            archive_reference["sha256"] = file_digest(archive_path)
+            archive_reference["bytes"] = archive_path.stat().st_size
+            snapshot_path.write_text(
+                json.dumps(compact_snapshot, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
         provenance = snapshot["snapshot_provenance"]
 
         self.assertEqual(provenance["schema_version"], 2)
@@ -435,10 +472,7 @@ class NextArchitectureTests(unittest.TestCase):
         ))
 
         snapshot["snapshot_provenance"]["trusted_state_sha256"] = "0" * 64
-        snapshot_path.write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        persist_snapshot()
         tampered = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=False,
             run_id="audited-rebase-tampered", campaign_id="audited-rebase",
@@ -457,10 +491,7 @@ class NextArchitectureTests(unittest.TestCase):
         snapshot["canonical_state"]["canonical_transition_id"] = (
             "transition-forged"
         )
-        snapshot_path.write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        persist_snapshot()
         forged = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=False,
             run_id="audited-rebase-forged", campaign_id="audited-rebase",
@@ -489,10 +520,7 @@ class NextArchitectureTests(unittest.TestCase):
         )
         snapshot["canonical_state"].pop("trusted_state_sha256", None)
         snapshot["canonical_state"].pop("canonical_transition_id", None)
-        snapshot_path.write_text(
-            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        persist_snapshot()
         legacy = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=False,
             run_id="audited-rebase-legacy", campaign_id="audited-rebase",
@@ -570,7 +598,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.3")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.5")
         self.assertIn("canonical_state", run_manifest)
 
     def test_stale_trusted_binding_fails_before_model_turn(self) -> None:
@@ -1230,7 +1258,25 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertTrue(events[-1]["payload"]["operator_interrupted"])
 
     def test_auto_epochs_continue_only_at_clean_epoch_boundaries(self) -> None:
-        config = load_config(self.project)
+        profile = self.root / "fast-profile.json"
+        profile.write_text(json.dumps({
+            "profile_schema_version": 1,
+            "name": "fast-profile",
+            "extends": "codex-app-server-default",
+            "overrides": {"execution": {"fast_mode": True}},
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        effective = load_config(self.project, profile_path=profile)
+        pinned = (
+            self.runtime / "runs" / "resumed-auto-epoch" / "config" / "config.yaml"
+        )
+        pinned.parent.mkdir(parents=True, exist_ok=True)
+        pinned.write_text(
+            json.dumps(effective.raw, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        config = load_config(self.project, pinned)
+        self.assertTrue(config.fast_mode)
+        self.assertIsNone(config.user_profile_path)
         calls: list[argparse.Namespace] = []
 
         async def execute(args: argparse.Namespace):
@@ -1312,6 +1358,9 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1].campaign_id, "auto-campaign")
         self.assertEqual(calls[1].previous_epoch_id, "auto-epoch-1")
+        self.assertEqual(calls[1].config, pinned)
+        self.assertIsNone(calls[1].profile)
+        self.assertTrue(load_config(self.project, calls[1].config).fast_mode)
 
     def test_auto_epochs_stop_on_quota_or_internal_failure(self) -> None:
         from autonomous_math_research.cli import _auto_epoch_allowed

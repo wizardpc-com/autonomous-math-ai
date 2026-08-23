@@ -87,7 +87,7 @@ amr run --project ./research-target --dry-run
 
 Validation checks the project manifest, paths, configuration, claim graph,
 canonical guard, provider/model routes, effort capabilities, secret references,
-no-fast/no-priority policy, bundled schemas, and protocol
+explicit-Fast/default-off policy, bundled schemas, and protocol
 compatibility. The result includes `model_turns_started: 0`.
 
 The new scaffold intentionally fails strict validation until the exact
@@ -121,7 +121,8 @@ amr catalog --project ./research-target
 Before any live run:
 
 1. pin the exact final claim and protected canonical inputs;
-2. review model names, reasoning effort, and null service tiers;
+2. review model names and reasoning effort; leave `execution.fast_mode=false`
+   unless Fast is explicitly intended for every main role;
 3. set campaign duration, epoch duration, global token budget, and independent
    Director/research/audit/mechanical concurrency caps;
 4. verify worker tool allowlists, filesystem permissions, and network policy;

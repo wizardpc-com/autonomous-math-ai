@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_SCHEMA_VERSION = 11
+CONFIG_SCHEMA_VERSION = 12
 PROFILE_SCHEMA_VERSION = 1
 BUILTIN_PROFILE_NAME = "codex-app-server-default"
 DEFAULT_GLOBAL_TOKENS = 500_000_000
@@ -73,7 +73,7 @@ def _provider_defaults() -> dict[str, Any]:
                     "mapping": {},
                 },
                 "service_tier_parameter": "service_tier",
-                "service_tiers": ["default", "flex"],
+                "service_tiers": ["default", "flex", "fast"],
                 "usage_mapping": {
                     "input_tokens": ["input_tokens", "prompt_tokens"],
                     "cached_input_tokens": [
@@ -170,8 +170,11 @@ def builtin_profile(project_id: str, final_claim_id: str) -> dict[str, Any]:
             "final_conjecture_claim_id": final_claim_id,
         },
         "campaign": {
-            "hours": 12.0,
+            "hours": 5.0,
             "epoch_hours": 2.0,
+        },
+        "execution": {
+            "fast_mode": False,
         },
         "engine": {
             "poll_interval_seconds": 0.1,
@@ -397,7 +400,7 @@ def migrate_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     if version == 8:
         value["schema_version"] = 9
         value["campaign"] = {
-            "hours": 12.0,
+            "hours": 5.0,
             "epoch_hours": 2.0,
         }
         _augment_role_routes(value)
@@ -414,10 +417,16 @@ def migrate_config(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         )
         if worker.get("fallback_condition") == "permanent_unavailable_or_access_denied":
             worker["fallback_condition"] = "provider_execution_failure"
-        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        value["schema_version"] = 11
         _augment_role_routes(value)
         migrations.append("10->11")
-        return value, migrations
+        version = 11
+    if version == 11:
+        value["schema_version"] = CONFIG_SCHEMA_VERSION
+        value.setdefault("execution", {"fast_mode": False})
+        _augment_role_routes(value)
+        migrations.append("11->12")
+        version = CONFIG_SCHEMA_VERSION
     if version == CONFIG_SCHEMA_VERSION:
         _augment_role_routes(value)
         return value, migrations

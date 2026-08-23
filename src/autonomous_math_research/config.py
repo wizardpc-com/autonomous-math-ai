@@ -92,6 +92,14 @@ class HarnessConfig:
         return float(self.raw["campaign"]["epoch_hours"])
 
     @property
+    def fast_mode(self) -> bool:
+        return bool(self.raw["execution"]["fast_mode"])
+
+    @property
+    def requested_service_tier(self) -> str | None:
+        return "fast" if self.fast_mode else None
+
+    @property
     def project_name(self) -> str:
         if self.manifest is not None:
             return self.manifest.project_id
@@ -201,6 +209,7 @@ class HarnessConfig:
             ),
             "migrations_applied": list(self.migrations_applied),
             "campaign": dict(self.raw["campaign"]),
+            "execution": dict(self.raw["execution"]),
             "research_continuation": {
                 key: self.raw["engine"][key]
                 for key in (
@@ -287,6 +296,7 @@ def load_config(
         profile_name, overrides = load_user_profile(resolved_profile)
         raw = deep_merge(raw, overrides)
         selected_profile = profile_name
+    _apply_fast_mode(raw)
     secret_issues = secret_reference_issues(raw)
     if secret_issues:
         raise ValueError(
@@ -321,7 +331,7 @@ def load_config(
 
 def _validate_config(raw: dict[str, Any]) -> None:
     for section in (
-        "campaign", "scheduler", "budgets", "providers", "models", "audit",
+        "campaign", "execution", "scheduler", "budgets", "providers", "models", "audit",
         "stagnation", "workspace", "policy",
     ):
         if section not in raw:
@@ -344,6 +354,11 @@ def _validate_config(raw: dict[str, Any]) -> None:
         raise ValueError(
             f"effective configuration must use schema v{CONFIG_SCHEMA_VERSION}"
         )
+    execution = raw["execution"]
+    if not isinstance(execution, dict) or set(execution) != {"fast_mode"}:
+        raise ValueError("execution must contain exactly fast_mode")
+    if type(execution["fast_mode"]) is not bool:
+        raise ValueError("execution.fast_mode must be boolean")
     campaign = raw["campaign"]
     campaign_hours = float(campaign["hours"])
     epoch_hours = float(campaign["epoch_hours"])
@@ -654,3 +669,43 @@ def _validate_config(raw: dict[str, Any]) -> None:
         ):
             if not str(worker.get(key) or "").strip():
                 raise ValueError(f"one_shot_compute_worker.{key} is required")
+
+
+def _apply_fast_mode(raw: dict[str, Any]) -> None:
+    """Derive main-role tiers from the single explicit fast opt-in."""
+    execution = raw.get("execution")
+    if not isinstance(execution, dict) or type(execution.get("fast_mode")) is not bool:
+        return
+    fast_mode = bool(execution["fast_mode"])
+    routes = raw.get("models")
+    providers = raw.get("providers")
+    if not isinstance(routes, dict) or not isinstance(providers, dict):
+        return
+    if not fast_mode:
+        for role, route in routes.items():
+            tier = route.get("service_tier") if isinstance(route, dict) else None
+            if isinstance(tier, str) and tier.casefold() in {"fast", "priority", "auto"}:
+                raise ValueError(
+                    f"models.{role}.service_tier requires execution.fast_mode=true"
+                )
+        return
+    for role, route in routes.items():
+        if not isinstance(route, dict):
+            continue
+        tier = route.get("service_tier")
+        if tier not in {None, "", "fast"}:
+            raise ValueError(
+                "execution.fast_mode=true conflicts with "
+                f"models.{role}.service_tier={tier!r}"
+            )
+        route["service_tier"] = "fast"
+        provider = providers.get(str(route.get("provider")))
+        if not isinstance(provider, dict):
+            continue
+        capabilities = provider.get("capabilities")
+        if provider.get("adapter") == "codex_app_server" and isinstance(
+            capabilities, dict
+        ):
+            tiers = capabilities.get("service_tiers")
+            if isinstance(tiers, list) and "fast" not in tiers:
+                tiers.append("fast")

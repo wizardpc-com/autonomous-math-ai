@@ -1,9 +1,9 @@
 # 配置与 profile
 
-配置 schema v11 的合并顺序是：内置 `codex-app-server-default`、manifest 指定的项目
+配置 schema v12 的合并顺序是：内置 `codex-app-server-default`、manifest 指定的项目
 `autonomous/config.yaml`、显式 `--profile`、可选的 launcher 一次性覆盖。最后执行核心可信边界校验，因此项目或
 用户 profile 都不能移除核心 protected paths、关闭 final claim 独立审计、替换持久
-controller、开放机械子工网络或启用 fast/priority/auto tier。
+controller、开放机械子工网络或请求未固定的 service tier。
 
 以下命令只读、自动脱敏、不会启动模型：
 
@@ -18,7 +18,7 @@ amr config summary --project ./research-target
 cost limit 和 estimated cost。默认仍全部走 Codex App Server；API 只在显式路由后
 使用。
 
-v9 新增了 `campaign.hours`（默认 12）和 `campaign.epoch_hours`（默认 2）。`amr run`
+v9 新增了 `campaign.hours`（默认 5）和 `campaign.epoch_hours`（默认 2）。`amr run`
 未传对应参数时读取项目值；显式 `--hours`、`--epoch-hours` 保持最高优先级。
 `config summary` 会脱敏输出项目、campaign、并发、预算、逐角色路由和机械路由摘要。
 
@@ -45,6 +45,22 @@ reference、domain contract、audit requirements 和机械资源连同 SHA-256 �
 run-local policy 目录。resume 使用这些已验证快照并报告已安装源码 drift；快照缺失、
 被修改或跨 pack 重绑定时 fail closed。详见
 [研究域与 policy pack](research-domains.md)。
+
+## Fast 模式
+
+Fast 是默认关闭的单一显式开关，可写在项目配置或 profile：
+
+```json
+"execution": {
+  "fast_mode": true
+}
+```
+
+启用后，AMR 为 Director、研究、审计和 smoke 等所有 controller 主角色统一派生
+`service_tier: "fast"`，并在 `thread/start` 与每个 `turn/start` 重复固定。只有该开关
+明确为 true 时，服务端回报的 `priority` 才作为 Fast 的观测别名接受；关闭时观测到
+fast/priority 会 fail closed。逐角色填写 fast/priority/ultrafast 不能绕过开关。机械子工在两种
+模式下都继续严格为 `service_tier=null`。
 
 启动 canonical refresh 没有可关闭的配置开关，项目配置或用户 profile 均不能绕过。
 `amr run` 在任何模型 turn 之前冻结 manifest 声明的 canonical inputs、SHA-256、可用的
@@ -112,7 +128,7 @@ epoch，provider 提供的官方 reset 时间会被保存；它不计入数学�
 “机械 ≥0（1次用量未知）”，不能再把它理解为精确的零消耗。
 
 用户 profile 必须只含 `profile_schema_version`、`name`、`extends`、`overrides`，且
-不能改项目 ID。v7/v8/v9/v10 项目配置会在内存中迁移到 v11；审核有效配置后可用
+不能改项目 ID。v7 至 v11 项目配置会在内存中迁移到 v12；审核有效配置后可用
 `amr config migrate --project PATH --write` 原子写回，且不会启动模型。launcher 的
 一次性覆盖只允许简单运行和路由字段；provider capability、credential、protected
 paths、audit/trust policy 等必须编辑项目配置并重新通过完整预检。示例见

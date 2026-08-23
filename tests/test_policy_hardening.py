@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import shutil
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.app_server import (
-    ModelRoutePolicyError, ServiceTierPolicyError, attest_model_route,
-    attest_no_service_tier,
+    AppServerClient, ModelRoutePolicyError, ServiceTierPolicyError,
+    attest_model_route, attest_no_service_tier, attest_service_tier,
 )
-from autonomous_math_research.backend import AppServerBackend
+from autonomous_math_research.backend import AppServerBackend, MockCodexBackend
 from autonomous_math_research.config import load_config
+from autonomous_math_research.controller import ActiveJob, AutonomousController
 from autonomous_math_research.director_context import DIRECTOR_PROMPT_HARD_LIMIT_BYTES
 from autonomous_math_research.initializer import initialize_project
-from autonomous_math_research.models import ResearchTask, TokenUsage, stable_hash
+from autonomous_math_research.models import (
+    JobOutcome, ResearchTask, TokenUsage, stable_hash,
+)
 from autonomous_math_research.policy import pin_policy_manifest
+from autonomous_math_research.provenance import capture_runtime_provenance
 from autonomous_math_research.resources import schema_resource
 
 
@@ -120,30 +126,39 @@ class PolicyManifestHardeningTests(unittest.TestCase):
             pin_policy_manifest(self.config, self.manifest_path, resume=True)
 
 
+_MISSING = object()
+
+
 class _TierClient:
     def __init__(
         self,
         *,
         thread_tier: object = None,
-        turn_tier: object = None,
+        turn_tier: object = _MISSING,
         thread_model: str | None = None,
         turn_model: str | None = None,
+        include_thread_tier: bool = True,
     ):
         self.thread_tier = thread_tier
         self.turn_tier = turn_tier
         self.thread_model = thread_model
         self.turn_model = turn_model
+        self.include_thread_tier = include_thread_tier
         self.goal_calls = 0
         self.turn_calls = 0
         self.start_thread_calls = 0
+        self.start_thread_kwargs: dict[str, object] = {}
+        self.start_turn_kwargs: list[dict[str, object]] = []
 
     async def start_thread(self, **kwargs):  # type: ignore[no-untyped-def]
-        del kwargs
+        self.start_thread_kwargs = dict(kwargs)
         self.start_thread_calls += 1
-        thread = {"id": "thread-tier", "serviceTier": self.thread_tier}
+        response: dict[str, object] = {"thread": {"id": "thread-tier"}}
+        if self.include_thread_tier:
+            response["serviceTier"] = self.thread_tier
         if self.thread_model is not None:
-            thread["model"] = self.thread_model
-        return {"thread": thread}
+            response["model"] = self.thread_model
+        return response
 
     async def set_goal(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         del args, kwargs
@@ -152,18 +167,25 @@ class _TierClient:
 
     async def start_turn(self, **kwargs):  # type: ignore[no-untyped-def]
         self.turn_calls += 1
+        self.start_turn_kwargs.append(dict(kwargs))
         callback = kwargs.get("on_started")
         if callback:
             callback("turn-tier")
-        turn = {
-                "id": "turn-tier", "status": "completed",
-                "serviceTier": self.turn_tier,
-            }
+        turn = {"id": "turn-tier", "status": "completed"}
+        if self.turn_tier is not _MISSING:
+            turn["serviceTier"] = self.turn_tier
         if self.turn_model is not None:
             turn["model"] = self.turn_model
         return (
             {"turn": turn},
-            "{}",
+            json.dumps({
+                "result_type": "NO_PROGRESS",
+                "main_finding": "bounded tier test",
+                "status": "NO_PROGRESS",
+                "artifact_paths": [],
+                "next_suggested_question": "none",
+                "evidence_level": "E0_SPECULATIVE",
+            }),
             TokenUsage(),
             "unknown",
         )
@@ -212,6 +234,12 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ServiceTierPolicyError):
             attest_no_service_tier({"serviceTier": "priority"}, "test")
         self.assertEqual(
+            attest_service_tier({"serviceTier": "priority"}, "test", "fast"),
+            "priority",
+        )
+        with self.assertRaises(ServiceTierPolicyError):
+            attest_service_tier({}, "test", "fast")
+        self.assertEqual(
             attest_model_route({}, "test", "gpt-5.6-sol"), "unobservable"
         )
         self.assertEqual(
@@ -235,7 +263,7 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outcome.status, "ERROR")
         self.assertEqual(outcome.observed_service_tier, "priority")
-        self.assertIn("no-fast/no-priority policy violation", outcome.error or "")
+        self.assertIn("service tier policy violation", outcome.error or "")
         self.assertEqual(client.goal_calls, 0)
         self.assertEqual(client.turn_calls, 0)
 
@@ -254,6 +282,184 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
         # continuations would escape controller turn ownership.
         self.assertEqual(client.goal_calls, 0)
         self.assertEqual(client.turn_calls, 1)
+
+    async def test_explicit_fast_requests_both_rpcs_and_accepts_priority_alias(self) -> None:
+        config_path = self.project / "autonomous" / "config.yaml"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["execution"]["fast_mode"] = True
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        backend = AppServerBackend(load_config(self.project))
+        client = _TierClient(thread_tier="priority")
+        backend.client = client  # type: ignore[assignment]
+
+        outcome = await backend.run_job(
+            job_id="job-tier-fast", task=_task(), prompt="unused",
+            output_schema=_worker_schema(), workspace=self.workspace,
+            writable_roots=[self.workspace], timeout=1, token_budget=100,
+            candidate_sink=_candidate_sink,
+        )
+
+        self.assertTrue(outcome.succeeded, outcome.error)
+        self.assertEqual(outcome.requested_service_tier, "fast")
+        self.assertEqual(outcome.observed_service_tier, "priority")
+        self.assertEqual(client.start_thread_kwargs["service_tier"], "fast")
+        self.assertEqual(client.start_turn_kwargs[0]["service_tier"], "fast")
+
+    async def test_explicit_fast_requires_thread_start_confirmation(self) -> None:
+        config_path = self.project / "autonomous" / "config.yaml"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["execution"]["fast_mode"] = True
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        backend = AppServerBackend(load_config(self.project))
+        client = _TierClient(thread_tier=None)
+        backend.client = client  # type: ignore[assignment]
+
+        outcome = await backend.run_job(
+            job_id="job-tier-fast-unconfirmed", task=_task(), prompt="unused",
+            output_schema=_worker_schema(), workspace=self.workspace,
+            writable_roots=[self.workspace], timeout=1, token_budget=100,
+            candidate_sink=_candidate_sink,
+        )
+
+        self.assertEqual(outcome.status, "ERROR")
+        self.assertEqual(outcome.failure_kind, "service_tier_policy")
+        self.assertEqual(client.turn_calls, 0)
+
+    async def test_fast_transport_failure_preserves_root_cause_without_telemetry(self) -> None:
+        config_path = self.project / "autonomous" / "config.yaml"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw["execution"]["fast_mode"] = True
+        config_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        config = load_config(self.project)
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="fast-transport", campaign_id="fast-transport",
+        )
+        task = _task()
+        model, effort = config.model_for(task.role)
+        route = config.route_for(task.role)
+        outcome = JobOutcome(
+            job_id="job-fast-transport", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="ERROR", result={},
+            model=model, reasoning_effort=effort,
+            provider=str(route["provider"]), provider_profile=route.get("profile"),
+            requested_service_tier="fast", observed_service_tier=None,
+            error="transport closed before thread/start response",
+            failure_kind="transport_transient", retryable=True,
+        )
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(outcome)
+        controller.active[outcome.job_id] = ActiveJob(
+            outcome.job_id, task, future, 0.0, 60.0, "research",
+            workspace=str(self.workspace), workspace_metadata={},
+            model=model, reasoning_effort=effort,
+            provider=str(route["provider"]), provider_profile=route.get("profile"),
+            requested_service_tier="fast",
+        )
+
+        with patch.object(controller, "_request_director"):
+            await controller._collect_completed()
+
+        self.assertEqual(controller.completed_jobs[0]["failure_kind"], "transport_transient")
+        self.assertTrue(controller.completed_jobs[0]["retryable"])
+        self.assertFalse(controller._internal_failure)
+        self.assertNotIn(
+            "SERVICE_TIER_POLICY_VIOLATION",
+            {event["kind"] for event in controller.store.replay()},
+        )
+
+    async def test_app_server_client_serializes_fast_on_thread_and_turn(self) -> None:
+        class CaptureClient(AppServerClient):
+            def __init__(self) -> None:
+                super().__init__(codex_executable="unused")
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def request(  # type: ignore[override]
+                self,
+                method: str,
+                params: dict[str, object] | None = None,
+                timeout: float = 60,
+            ) -> object:
+                del timeout
+                assert params is not None
+                self.calls.append((method, dict(params)))
+                if method == "thread/start":
+                    return {"thread": {"id": "thread-fast"}}
+                if method == "turn/start":
+                    return {"turn": {"id": "turn-fast", "status": "completed"}}
+                raise AssertionError(f"unexpected request: {method}")
+
+        client = CaptureClient()
+        await client.start_thread(
+            model="gpt-5.6-sol", cwd=self.workspace, service_tier="fast",
+        )
+        await client.start_turn(
+            thread_id="thread-fast", prompt="{}", cwd=self.workspace,
+            model="gpt-5.6-sol", effort="high", output_schema=STRICT_EMPTY_SCHEMA,
+            writable_roots=[self.workspace], timeout=1, service_tier="fast",
+        )
+
+        self.assertEqual(client.calls[0][1]["serviceTier"], "fast")
+        self.assertEqual(client.calls[1][1]["serviceTier"], "fast")
+
+    def test_fast_runtime_preflight_requires_all_app_server_fields(self) -> None:
+        capability = {
+            "service_tier": {
+                "thread_start_supports_clear": True,
+                "turn_start_supports_clear": True,
+                "thread_start_reports_tier": False,
+            },
+        }
+        with (
+            patch(
+                "autonomous_math_research.provenance._codex_capability",
+                return_value=capability,
+            ),
+            self.assertRaisesRegex(ValueError, "thread_start_reports_tier"),
+        ):
+            capture_runtime_provenance(
+                include_codex=True, require_fast_service_tier=True,
+            )
+
+    def test_fast_runtime_preflight_reprobes_each_epoch(self) -> None:
+        def capability(schema_sha256: str) -> dict[str, object]:
+            return {
+                "codex_version": f"codex-cli {schema_sha256[:4]}",
+                "schema_sha256": schema_sha256,
+                "methods": {},
+                "notifications": {},
+                "thread_token_usage_fields": [],
+                "thread_goal_fields": [],
+                "thread_start_fields": ["serviceTier"],
+                "turn_start_fields": ["serviceTier"],
+                "service_tier": {
+                    "thread_start_supports_clear": True,
+                    "turn_start_supports_clear": True,
+                    "thread_start_reports_tier": True,
+                },
+                "sandbox_policy_variants": [],
+            }
+
+        with patch(
+            "autonomous_math_research.provenance.inspect_generated_schema",
+            side_effect=[capability("1" * 64), capability("2" * 64)],
+        ) as probe:
+            first = capture_runtime_provenance(
+                include_codex=True, require_fast_service_tier=True,
+            )
+            second = capture_runtime_provenance(
+                include_codex=True, require_fast_service_tier=True,
+            )
+
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(first["app_server_schema_sha256"], "1" * 64)
+        self.assertEqual(second["app_server_schema_sha256"], "2" * 64)
 
     async def test_thread_model_mismatch_stops_before_goal_and_turn(self) -> None:
         client = _TierClient(thread_model="gpt-5.6-terra")

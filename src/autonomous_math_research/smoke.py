@@ -13,7 +13,7 @@ from uuid import uuid4
 from .app_server import (
     AppServerClient, AppServerError, AppServerRequestError, AppServerTurnFailed,
     ModelRoutePolicyError, ServiceTierPolicyError, StructuredOutputProtocolError,
-    attest_model_route, attest_no_service_tier, parse_structured_message,
+    attest_model_route, attest_service_tier, parse_structured_message,
 )
 from .audit_gate import AuditGate
 from .backend import CodexBackend
@@ -212,7 +212,7 @@ async def run_real_smoke(
     schema_role: str | None = None,
     client_factory: Callable[..., AppServerClient] = AppServerClient,
 ) -> Path:
-    """Run an isolated no-fast/no-priority provider smoke and finalize evidence."""
+    """Run an isolated provider smoke with the pinned main-role tier."""
     if token_budget <= 0:
         raise ValueError("smoke token budget must be positive")
     if schema_role not in {None, *SCHEMA_ROLES}:
@@ -367,15 +367,18 @@ async def run_real_smoke(
             started = await client.start_thread(
                 model=model, cwd=workspace, sandbox="workspace-write",
                 developer_instructions=(
-                    "This is a bounded no-fast/no-priority App Server protocol smoke. Do not spawn "
+                    "This is a bounded App Server protocol smoke with the configured service tier. Do not spawn "
                     "subagents, access the network, or modify canonical project files. "
                     "Return only the requested JSON."
                 ),
+                service_tier=requested_tier,
             )
             thread_data = started["thread"]
             thread_id = str(thread_data["id"])
-            observed_tier = attest_no_service_tier(thread_data, "thread/start")
-            attest_model_route(thread_data, "thread/start", model)
+            observed_tier = attest_service_tier(
+                started, "thread/start", requested_tier,
+            )
+            attest_model_route(started, "thread/start", model)
             if budget is not None and config.per_thread_limit_action == "interrupt":
                 await client.set_goal(thread_id, f"Complete the bounded {role} smoke task", budget)
             final_prompt = prompt
@@ -391,13 +394,17 @@ async def run_real_smoke(
                 thread_id=thread_id, prompt=final_prompt, cwd=workspace, model=model,
                 effort=effort, output_schema=schema, writable_roots=[workspace],
                 timeout=180,
+                service_tier=requested_tier,
             )
             turn_data = completed.get("turn") or {}
             turn_id = str(turn_data.get("id") or "") or None
             store.append("TURN_RETURNED", {
                 "role": role, "thread_id": thread_id, "turn_id": turn_id,
             })
-            turn_tier = attest_no_service_tier(turn_data, "turn/completed")
+            turn_tier = (
+                attest_service_tier(turn_data, "turn/completed", requested_tier)
+                if "serviceTier" in turn_data else "unobservable"
+            )
             if turn_tier != "unobservable":
                 observed_tier = turn_tier
             attest_model_route(turn_data, "turn/completed", model)

@@ -8,6 +8,13 @@ provider transport 与数学角色协议解耦。无论模型来自哪里，都�
 preflight、错误分类、token/cost telemetry 规范化、retry、canonical gate 和独立审计；
 provider 返回值从不自动成为证明。
 
+Fast 只能通过全局显式 `execution.fast_mode=true` 启用，AMR 请求值始终为 `fast`，不会
+主动请求 `priority`。仅在已固定 Fast 请求时，服务端回报的 `priority` 才作为观测别名
+接受；直接 priority/auto/ultrafast 请求仍被禁止。Codex App Server 会在 thread 和每个 turn 都
+重复传递该值，thread-start 必须在首个模型 turn 前确认 `fast` 或 `priority`。当前
+turn-completion 协议不提供交付 tier，因此报告只声明 thread 配置确认，不伪称逐 turn
+交付 telemetry。机械子工始终保持 null tier。
+
 capability 必须声明 structured-output 模式、reasoning 参数和支持的 effort、显式 effort
 mapping、安全 service tiers、总/cached/uncached/cache-write input、output、reasoning
 output token 字段路径、可选 cost 路径及机械 one-shot 能力。不

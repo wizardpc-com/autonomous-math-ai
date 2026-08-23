@@ -1,19 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://autonomous-math-ai.invalid/schemas/config-v10.json",
-  "title": "Autonomous Math AI effective configuration v10",
+  "$id": "https://autonomous-math-ai.invalid/schemas/config-v12.json",
+  "title": "Autonomous Math AI effective configuration v12",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "profile", "project", "campaign", "engine", "scheduler",
+    "schema_version", "profile", "project", "campaign", "execution", "engine", "scheduler",
     "budgets", "providers", "models", "audit", "stagnation",
     "rate_limits", "observability", "timeouts", "workspace", "policy"
   ],
   "properties": {
-    "schema_version": {"const": 11},
+    "schema_version": {"const": 12},
     "profile": {"type": "string", "minLength": 1},
     "project": {"$ref": "#/$defs/project"},
     "campaign": {"$ref": "#/$defs/campaign"},
+    "execution": {"$ref": "#/$defs/execution"},
     "engine": {"$ref": "#/$defs/engine"},
     "scheduler": {"$ref": "#/$defs/scheduler"},
     "budgets": {"$ref": "#/$defs/budgets"},
@@ -58,6 +59,13 @@
       "properties": {
         "hours": {"$ref": "#/$defs/positiveNumber"},
         "epoch_hours": {"$ref": "#/$defs/positiveNumber"}
+      }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fast_mode"],
+      "properties": {
+        "fast_mode": {"type": "boolean"}
       }
     },
     "engine": {

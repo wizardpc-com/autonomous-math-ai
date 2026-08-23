@@ -82,6 +82,10 @@ amr init ./study-target --domain empirical-research
 再运行 `amr validate --strict`。Codex App Server 是开箱即用的默认 provider，复用
 operator 的 Codex 登录；API 只是显式可选入口，不配置 API 就不会要求 API key。
 
+Fast 默认关闭。仅当项目配置或显式 profile 设置 `execution.fast_mode=true` 时，AMR 才为
+所有 controller 主角色统一固定 Fast；请求值为 `fast`，返回的 `priority` 只作为该请求
+的观测别名接受。机械子工始终保持 null tier。
+
 ## 长期运行结构
 
 ```text

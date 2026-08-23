@@ -42,8 +42,11 @@ retains pending work. It never becomes mathematical failure or stagnation.
 
 The built-in optional provider is named `openai-compatible`. Override its
 endpoint, API style/capabilities if needed, then point individual roles at it.
-Safe `default` or `flex` tiers can be declared for compatible APIs; fast,
-priority, and auto remain forbidden by core policy. See the profile example in
+Safe `default` or `flex` tiers can be declared for compatible APIs. Fast is
+available only through the global explicit `execution.fast_mode` opt-in and a
+provider that declares Fast support; AMR requests `fast`, never `priority`.
+An observed `priority` is accepted only as the Fast response alias. Direct
+priority, auto, and ultrafast requests remain forbidden. See the profile example in
 [`examples/per-role-api-profile.json`](examples/per-role-api-profile.json).
 For a separately named OpenAI-compatible gateway with explicit capability
 mapping, see [`examples/custom-provider-profile.json`](examples/custom-provider-profile.json).
@@ -64,3 +67,9 @@ id. The factory receives `config`, `repository_root`, `primary_route`, and
 fallback routes share one runner adapter; mixed adapters fail preflight. The
 controller still owns packet validation, budgets, backpressure, artifact gates,
 retry/recovery records, and the recursion prohibition.
+
+Codex App Server Fast requests are pinned on both thread creation and every
+turn because a turn-level null would clear the thread setting. Its thread-start
+response must confirm `fast` or `priority` before the first model turn. Current
+turn-completion payloads do not expose delivery-tier telemetry, so reports call
+this a thread configuration confirmation rather than claiming per-turn delivery.

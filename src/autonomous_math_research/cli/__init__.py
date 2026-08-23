@@ -302,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--out", type=Path)
 
     smoke = sub.add_parser(
-        "smoke", help="run the configured minimal real no-fast provider lifecycle"
+        "smoke", help="run the configured minimal real provider lifecycle"
     )
     smoke.add_argument("--project", type=Path, required=True)
     smoke.add_argument("--config", type=Path)
@@ -649,8 +649,11 @@ async def _run_command(args: argparse.Namespace) -> int:
             max_audit=args.max_audit,
             max_mechanical_subworkers=args.max_mechanical_subworkers,
             budget=args.budget,
-            config=args.config,
-            profile=args.profile,
+            # Continue from the effective configuration that produced the
+            # sealed epoch. On resume this is the pinned snapshot; on a fresh
+            # launch it retains any explicit user profile.
+            config=config.config_path,
+            profile=config.user_profile_path,
             dry_run=False,
             mock=args.mock,
             auto_epochs=False,

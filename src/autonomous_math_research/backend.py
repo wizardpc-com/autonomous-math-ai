@@ -13,7 +13,7 @@ from .app_server import (
     AppServerTransportClosed, AppServerTurnFailed,
     AppServerTurnTimeout, ModelRoutePolicyError, ServiceTierPolicyError,
     StructuredOutputProtocolError, UnmanagedContinuationError,
-    attest_model_route, attest_no_service_tier,
+    attest_model_route, attest_service_tier,
     parse_structured_message, redact_auth_material,
 )
 from .config import HarnessConfig
@@ -306,15 +306,22 @@ class AppServerBackend:
                 f"AppServerBackend cannot execute provider route {route_config['provider']!r}"
             )
         model, effort = self._model_for(task.role)
+        requested_tier = route_config.get("service_tier")
+        tier_instruction = (
+            "Fast service tier is explicitly authorized for this controller-owned role; "
+            "do not change the pinned service tier. "
+            if requested_tier == "fast"
+            else "Do not use fast or priority service tier. "
+        )
         developer = (
             "You are one bounded autonomous research role governed by the pinned domain policy. "
             "Do not spawn research, strategy, "
             "or recursive subagents. The sole delegation exception is the controller-installed "
             "delegate_mechanical_task command in the job workspace; never invoke codex exec or "
             "another worker directly. "
-            "Do not use fast or priority service tier. Do not modify canonical claims, proofs, "
-            "certificates, protocols, state, artifacts, "
-            "or historical experiments. Write only inside the supplied job workspace."
+            + tier_instruction
+            + "Do not modify canonical claims, proofs, certificates, protocols, state, "
+            + "artifacts, or historical experiments. Write only inside the supplied job workspace."
         )
         thread_id: str | None = None
         turn_id: str | None = None
@@ -331,14 +338,17 @@ class AppServerBackend:
             if task.role == Role.DIRECTOR:
                 enforce_director_prompt_limit(prompt)
             started = await self.client.start_thread(
-                model=model, cwd=workspace, sandbox="workspace-write", developer_instructions=developer
+                model=model, cwd=workspace, sandbox="workspace-write",
+                developer_instructions=developer, service_tier=requested_tier,
             )
             thread = started["thread"]
             thread_id = thread["id"]
-            # This check deliberately precedes goal/turn creation so a server-side
-            # tier override cannot consume research tokens under a forbidden mode.
-            observed_tier = attest_no_service_tier(thread, "thread/start")
-            attest_model_route(thread, "thread/start", model)
+            # ThreadStartResponse carries the configured tier and model at the
+            # top level. Attest before creating the first model turn.
+            observed_tier = attest_service_tier(
+                started, "thread/start", requested_tier,
+            )
+            attest_model_route(started, "thread/start", model)
             # Never arm an App Server goal for autonomous work.  An active
             # server goal may create native continuations outside controller
             # ownership.  Per-thread budgets are enforced from observed token
@@ -359,13 +369,19 @@ class AppServerBackend:
                     writable_roots=writable_roots,
                     timeout=timeout,
                     skill_path=skill_path,
+                    service_tier=requested_tier,
                     on_started=lambda active_turn_id: self.active.__setitem__(
                         job_id, (thread_id, active_turn_id)
                     ),
                 )
                 turn = completed.get("turn") or {}
                 turn_id = str(turn.get("id") or "") or None
-                turn_tier = attest_no_service_tier(turn, "turn/completed")
+                # Codex 0.149 does not expose tier telemetry on Turn. Retain a
+                # fail-closed check if a future server starts reporting it.
+                turn_tier = (
+                    attest_service_tier(turn, "turn/completed", requested_tier)
+                    if "serviceTier" in turn else "unobservable"
+                )
                 if turn_tier != "unobservable":
                     observed_tier = turn_tier
                 attest_model_route(turn, "turn/completed", model)
@@ -395,7 +411,7 @@ class AppServerBackend:
                     thread_id=thread_id, turn_id=turn_id, model=model,
                     reasoning_effort=current_effort, provider=self.provider_name,
                     provider_profile=route_config.get("profile"),
-                    requested_service_tier=None,
+                    requested_service_tier=requested_tier,
                     observed_service_tier=observed_tier,
                     token_usage=turn_usage, token_telemetry=turn_telemetry,
                     cost_usd=None, cost_telemetry="unknown",
@@ -484,7 +500,8 @@ class AppServerBackend:
                 model=model, reasoning_effort=effort,
                 provider=self.provider_name,
                 provider_profile=route_config.get("profile"),
-                requested_service_tier=None, observed_service_tier=observed_tier,
+                requested_service_tier=requested_tier,
+                observed_service_tier=observed_tier,
                 token_usage=usage, token_telemetry=token_telemetry,
                 cost_usd=None, cost_telemetry="unknown",
                 error=str(redact_auth_material(str(exc))),

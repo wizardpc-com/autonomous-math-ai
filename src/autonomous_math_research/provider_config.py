@@ -24,7 +24,7 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
 )
-_FORBIDDEN_SERVICE_TIERS = frozenset({"fast", "priority", "auto"})
+_FORBIDDEN_SERVICE_TIERS = frozenset({"priority", "auto", "ultrafast"})
 
 
 def _redact_url(value: str) -> str:
@@ -168,7 +168,10 @@ def _provider_capabilities(provider: dict[str, Any], label: str) -> dict[str, An
     ):
         raise ValueError(f"{label}.capabilities.service_tiers must be a string list")
     if any(item.casefold() in _FORBIDDEN_SERVICE_TIERS for item in tiers):
-        raise ValueError(f"{label}.capabilities declares a forbidden service tier")
+        raise ValueError(
+            f"{label}.capabilities declares a forbidden request tier; "
+            "priority is observation-only and auto/ultrafast are not supported"
+        )
     if len(tiers) != len(set(tiers)):
         raise ValueError(f"{label}.capabilities.service_tiers contains duplicates")
     tier_parameter = capabilities.get("service_tier_parameter")
@@ -191,9 +194,27 @@ def validate_service_tier(value: Any, capabilities: dict[str, Any], label: str) 
     if not isinstance(value, str):
         raise ValueError(f"{label} must be null or a service tier name")
     if value.casefold() in _FORBIDDEN_SERVICE_TIERS:
-        raise ValueError(f"{label} requests a forbidden fast/priority/auto tier")
+        raise ValueError(f"{label} requests a forbidden priority/auto/ultrafast tier")
     if value not in capabilities.get("service_tiers", []):
         raise ValueError(f"{label} is not declared by the provider capability")
+
+
+def allowed_observed_service_tiers(requested: Any) -> frozenset[str]:
+    """Return the exact observation set for a pinned tier request."""
+    if requested in {None, ""}:
+        return frozenset({"none", "unobservable"})
+    normalized = str(requested).casefold()
+    if normalized == "fast":
+        # OpenAI reports Fast-mode delivery as priority even when the request
+        # used the preferred public spelling, fast.
+        return frozenset({"fast", "priority"})
+    return frozenset({normalized})
+
+
+def normalize_observed_service_tier(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "none"
+    return str(value).strip().casefold()
 
 
 def validate_provider_and_routes(raw: dict[str, Any]) -> None:
@@ -217,10 +238,12 @@ def validate_provider_and_routes(raw: dict[str, Any]) -> None:
             raise ValueError(f"{label}.profile must be null or a portable name")
         validate_credential_reference(provider.get("credential"), f"{label}.credential")
         capabilities = _provider_capabilities(provider, label)
-        if adapter == "codex_app_server" and capabilities.get("service_tiers"):
+        if adapter == "codex_app_server" and set(
+            capabilities.get("service_tiers", [])
+        ) - {"fast"}:
             raise ValueError(
-                f"{label}.capabilities.service_tiers must be empty because the "
-                "bundled Codex App Server adapter does not send a tier override"
+                f"{label}.capabilities.service_tiers may declare only fast for the "
+                "bundled Codex App Server adapter"
             )
 
     routes = raw.get("models")

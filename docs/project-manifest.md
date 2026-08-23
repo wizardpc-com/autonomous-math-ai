@@ -73,6 +73,11 @@ provenance. Resume validates that record before any campaign write. Existing
 schema-v12 run manifests remain readable; they are marked as legacy-unpinned in
 the append-only event log rather than rewritten.
 
+The manifest-selected configuration is schema v12. Its optional Fast choice is
+the single `execution.fast_mode` boolean, defaulting to false. The resulting
+main-role routes and global requested tier are pinned into `RUN_MANIFEST`;
+mechanical routes remain null. This changes no `autonomous/project.json` field.
+
 The derived `INTERMEDIATE_INDEX.json` format is schema v2. It hashes finalized
 immutable artifacts and records a lifecycle event watermark separately;
 `EVENTS.jsonl` and `LIVE_EVENTS.jsonl` remain append-only evidence and are not

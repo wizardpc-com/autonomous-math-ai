@@ -2268,7 +2268,8 @@ class MechanicalConfigurationTests(TempProjectMixin, unittest.TestCase):
         migrated = load_config(self.project, bad)
         self.assertIsNone(migrated.max_mechanical_subworkers)
         self.assertEqual(
-            migrated.migrations_applied, ("7->8", "8->9", "9->10", "10->11"),
+            migrated.migrations_applied,
+            ("7->8", "8->9", "9->10", "10->11", "11->12"),
         )
 
     def test_subprocess_runner_executes_run_local_pinned_sources(self) -> None:

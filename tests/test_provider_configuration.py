@@ -13,10 +13,11 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.cli import main as cli_main
+from autonomous_math_research.backend import MockCodexBackend
 from autonomous_math_research.config import load_config
 from autonomous_math_research.controller import AutonomousController
 from autonomous_math_research.initializer import initialize_project
-from autonomous_math_research.models import ResearchTask, TokenUsage
+from autonomous_math_research.models import ResearchTask, TokenUsage, stable_hash
 from autonomous_math_research.provider_backend import (
     OpenAICompatibleBackend, ProviderRouterBackend, ProviderTransportError,
 )
@@ -25,6 +26,7 @@ from autonomous_math_research.resources import schema_resource
 from autonomous_math_research.schema import load_schema
 from autonomous_math_research.validation import validate_project
 from autonomous_math_research.token_governor import TokenGovernor
+from autonomous_math_research.storage import file_digest
 
 
 RUNTIME = Path(__file__).resolve().parent / "_runtime"
@@ -59,8 +61,9 @@ class ProviderConfigurationTests(unittest.TestCase):
 
     def test_default_profile_is_codex_and_new_budgets_are_separate(self) -> None:
         config = load_config(self.project)
-        self.assertEqual(config.raw["schema_version"], 11)
-        self.assertEqual(config.raw["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
+        self.assertEqual(config.raw["schema_version"], 12)
+        self.assertEqual(config.raw["campaign"], {"hours": 5.0, "epoch_hours": 2.0})
+        self.assertEqual(config.raw["execution"], {"fast_mode": False})
         self.assertEqual(config.profile_name, "codex-app-server-default")
         self.assertTrue(all(
             route["provider"] == "codex" for route in config.raw["models"].values()
@@ -82,6 +85,10 @@ class ProviderConfigurationTests(unittest.TestCase):
             "uncached_input_tokens",
             config.raw["providers"]["codex"]["capabilities"]["usage_mapping"],
         )
+        self.assertTrue(all(
+            route["service_tier"] is None
+            for route in config.raw["models"].values()
+        ))
 
     def test_init_cli_accepts_explicit_ids_and_strict_cli_stays_zero_model(self) -> None:
         explicit = self.root / "explicit-project"
@@ -163,15 +170,19 @@ class ProviderConfigurationTests(unittest.TestCase):
             json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
         config = load_config(self.project)
-        self.assertEqual(config.migrations_applied, ("8->9", "9->10", "10->11"))
-        self.assertEqual(config.campaign_hours, 12.0)
+        self.assertEqual(
+            config.migrations_applied,
+            ("8->9", "9->10", "10->11", "11->12"),
+        )
+        self.assertEqual(config.campaign_hours, 5.0)
         self.assertEqual(config.epoch_hours, 2.0)
 
         code, payload = self._cli([
             "config", "summary", "--project", str(self.project),
         ])
         self.assertEqual(code, 0, payload)
-        self.assertEqual(payload["config_schema_version"], 11)
+        self.assertEqual(payload["config_schema_version"], 12)
+        self.assertEqual(payload["execution"], {"fast_mode": False})
         self.assertEqual(payload["campaign"]["epoch_hours"], 2.0)
         self.assertEqual(
             payload["mechanical"]["fallback_condition"],
@@ -185,8 +196,8 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(code, 0, payload)
         self.assertTrue(payload["written"])
         persisted = json.loads(config_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 11)
-        self.assertEqual(persisted["campaign"], {"hours": 12.0, "epoch_hours": 2.0})
+        self.assertEqual(persisted["schema_version"], 12)
+        self.assertEqual(persisted["campaign"], {"hours": 5.0, "epoch_hours": 2.0})
         self.assertEqual(payload["model_turns_started"], 0)
 
     def test_campaign_epoch_must_not_exceed_campaign_hours(self) -> None:
@@ -214,7 +225,7 @@ class ProviderConfigurationTests(unittest.TestCase):
         migrated = load_config(self.project)
 
         effective_worker = migrated.raw["policy"]["one_shot_compute_worker"]
-        self.assertEqual(migrated.migrations_applied, ("10->11",))
+        self.assertEqual(migrated.migrations_applied, ("10->11", "11->12"))
         self.assertEqual(
             effective_worker["fallback_condition"], "provider_execution_failure"
         )
@@ -232,7 +243,9 @@ class ProviderConfigurationTests(unittest.TestCase):
             json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
         )
         migrated = load_config(self.project)
-        self.assertEqual(migrated.migrations_applied, ("9->10", "10->11"))
+        self.assertEqual(
+            migrated.migrations_applied, ("9->10", "10->11", "11->12")
+        )
         self.assertEqual(migrated.raw["engine"]["research_max_turns"], {
             "prover": 7, "falsifier": 7, "explorer": 7,
         })
@@ -261,7 +274,7 @@ class ProviderConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "structured_outputs"):
             load_config(self.project, profile_path=self._profile(raw))
 
-    def test_fast_service_tier_is_rejected_during_preflight(self) -> None:
+    def test_fast_service_tier_requires_explicit_global_opt_in(self) -> None:
         raw = json.loads(
             (REPO / "docs" / "examples" / "custom-provider-profile.json")
             .read_text(encoding="utf-8")
@@ -270,8 +283,133 @@ class ProviderConfigurationTests(unittest.TestCase):
         raw["overrides"]["providers"]["research-gateway"]["capabilities"][
             "service_tiers"
         ].append("fast")
-        with self.assertRaisesRegex(ValueError, "forbidden service tier"):
+        with self.assertRaisesRegex(ValueError, "requires execution.fast_mode=true"):
             load_config(self.project, profile_path=self._profile(raw))
+
+    def test_explicit_fast_mode_derives_every_main_route_only(self) -> None:
+        profile = {
+            "profile_schema_version": 1,
+            "name": "explicit-fast-main-roles",
+            "extends": "codex-app-server-default",
+            "overrides": {"execution": {"fast_mode": True}},
+        }
+        config = load_config(self.project, profile_path=self._profile(profile))
+
+        self.assertTrue(config.fast_mode)
+        self.assertEqual(config.requested_service_tier, "fast")
+        self.assertTrue(all(
+            route["service_tier"] == "fast"
+            for route in config.raw["models"].values()
+        ))
+        worker = config.raw["policy"]["one_shot_compute_worker"]
+        self.assertIsNone(worker["service_tier"])
+        self.assertIsNone(worker["primary_route"]["service_tier"])
+        self.assertIsNone(worker["fallback_route"]["service_tier"])
+
+    def test_explicit_fast_mode_rejects_priority_request_value(self) -> None:
+        profile = {
+            "profile_schema_version": 1,
+            "name": "invalid-priority-request",
+            "extends": "codex-app-server-default",
+            "overrides": {
+                "execution": {"fast_mode": True},
+                "models": {"explorer": {"service_tier": "priority"}},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            load_config(self.project, profile_path=self._profile(profile))
+
+    def test_ultrafast_cannot_bypass_explicit_fast_mode(self) -> None:
+        raw = json.loads(
+            (REPO / "docs" / "examples" / "custom-provider-profile.json")
+            .read_text(encoding="utf-8")
+        )
+        raw["overrides"]["models"]["explorer"]["service_tier"] = "ultrafast"
+        raw["overrides"]["providers"]["research-gateway"]["capabilities"][
+            "service_tiers"
+        ].append("ultrafast")
+
+        with self.assertRaisesRegex(ValueError, "forbidden request tier"):
+            load_config(self.project, profile_path=self._profile(raw))
+
+    def test_fast_mode_fails_closed_for_provider_without_fast_capability(self) -> None:
+        raw = json.loads(
+            (REPO / "docs" / "examples" / "custom-provider-profile.json")
+            .read_text(encoding="utf-8")
+        )
+        raw["overrides"]["execution"] = {"fast_mode": True}
+        raw["overrides"]["models"]["explorer"]["service_tier"] = None
+        with self.assertRaisesRegex(ValueError, "not declared"):
+            load_config(self.project, profile_path=self._profile(raw))
+
+    def test_fast_dry_run_pins_routes_without_rewriting_canonical_files(self) -> None:
+        profile = {
+            "profile_schema_version": 1,
+            "name": "fast-dry-run",
+            "extends": "codex-app-server-default",
+            "overrides": {"execution": {"fast_mode": True}},
+        }
+        config = load_config(self.project, profile_path=self._profile(profile))
+        canonical = [
+            self.project / "claims" / "CLAIMS.md",
+            self.project / "state" / "PROGRESS.md",
+            self.project / "autonomous" / "state" / "claim_graph.json",
+            self.project / "autonomous" / "state" / "nightly_trusted.json",
+        ]
+        before = {path: path.read_bytes() for path in canonical}
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="fast-dry-run", campaign_id="fast-dry-run",
+        )
+
+        result = asyncio.run(controller.run(0.01, dry_run=True))
+
+        self.assertFalse(result.internal_failure, result.stopped_reason)
+        manifest = json.loads(
+            (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["requested_service_tier"], "fast")
+        self.assertTrue(all(
+            route["service_tier"] == "fast"
+            for route in manifest["requested_routes"].values()
+        ))
+        self.assertEqual({path: path.read_bytes() for path in canonical}, before)
+
+    def test_v11_pinned_config_is_resume_equivalent_without_rewrite(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="v11-pinned-resume", campaign_id="v11-pinned-resume",
+        )
+        first._pin_run_inputs(0.01, False)
+        snapshot = first.run_dir / "config" / "config.yaml"
+        pinned = json.loads(snapshot.read_text(encoding="utf-8"))
+        pinned["schema_version"] = 11
+        pinned.pop("execution")
+        snapshot.write_text(
+            json.dumps(pinned, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        manifest_path = first.run_dir / "RUN_MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["config"]["sha256"] = file_digest(snapshot)
+        unsigned = dict(manifest)
+        unsigned.pop("manifest_sha256", None)
+        manifest["manifest_sha256"] = stable_hash(unsigned)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        before = snapshot.read_bytes()
+        resumed = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="v11-pinned-resume", campaign_id="v11-pinned-resume",
+            resume=True,
+        )
+
+        resumed._pin_run_inputs(0.01, False)
+
+        self.assertEqual(snapshot.read_bytes(), before)
 
     def test_deep_config_schema_rejects_unknown_nested_fields(self) -> None:
         profile = {

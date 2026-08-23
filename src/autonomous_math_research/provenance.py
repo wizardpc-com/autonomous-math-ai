@@ -62,9 +62,11 @@ def _source_identity() -> dict[str, Any]:
     }
 
 
-@lru_cache(maxsize=1)
-def _codex_identity() -> dict[str, Any]:
-    capability = inspect_generated_schema(work_root=Path(tempfile.gettempdir()))
+def _codex_capability() -> dict[str, Any]:
+    return inspect_generated_schema(work_root=Path(tempfile.gettempdir()))
+
+
+def _codex_identity(capability: dict[str, Any]) -> dict[str, Any]:
     required_view = {
         key: capability[key]
         for key in (
@@ -83,8 +85,31 @@ def _codex_identity() -> dict[str, Any]:
     }
 
 
-def capture_runtime_provenance(*, include_codex: bool) -> dict[str, Any]:
-    codex = _codex_identity() if include_codex else {
+def capture_runtime_provenance(
+    *,
+    include_codex: bool,
+    require_fast_service_tier: bool = False,
+) -> dict[str, Any]:
+    capability = _codex_capability() if include_codex else None
+    if require_fast_service_tier:
+        service_tier = (
+            capability.get("service_tier") if isinstance(capability, dict) else None
+        )
+        required = (
+            "thread_start_supports_clear",
+            "turn_start_supports_clear",
+            "thread_start_reports_tier",
+        )
+        missing = [
+            name for name in required
+            if not isinstance(service_tier, dict) or service_tier.get(name) is not True
+        ]
+        if missing:
+            raise ValueError(
+                "Codex App Server schema cannot safely enable fast service tier; "
+                f"missing capabilities: {', '.join(missing)}"
+            )
+    codex = _codex_identity(capability) if capability is not None else {
         "codex_cli_version": None,
         "app_server_schema_sha256": None,
         "app_server_required_protocol_sha256": None,

@@ -1,11 +1,11 @@
 # Configuration and profiles
 
-Configuration schema v11 is merged as: built-in `codex-app-server-default`, the
+Configuration schema v12 is merged as: built-in `codex-app-server-default`, the
 project's manifest-selected `autonomous/config.yaml`, an explicit `--profile`,
 then an optional launcher one-shot override. Core
 trust validation runs last, so neither a project nor a user profile can enable
 networked worker tools, remove core protected paths, disable independent final
-audit, change the persistent controller, or enable fast/priority/auto tiers.
+audit, change the persistent controller, or request an unpinned service tier.
 
 Inspect the exact redacted result without starting a model:
 
@@ -21,7 +21,7 @@ fail validation; explanation output redacts defense-in-depth matches.
 
 `summary` emits a compact redacted view of project identity, campaign duration,
 concurrency, budgets, each role route, and mechanical routing. Schema v9 added
-`campaign.hours` (default `12`) and `campaign.epoch_hours` (default `2`). When
+`campaign.hours` (default `5`) and `campaign.epoch_hours` (default `2`). When
 the corresponding CLI flags are absent, `amr run` uses these project values;
 explicit `--hours` and `--epoch-hours` remain highest priority.
 
@@ -50,6 +50,24 @@ requirements, and mechanical resources with SHA-256 snapshots. Resume uses
 those verified snapshots and reports installed-source drift; missing, modified,
 or rebound policy state fails closed. See
 [Research domains and policy packs](research-domains.md).
+
+## Fast mode
+
+Fast mode is one explicit project/profile switch and is off by default:
+
+```json
+"execution": {
+  "fast_mode": true
+}
+```
+
+When true, AMR derives `service_tier: "fast"` for every controller-owned main
+role, including Director, research, audit, and smoke. It sends the same tier on
+both `thread/start` and every `turn/start`. A server-reported `priority` is
+accepted only as the observed alias of that pinned Fast request. With the
+switch false, any observed fast/priority tier fails closed. Per-role fast,
+priority, or ultrafast requests cannot bypass the switch. Mechanical routes
+remain strictly `null` in both modes.
 
 Startup canonical refresh has no configuration switch and cannot be disabled by
 a project or user profile. `amr run` pins manifest-declared canonical inputs,
@@ -119,7 +137,8 @@ Each entry under `models` independently declares:
 
 - `provider`, `model`, optional endpoint/profile override;
 - canonical `effort` and `unsupported_effort` (`error` or explicit `map`);
-- `service_tier` (provider-declared safe tiers only; fast/priority/auto fail);
+- derived or provider-declared `service_tier`; Fast is controlled only by
+  `execution.fast_mode`, while direct priority/auto/ultrafast requests fail;
 - output normalization mode;
 - timeout, transport/model-protocol retries, and concurrency;
 - per-thread token limit, per-role cost limit, and estimated cost reservation.
@@ -163,8 +182,8 @@ mechanical-only, and unable to update canonical state.
 
 See [`examples/per-role-api-profile.json`](examples/per-role-api-profile.json).
 A profile contains exactly `profile_schema_version`, `name`, `extends`, and
-`overrides`. It cannot override project identity. Schema-v7, v8, v9, and v10
-project configs migrate to v11 in memory. Use
+`overrides`. It cannot override project identity. Schema-v7 through v11
+project configs migrate to v12 in memory. Use
 `amr config migrate --project PATH --write`
 for an atomic persistent migration after reviewing the redacted effective
 configuration; the command starts no model.

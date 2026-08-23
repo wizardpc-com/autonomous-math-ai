@@ -10,7 +10,7 @@ from ..storage import append_jsonl, atomic_write_json, read_jsonl, validate_stor
 
 
 CAMPAIGN_SCHEMA_VERSION = 1
-DEFAULT_CAMPAIGN_HOURS = 12.0
+DEFAULT_CAMPAIGN_HOURS = 5.0
 DEFAULT_EPOCH_HOURS = 2.0
 CAMPAIGN_STATUSES = frozenset({
     "ACTIVE", "PAUSED", "STOPPED", "COMPLETED", "SUPERSEDED",

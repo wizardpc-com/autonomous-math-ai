@@ -118,11 +118,9 @@ class SequenceAppServerClient:
     async def start_thread(self, **kwargs):  # type: ignore[no-untyped-def]
         self.start_thread_calls += 1
         return {
-            "thread": {
-                "id": "thread-proof",
-                "model": kwargs["model"],
-                "serviceTier": None,
-            }
+            "thread": {"id": "thread-proof"},
+            "model": kwargs["model"],
+            "serviceTier": kwargs.get("service_tier"),
         }
 
     async def set_goal(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -144,7 +142,6 @@ class SequenceAppServerClient:
                     "id": f"turn-{index}",
                     "status": "completed",
                     "model": kwargs["model"],
-                    "serviceTier": None,
                 },
             },
             json.dumps(result),

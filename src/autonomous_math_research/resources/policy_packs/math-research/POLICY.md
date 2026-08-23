@@ -20,5 +20,6 @@ ephemeral and cannot directly modify canonical trust state.
 - Roles should prefer the broker for finite enumeration, data normalization,
   formula expansion, code preparation, deterministic reproduction, and artifact
   checking when acceptance is mechanical.
-- Service tiers require provider capability preflight. Fast, priority, and auto
-  tiers are forbidden; bundled mechanical routes remain null-tier.
+- Service tiers require provider capability preflight. Main-role Fast requires
+  the pinned `execution.fast_mode=true` opt-in; priority, auto, and ultrafast
+  requests are forbidden, and bundled mechanical routes remain null-tier.

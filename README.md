@@ -110,6 +110,11 @@ Initialization deliberately leaves marked research placeholders. Replace
 them and complete the checklist before `amr validate --strict` can pass. These
 validation/config commands never start a provider.
 
+Fast mode is off by default. Set `execution.fast_mode=true` in the project
+configuration or an explicit profile to pin Fast for every controller-owned
+main role. AMR requests `fast` and accepts a returned `priority` only as that
+request's observed alias; mechanical workers always keep a null tier.
+
 Exercise the full controller lifecycle with deterministic mock agents:
 
 ```console

@@ -47,6 +47,15 @@ fail closed. Pack selection changes domain semantics, not lifecycle, storage,
 audit-lease, or canonical-gate ownership. See
 [Research domains and policy packs](research-domains.md).
 
+## Service-tier boundary
+
+Service-tier selection is part of the pinned execution route. The default is
+null. Only `execution.fast_mode=true` derives Fast for all controller-owned main
+roles; `priority` is accepted only as the observed alias of that request.
+Mechanical routes remain null. Requested and observed values are recorded in
+the run manifest and append-only job events, and mismatches stop before trust
+accounting.
+
 ## Startup canonical-state refresh
 
 Every new `amr run` performs a zero-model-turn refresh before backend startup or

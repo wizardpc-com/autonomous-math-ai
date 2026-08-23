@@ -13,6 +13,9 @@ import time
 from typing import Any
 
 from .models import TokenUsage
+from .provider_config import (
+    allowed_observed_service_tiers, normalize_observed_service_tier,
+)
 from .schema import validate_output_schema_compatibility
 
 
@@ -309,12 +312,19 @@ class AppServerTurnTimeout(TimeoutError):
 
 
 class ServiceTierPolicyError(AppServerError):
-    def __init__(self, phase: str, observed_service_tier: str):
+    def __init__(
+        self,
+        phase: str,
+        observed_service_tier: str,
+        requested_service_tier: str | None = None,
+    ):
         self.phase = phase
         self.observed_service_tier = observed_service_tier
+        self.requested_service_tier = requested_service_tier
         super().__init__(
-            f"no-fast/no-priority policy violation: {phase} reported non-empty serviceTier "
-            f"{observed_service_tier!r}"
+            "service tier policy violation: "
+            f"{phase} requested {requested_service_tier!r} but reported "
+            f"serviceTier {observed_service_tier!r}"
         )
 
 
@@ -350,21 +360,26 @@ class ModelRoutePolicyError(AppServerError):
         )
 
 
-def attest_no_service_tier(payload: Any, phase: str) -> str:
-    """Return an auditable tier observation and fail on every non-empty tier.
-
-    The current App Server schema permits an explicit JSON null. Missing telemetry
-    remains unobservable; null or an empty string is recorded as none. Any other
-    response means the no-explicit-tier request was not honored and must stop the
-    job before further work whenever this check runs before turn/start.
-    """
+def attest_service_tier(
+    payload: Any,
+    phase: str,
+    requested_service_tier: str | None,
+) -> str:
+    """Attest an App Server tier response against the pinned request."""
     if not isinstance(payload, dict) or "serviceTier" not in payload:
-        return "unobservable"
-    raw = payload.get("serviceTier")
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return "none"
-    observed = str(raw)
-    raise ServiceTierPolicyError(phase, observed)
+        observed = "unobservable"
+    else:
+        observed = normalize_observed_service_tier(payload.get("serviceTier"))
+    if observed not in allowed_observed_service_tiers(requested_service_tier):
+        raise ServiceTierPolicyError(
+            phase, observed, requested_service_tier=requested_service_tier,
+        )
+    return observed
+
+
+def attest_no_service_tier(payload: Any, phase: str) -> str:
+    """Backward-compatible strict attestation for a null tier request."""
+    return attest_service_tier(payload, phase, None)
 
 
 def attest_model_route(payload: Any, phase: str, requested_model: str) -> str:
@@ -852,6 +867,7 @@ class AppServerClient:
         cwd: Path,
         sandbox: str = "workspace-write",
         developer_instructions: str | None = None,
+        service_tier: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": model,
@@ -859,7 +875,7 @@ class AppServerClient:
             "approvalPolicy": "never",
             "sandbox": sandbox,
             "serviceName": "autonomous_math_research",
-            "serviceTier": None,
+            "serviceTier": service_tier,
             "allowProviderModelFallback": False,
         }
         if developer_instructions:
@@ -885,6 +901,7 @@ class AppServerClient:
         timeout: float,
         skill_path: Path | None = None,
         on_started: Callable[[str], None] | None = None,
+        service_tier: str | None = None,
     ) -> tuple[dict[str, Any], str, TokenUsage, str]:
         # Last-resort wire boundary. Controller/bootstrap and both backends also
         # call this gate, but no caller can accidentally bypass it here.
@@ -910,7 +927,7 @@ class AppServerClient:
             "model": model,
             "effort": effort,
             "summary": "concise",
-            "serviceTier": None,
+            "serviceTier": service_tier,
             "outputSchema": output_schema,
         }
         self._notification_turn_by_thread.pop(thread_id, None)

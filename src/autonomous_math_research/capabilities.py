@@ -71,7 +71,8 @@ def inspect_generated_schema(codex: str = "codex", work_root: Path | None = None
             "service_tier": {
                 "thread_start_supports_clear": "serviceTier" in _definition_properties(raw, "ThreadStartParams"),
                 "turn_start_supports_clear": "serviceTier" in _definition_properties(raw, "TurnStartParams"),
-                "requested_value": None,
+                "thread_start_reports_tier": "serviceTier" in _definition_properties(raw, "ThreadStartResponse"),
+                "supported_request_values": [None, "fast"],
             },
             "sandbox_policy_variants": _sandbox_variants(raw),
         }
