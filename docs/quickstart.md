@@ -147,6 +147,8 @@ checks are complete.
 
 - `--resume` is only for the same crashed epoch.
 - `amr campaign continue` creates a new epoch from a sealed checkpoint.
+- `amr campaign continue --auto-epochs` starts from that sealed checkpoint and
+  keeps crossing later clean epoch boundaries.
 - `--auto-epochs` repeatedly performs that fresh-epoch boundary during one
   invocation without changing the checkpoint/seal model.
 - `amr run --project PATH --resume EPOCH_ID --auto-epochs` safely recovers the
@@ -158,9 +160,10 @@ checks are complete.
 - Budget or epoch drain stops new dispatch and waits for healthy in-flight work.
 - Failed runs remain immutable evidence; recovery imports into a new append-only
   context rather than rewriting the old run.
-- Interactive monitor windows persist the failure reason and report/outcome
-  paths and hold on internal failure by default; pass `--no-hold-on-error` for
-  headless operation.
+- Interactive monitor windows remain in `FINALIZING` while report/outcome
+  indexes are written, then persist the terminal reason and finalized paths.
+  They hold on internal failure by default; pass `--no-hold-on-error` for
+  headless operation. Ctrl+C returns structured exit code 130.
 
 ## Human steering and assets
 

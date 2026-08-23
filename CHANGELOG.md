@@ -8,6 +8,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Artifact-finalization progress events, structured operator-interrupt
+  terminals, and `campaign continue --auto-epochs`.
+
 - Attempt-scoped crash recovery events, run-manifest runtime provenance, and
   unattended `--resume --auto-epochs` continuation.
 
@@ -34,6 +37,22 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   diagnostic-only reasoning health monitor.
 
 ### Changed
+
+- Incremental Director turns now receive a sub-4-KiB routing envelope instead
+  of inline snapshots or transcripts. Complete current context is stored in a
+  digest-bound external archive, `compact_snapshot.json` is a bounded summary,
+  and prompts at or above 10 KiB fail before App Server thread creation.
+
+- Sealed checkpoint provenance now follows the epoch's last audited canonical
+  transition instead of retaining its startup ClaimGraph/trusted-state hashes.
+  Strictly matched v1 checkpoints are reconciled append-only; unrelated
+  canonical drift with an open audit frontier still fails closed.
+
+- `RUN_STOPPED` is now committed only after report, immutable-file index,
+  semantic index, outcome, and run summary generation. Automatic epoch
+  continuation requires that durable artifact commit; monitors remain in a
+  visible finalizing state until it completes and drain buffered Windows SGR
+  mouse input before returning to PowerShell.
 
 - Resume now hydrates campaign identity before controller construction,
   rebuilds derived frontier state from append-only evidence, preserves the

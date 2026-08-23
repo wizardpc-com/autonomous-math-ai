@@ -12,6 +12,7 @@ from autonomous_math_research.app_server import (
 )
 from autonomous_math_research.backend import AppServerBackend
 from autonomous_math_research.config import load_config
+from autonomous_math_research.director_context import DIRECTOR_PROMPT_HARD_LIMIT_BYTES
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.models import ResearchTask, TokenUsage, stable_hash
 from autonomous_math_research.policy import pin_policy_manifest
@@ -26,6 +27,11 @@ STRICT_EMPTY_SCHEMA = {
 
 def _worker_schema() -> dict[str, object]:
     with schema_resource("worker_result.schema.json") as path:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _director_schema() -> dict[str, object]:
+    with schema_resource("director_plan.schema.json") as path:
         return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -129,9 +135,11 @@ class _TierClient:
         self.turn_model = turn_model
         self.goal_calls = 0
         self.turn_calls = 0
+        self.start_thread_calls = 0
 
     async def start_thread(self, **kwargs):  # type: ignore[no-untyped-def]
         del kwargs
+        self.start_thread_calls += 1
         thread = {"id": "thread-tier", "serviceTier": self.thread_tier}
         if self.thread_model is not None:
             thread["model"] = self.thread_model
@@ -168,6 +176,16 @@ def _task() -> ResearchTask:
         dependencies=[], expected_information_gain="HIGH",
         mathematical_impact="LOW", estimated_cost_tier="LOW", required_files=[],
         stop_conditions=["return"], output_contract="worker_result.schema.json",
+    )
+
+
+def _director_task() -> ResearchTask:
+    return ResearchTask(
+        task_id="director-prompt-guard", role="director", target_claim="FRONTIER",
+        exact_objective="Return one bounded plan.", why_now="guard regression",
+        dependencies=[], expected_information_gain="portfolio decision",
+        mathematical_impact="HIGH", estimated_cost_tier="MEDIUM", required_files=[],
+        stop_conditions=["return"], output_contract="director_plan.schema.json",
     )
 
 
@@ -251,6 +269,22 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.retryable)
         self.assertEqual(outcome.server_error["observed_model"], "gpt-5.6-terra")
         self.assertEqual(client.goal_calls, 0)
+        self.assertEqual(client.turn_calls, 0)
+
+    async def test_oversize_director_prompt_is_rejected_before_thread_start(self) -> None:
+        client = _TierClient()
+        self.backend.client = client  # type: ignore[assignment]
+        outcome = await self.backend.run_job(
+            job_id="job-director-prompt-guard", task=_director_task(),
+            prompt="x" * DIRECTOR_PROMPT_HARD_LIMIT_BYTES,
+            output_schema=_director_schema(), workspace=self.workspace,
+            writable_roots=[self.workspace], timeout=1, token_budget=100,
+            candidate_sink=_candidate_sink,
+        )
+        self.assertEqual(outcome.status, "ERROR")
+        self.assertEqual(outcome.failure_kind, "director_prompt_too_large")
+        self.assertFalse(outcome.retryable)
+        self.assertEqual(client.start_thread_calls, 0)
         self.assertEqual(client.turn_calls, 0)
 
 

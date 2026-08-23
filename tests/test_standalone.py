@@ -9,6 +9,7 @@ import re
 import shutil
 import tomllib
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.cli import build_parser, main as cli_main
@@ -21,7 +22,9 @@ from autonomous_math_research.controller import (
 from autonomous_math_research.lifecycle.campaign import CampaignStore
 from autonomous_math_research.lifecycle.state import LifecyclePhase, MonotoneLifecycle
 from autonomous_math_research.resources import policy_resource, schema_resource
-from autonomous_math_research.monitor import resolve_run, watch_run
+from autonomous_math_research.monitor import (
+    _TerminalMouseInput, build_status, resolve_run, watch_run,
+)
 from autonomous_math_research.storage import EventStore, ProjectLayout, file_digest
 from autonomous_math_research.storage_layer.steering import append_steering, ingest_asset
 
@@ -92,6 +95,93 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertIn("E:/reports/NIGHTLY_REPORT.md", rendered)
         self.assertIn("E:/outcomes/OUTCOME.md", rendered)
 
+    def test_monitor_stays_finalizing_until_terminal_artifacts_are_ready(self) -> None:
+        run_dir = self.root / "monitor-artifact-finalization"
+        run_dir.mkdir()
+        store = EventStore(run_dir / "EVENTS.jsonl", run_dir.name)
+        store.append("ATTEMPT_STARTED", {
+            "attempt_id": "attempt-1", "campaign_id": "campaign-1",
+            "epoch_id": run_dir.name, "mode": "mock",
+        })
+        store.append("RUN_ARTIFACT_FINALIZATION_STARTED", {
+            "attempt_id": "attempt-1", "report": "report.md",
+            "outcome": "outcome.md",
+        })
+
+        self.assertEqual(build_status(run_dir)["state"], "FINALIZING")
+
+        store.append("RUN_ARTIFACT_FINALIZATION_COMPLETED", {
+            "attempt_id": "attempt-1", "artifacts_finalized": True,
+        })
+        store.append("ATTEMPT_COMPLETED", {
+            "attempt_id": "attempt-1", "artifacts_finalized": True,
+        })
+        store.append("RUN_STOPPED", {
+            "reason": "epoch time limit reached", "internal_failure": False,
+            "artifacts_finalized": True, "report": "report.md",
+            "outcome": "outcome.md",
+        })
+        output = StringIO()
+        code = watch_run(
+            run_dir, chat=True, output=output, ui_mode="plain",
+            color_mode="never", hold_on_error=False,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("成果归档：完成", output.getvalue())
+
+    def test_new_attempt_does_not_reuse_previous_terminal_artifact_paths(self) -> None:
+        run_dir = self.root / "monitor-retried-attempt"
+        run_dir.mkdir()
+        store = EventStore(run_dir / "EVENTS.jsonl", run_dir.name)
+        store.append("RUN_STOPPED", {
+            "reason": "old failure", "internal_failure": True,
+            "report": "old-report.md", "outcome": "old-outcome.md",
+        })
+        store.append("ATTEMPT_STARTED", {
+            "attempt_id": "attempt-2", "campaign_id": "campaign-1",
+            "epoch_id": run_dir.name, "mode": "mock",
+        })
+        store.append("ATTEMPT_FAILED", {
+            "attempt_id": "attempt-2", "internal_failure": True,
+            "reason": "new pre-recovery failure", "artifacts_finalized": False,
+        })
+
+        status = build_status(run_dir)
+
+        self.assertIsNone(status["report"])
+        self.assertIsNone(status["outcome"])
+        self.assertFalse(status["artifacts_finalized"])
+
+    def test_terminal_mouse_close_discards_buffered_sgr_input(self) -> None:
+        mouse = _TerminalMouseInput()
+        mouse.enabled = True
+        mouse.parser.pending = "\x1b[<35;141;7M"
+        output = StringIO()
+
+        mouse.close(output)
+
+        self.assertFalse(mouse.enabled)
+        self.assertEqual(mouse.parser.pending, "")
+        self.assertIn("\x1b[?1003l\x1b[?1006l", output.getvalue())
+
+    def test_run_keyboard_interrupt_returns_structured_exit_130(self) -> None:
+        self._init()
+        output = StringIO()
+        with (
+            patch(
+                "autonomous_math_research.cli._run_command",
+                side_effect=KeyboardInterrupt,
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = cli_main(["run", "--project", str(self.project), "--mock"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(code, 130)
+        self.assertTrue(payload["interrupted"])
+        self.assertEqual(payload["error_type"], "KeyboardInterrupt")
+
     def test_campaign_continue_reports_exact_resume_command_for_unsealed_epoch(self) -> None:
         self._init()
         store = CampaignStore(
@@ -155,6 +245,24 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertEqual(
             manifest["campaign"]["previous_epoch_id"], first["epoch_id"],
         )
+
+    def test_campaign_continue_forwards_auto_epochs(self) -> None:
+        self._init()
+        code, first = self._cli([
+            "run", "--project", str(self.project), "--dry-run",
+        ])
+        self.assertEqual(code, 0, first)
+
+        with patch(
+            "autonomous_math_research.cli._run_command", return_value=0,
+        ) as run_command:
+            code = cli_main([
+                "campaign", "continue", "--project", str(self.project),
+                "--campaign", first["campaign_id"], "--auto-epochs",
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertTrue(run_command.await_args.args[0].auto_epochs)
 
     def test_run_uses_project_campaign_defaults_and_cli_overrides_them(self) -> None:
         self._init()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .catalog import write_semantic_index
 from .contracts import job_lifecycle_metrics, mechanical_lifecycle_metrics
@@ -75,14 +75,16 @@ def _artifact_references(
     report_path: Path,
     jobs: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     layout = ProjectLayout(project_root)
     candidates: set[Path] = set(_iter_files(run_dir))
     if report_path.is_file():
         candidates.add(report_path)
-    run_summary = report_path.parent / "RUN_SUMMARY.json"
-    if run_summary.is_file():
-        candidates.add(run_summary)
+    mutable_logs = {
+        (run_dir / "EVENTS.jsonl").resolve(),
+        (run_dir / "LIVE_EVENTS.jsonl").resolve(),
+    }
 
     raw_references: list[str] = []
     for job in jobs:
@@ -137,9 +139,18 @@ def _artifact_references(
         candidates.update(_iter_files(resolved))
 
     records = []
-    for path in sorted(candidates, key=lambda item: str(item).casefold()):
+    ordered = sorted(candidates, key=lambda item: str(item).casefold())
+    total = sum(path.resolve() not in mutable_logs for path in ordered)
+    interval = max(1, total // 20)
+    completed = 0
+    if progress is not None:
+        progress({"stage": "hashing", "completed": 0, "total": total})
+    for path in ordered:
+        resolved = path.resolve()
+        if resolved in mutable_logs:
+            continue
+        completed += 1
         try:
-            resolved = path.resolve()
             if not resolved.is_relative_to(project):
                 skipped.append({"path": str(resolved), "reason": "outside project boundary"})
                 continue
@@ -150,6 +161,12 @@ def _artifact_references(
             })
         except OSError as exc:
             skipped.append({"path": str(path), "reason": f"unreadable at finalization: {exc}"})
+        if progress is not None and (
+            completed == total or completed % interval == 0
+        ):
+            progress({
+                "stage": "hashing", "completed": completed, "total": total,
+            })
     return records, skipped
 
 
@@ -193,6 +210,7 @@ def write_outcome_archive(
     epoch_id: str | None = None,
     campaign_status: str | None = None,
     project_id: str | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> Path:
     """Write a human review summary plus a hash index of preserved intermediates."""
     outcome_dir.mkdir(parents=True, exist_ok=True)
@@ -200,22 +218,35 @@ def write_outcome_archive(
     mechanical_jobs = list(mechanical_jobs or [])
     records, skipped = _artifact_references(
         project_root, run_dir, report_path, [*jobs, *mechanical_jobs], events,
+        progress,
     )
     index_path = outcome_dir / "INTERMEDIATE_INDEX.json"
     atomic_write_json(index_path, {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "generated_at": utc_now(),
         "project": display_project,
+        "event_snapshot": {
+            "last_sequence": int(events[-1].get("sequence", 0)) if events else 0,
+            "append_only_logs": [
+                _portable_path(run_dir / "EVENTS.jsonl", project_root),
+                _portable_path(run_dir / "LIVE_EVENTS.jsonl", project_root),
+            ],
+            "logs_excluded_from_file_hashes": True,
+        },
         "records": records,
         "skipped_references": skipped,
     })
+    if progress is not None:
+        progress({"stage": "semantic_index", "completed": 0, "total": 1})
     write_semantic_index(
         project_root=project_root,
         outcome_dir=outcome_dir,
         run_dir=run_dir,
         events=events,
     )
+    if progress is not None:
+        progress({"stage": "semantic_index", "completed": 1, "total": 1})
 
     event_counts = Counter(str(event.get("kind", "UNKNOWN")) for event in events)
     lifecycle = job_lifecycle_metrics(events)
@@ -377,7 +408,7 @@ def write_outcome_archive(
         f"- [固定运行配置与协议]({relative_run}/RUN_MANIFEST.json)",
         f"- [完整 nightly report]({relative_report})",
         "- `jobs/`、`candidates/`、`audits/`、`state/`、`policy/` 均保留在对应 run 目录或项目 autonomous 目录；不会因生成本摘要而删除或覆盖。",
-        f"- `INTERMEDIATE_INDEX.json` 索引 {len(records)} 个最终可见文件的路径、大小与 SHA-256。",
+        f"- `INTERMEDIATE_INDEX.json` 索引 {len(records)} 个最终可见不可变文件的路径、大小与 SHA-256；append-only 事件日志按 event watermark 单独标记。",
         "- `SEMANTIC_INDEX.json` 只整理事件关联的 job、candidate、audit、mechanical subtask 与 artifact；不递归复制 worktree。",
         *(
             [f"- 有 {len(skipped)} 个引用在收尾时缺失或越过项目边界；详见索引中的 `skipped_references`。"]
@@ -393,4 +424,6 @@ def write_outcome_archive(
     ]
     outcome_path = outcome_dir / "OUTCOME.md"
     atomic_write_text(outcome_path, "\n".join(lines))
+    if progress is not None:
+        progress({"stage": "outcome", "completed": 1, "total": 1})
     return outcome_path

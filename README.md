@@ -166,7 +166,14 @@ or silently discard pending candidates.
 time boundary until the campaign duration is exhausted. Every epoch repeats
 canonical refresh and planning reconstruction. Quota pause, unsafe drift,
 internal failure, operator stop, or a resolved final claim stops the automatic
-loop. `amr campaign continue` remains the manual continuation path.
+loop. `amr campaign continue` remains the manual continuation path and accepts
+`--auto-epochs` when later clean boundaries should continue unattended.
+
+After the epoch checkpoint is sealed, the monitor remains attached while the
+report, immutable-file index, semantic index, outcome, and run summary are
+written. `RUN_STOPPED` is committed only after that derived artifact set is
+durable. Ctrl+C records a structured interruption and cannot enter the next
+automatic epoch.
 
 The Director's falsification, representation-bridge, audit, kill-gate, and route
 novelty rules live in AMR. A project `director.md` is an optional stable

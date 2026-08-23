@@ -130,13 +130,14 @@ class CatalogTests(unittest.TestCase):
         artifact = next(row for row in index["artifacts"] if row["kind"] == "file")
         self.assertEqual(artifact["relations"], ["job:job-1", "mechanical:job-1:mechanical-1"])
 
-    def test_outcome_keeps_v1_intermediate_contract_and_adds_sidecar(self) -> None:
+    def test_outcome_v2_separates_append_only_logs_from_immutable_hashes(self) -> None:
         run_dir = self._make_run()
         report = self.autonomous / "nightly" / run_dir.name / "NIGHTLY_REPORT.md"
         report.parent.mkdir(parents=True)
         report.write_text("# report\n", encoding="utf-8", newline="\n")
         events = EventStore(run_dir / "EVENTS.jsonl", run_dir.name).replay()
         outcome_dir = self.autonomous / "outcomes" / run_dir.name
+        progress: list[dict] = []
 
         write_outcome_archive(
             project_root=self.project,
@@ -153,6 +154,7 @@ class CatalogTests(unittest.TestCase):
             final_claim_id=None,
             final_claim=None,
             final_conjecture_proved=False,
+            progress=progress.append,
         )
 
         intermediate = json.loads(
@@ -160,9 +162,20 @@ class CatalogTests(unittest.TestCase):
         )
         self.assertEqual(set(intermediate), {
             "schema_version", "run_id", "generated_at", "project",
-            "records", "skipped_references",
+            "event_snapshot", "records", "skipped_references",
         })
-        self.assertEqual(intermediate["schema_version"], 1)
+        self.assertEqual(intermediate["schema_version"], 2)
+        self.assertTrue(
+            intermediate["event_snapshot"]["logs_excluded_from_file_hashes"]
+        )
+        indexed_paths = {row["path"] for row in intermediate["records"]}
+        self.assertNotIn(
+            f"autonomous/runs/{run_dir.name}/EVENTS.jsonl", indexed_paths,
+        )
+        hashing = [item for item in progress if item["stage"] == "hashing"]
+        self.assertEqual(hashing[0]["completed"], 0)
+        self.assertEqual(hashing[-1]["completed"], hashing[-1]["total"])
+        self.assertEqual(progress[-1]["stage"], "outcome")
         semantic = json.loads(
             (outcome_dir / "SEMANTIC_INDEX.json").read_text(encoding="utf-8")
         )

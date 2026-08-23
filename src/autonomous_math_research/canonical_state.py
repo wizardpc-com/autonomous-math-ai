@@ -94,6 +94,21 @@ def _planning_fingerprint_payload(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def planning_context_fingerprint(
+    state: dict[str, Any],
+    *,
+    claim_graph_sha256: str | None = None,
+    trusted_state_sha256: str | None = None,
+) -> str:
+    """Bind planning context to the current audited claim-state revision."""
+    payload = _planning_fingerprint_payload(state)
+    if claim_graph_sha256 is not None:
+        payload["claim_graph_sha256"] = claim_graph_sha256
+    if trusted_state_sha256 is not None:
+        payload["trusted_state_sha256"] = trusted_state_sha256
+    return stable_hash(payload)
+
+
 def _graph_state_view_payload(graph_payload: dict[str, Any], graph_digest: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -291,9 +306,7 @@ def capture_canonical_state(
         "git_revision": _git_revision(workspace_root),
     }
     state["canonical_state_sha256"] = stable_hash(_fingerprint_payload(state))
-    state["planning_context_sha256"] = stable_hash(
-        _planning_fingerprint_payload(state)
-    )
+    state["planning_context_sha256"] = planning_context_fingerprint(state)
     prior_planning = (
         str(previous_state.get("planning_context_sha256") or "")
         if previous_state else ""
@@ -331,7 +344,7 @@ def validate_canonical_state(state: dict[str, Any], *, run_dir: Path) -> None:
         raise ValueError("unsupported canonical state schema")
     if stable_hash(_fingerprint_payload(state)) != state.get("canonical_state_sha256"):
         raise ValueError("canonical state fingerprint is invalid")
-    if stable_hash(_planning_fingerprint_payload(state)) != state.get(
+    if planning_context_fingerprint(state) != state.get(
         "planning_context_sha256"
     ):
         raise ValueError("canonical planning-context fingerprint is invalid")

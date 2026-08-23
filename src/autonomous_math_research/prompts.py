@@ -11,6 +11,7 @@ from .contracts import (
     WORKER_RESULT_KEYS,
     render_contract_keys,
 )
+from .director_context import enforce_director_prompt_limit
 from .models import CandidateEvent, ResearchTask
 from .project import ProjectManifest
 
@@ -122,51 +123,60 @@ def director_prompt(
     extra_constraints: list[dict[str, Any]],
     policy_view: dict[str, Any],
     project_overlay: str | None | object = _PROJECT_OVERLAY_UNSET,
+    *,
+    task_packet_path: Path | None = None,
+    full_context_path: Path | None = None,
 ) -> str:
-    overlay = (
-        load_optional_prompt(project_root, "director.md")
-        if project_overlay is _PROJECT_OVERLAY_UNSET
-        else _render_prompt_text(project_overlay, "director.md")
-        if isinstance(project_overlay, str) else None
+    del project_root, project_overlay  # Complete policy/overlay text is external state.
+    compact = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if not isinstance(compact, dict):
+        raise ValueError("Director compact snapshot must be a JSON object")
+    provenance = compact.get("snapshot_provenance") or {}
+    watermark = compact.get("controller_watermark") or {}
+    counts = compact.get("summary_counts") or {}
+    archive = compact.get("full_context_archive") or {}
+    if full_context_path is None:
+        relative = archive.get("relative_path") if isinstance(archive, dict) else None
+        if isinstance(relative, str) and relative:
+            full_context_path = snapshot_path.parent / relative
+    prompt = (
+        "AMR DIRECTOR TURN\n"
+        "Plan the next bounded, highest-information research portfolio for the exact "
+        "current controller state. This message is only a routing envelope; no snapshot "
+        "or transcript is inline.\n\n"
+        f"run_id={provenance.get('epoch_id') or provenance.get('run_id') or 'unknown'}\n"
+        f"campaign_id={provenance.get('campaign_id') or 'unknown'}\n"
+        f"attempt_id={provenance.get('attempt_id') or 'unknown'}\n"
+        f"state_version={watermark.get('state_version', 'unknown')}\n"
+        f"constraint_count={len(extra_constraints)}\n"
+        f"frontier_counts={json.dumps(counts, ensure_ascii=False, sort_keys=True)}\n"
+        f"task_packet_path={task_packet_path.resolve() if task_packet_path else 'not-provided'}\n"
+        f"compact_state_path={snapshot_path.resolve()}\n"
+        f"full_context_archive_path={full_context_path.resolve() if full_context_path else 'missing'}\n"
+        f"history_archive_path={snapshot_path.parent.parent / 'EVENTS.jsonl'}\n"
+        f"policy_manifest_sha256={policy_view.get('manifest_sha256', 'unknown')}\n\n"
+        "READ ORDER AND AUTHORITY\n"
+        "1. Read task_packet_path and compact_state_path.\n"
+        "2. Read full_context_archive_path only for details omitted/truncated by the bounded summary.\n"
+        "3. Read canonical/policy reference paths listed there as needed. Read the append-only "
+        "history only when provenance or prior attempts matter; never copy history into output.\n"
+        "The controller ClaimGraph is the sole status/frontier authority. Model output cannot "
+        "change trust, evidence, representation compatibility, audit verdicts, or lifecycle state.\n\n"
+        "SCHEDULING RULES\n"
+        "Prefer cheap exact falsification, explicit stop conditions, route novelty, and information "
+        "gain. Do not duplicate active/pending task fingerprints. Dependencies are existing ClaimGraph "
+        "claim IDs, not task IDs. Cross-representation work needs an independently audited bridge. "
+        "Respect route kill/retry state and pending audit gates.\n"
+        f"mechanical_broker_command={MECHANICAL_BROKER_COMMAND_MARKER}\n"
+        "Use that broker only for a finite deterministic packet; never delegate strategy or judgment.\n\n"
+        "OUTPUT\n"
+        f"Return one schema-valid Output Protocol v2 JSON object with exactly: "
+        f"{render_contract_keys(DIRECTOR_PLAN_KEYS)}. "
+        "Do not emit output_contract or independent_exploration. The controller owns termination, "
+        "pruning, candidate identity, audit leases, and route-state application."
     )
-    snapshot = snapshot_path.read_text(encoding="utf-8").strip()
-    overlay_block = (
-        "\n\nOPTIONAL STABLE PROJECT CONSTRAINTS OVERLAY\n"
-        "The following text is non-authoritative for current frontier, claim status, "
-        "or recent progress. Apply only stable project-specific mathematical or routing "
-        f"constraints that do not conflict with dynamic state.\n{overlay}"
-        if overlay else ""
-    )
-    return (
-        f"{_DIRECTOR_CORE}{_policy_block(policy_view)}"
-        f"{_mechanical_broker_block(MECHANICAL_BROKER_COMMAND_MARKER)}\n\n"
-        f"{overlay_block}\n\n"
-        "DYNAMIC INPUT (all required strategy state is already embedded below):\n"
-        f"compact_state_snapshot_path={snapshot_path.resolve()}\n"
-        f"compact_state_snapshot={snapshot}\n"
-        f"controller_constraints={json.dumps(extra_constraints, ensure_ascii=False, sort_keys=True)}\n"
-        "Do not call shell tools, open files, search, or request transcripts in this Director turn, "
-        "except for the exact controlled mechanical broker workflow above when a qualifying "
-        "mechanical subtask is genuinely needed. "
-        "Output Protocol v2 has exactly these top-level keys: "
-        f"{render_contract_keys(DIRECTOR_PLAN_KEYS)}. The controller owns termination, "
-        "pruning, candidate identity, and audit lease creation. audit_priorities may only "
-        "reprioritize an existing fingerprint. Every spawn task must declare its complete "
-        "representation contract; use the controller-owned representation_compatibility "
-        "view in the compact snapshot before declaring dependencies. The dependencies field may "
-        "contain only existing ClaimGraph claim ids, never task ids; express sequential work by "
-        "waiting for a later Director wave. A task_id is a stable binding within this epoch: do "
-        "not resubmit an active or pending task, and use a new task_id whenever any task content "
-        "changes. required_files may use project://, campaign://, or epoch:// "
-        "durable references from controller state. Reuse the exact known "
-        "contract for same-representation work. If no audited bridge exists, schedule a "
-        "bounded bridge-producing task without consuming the incompatible dependency first. "
-        "Route updates are durable bookkeeping but do not count as runnable queue work. "
-        "For every current-state conflict, the dynamic canonical snapshot wins over the "
-        "optional project overlay and any prior planning mirror. "
-        "Do not emit output_contract or independent_exploration. "
-        "Return the schema-valid Director JSON immediately."
-    )
+    enforce_director_prompt_limit(prompt)
+    return prompt
 
 
 def worker_prompt(

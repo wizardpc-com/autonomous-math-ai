@@ -60,6 +60,12 @@ attempt-terminal only: it neither seals the epoch nor replaces its planning
 snapshot. `amr campaign continue` reports the exact resume command while an
 unsealed epoch exists.
 
+For a sealed paused campaign, `amr campaign continue --auto-epochs` is the
+public unattended continuation entry point. Automatic continuation requires a
+durable artifact commit in addition to a usable checkpoint. The monitor shows
+hash-index progress and does not treat the run as stopped until report,
+outcome, and summary generation finish.
+
 The `engine` section also controls controller-owned research continuation:
 
 - `research_max_turns.prover`, `.falsifier`, and `.explorer` (each defaulting

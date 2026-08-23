@@ -254,6 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_continue.add_argument("--profile", type=Path)
     campaign_continue.add_argument("--mock", action="store_true")
     campaign_continue.add_argument("--dry-run", action="store_true")
+    campaign_continue.add_argument(
+        "--auto-epochs", action="store_true",
+        help="continue across clean epoch boundaries until the campaign stops",
+    )
     campaign_continue.add_argument("--epoch-hours", type=float)
 
     mechanical_run = sub.add_parser(
@@ -533,7 +537,9 @@ async def _execute_epoch(args: argparse.Namespace):
 def _run_result_payload(result, config) -> dict[str, object]:
     return {
         "run_id": result.run_id, "project": config.project_name,
-        "report": str(result.report_path),
+        "report": (
+            str(result.report_path) if result.report_path.is_file() else None
+        ),
         "outcome": str(result.outcome_path) if result.outcome_path else None,
         "stopped_reason": result.stopped_reason, "jobs": result.job_count,
         "jobs_started": result.jobs_started,
@@ -548,12 +554,14 @@ def _run_result_payload(result, config) -> dict[str, object]:
         "campaign_id": result.campaign_id,
         "epoch_id": result.epoch_id,
         "campaign_status": result.campaign_status,
+        "artifacts_finalized": result.artifacts_finalized,
     }
 
 
 def _auto_epoch_allowed(result, checkpoint) -> bool:
     return bool(
         not result.internal_failure
+        and result.artifacts_finalized
         and result.run_mode not in {"dry-run"}
         and result.campaign_status == "PAUSED"
         and result.stopped_reason == "epoch time limit reached"
@@ -573,7 +581,16 @@ async def _run_command(args: argparse.Namespace) -> int:
             result.campaign_id,
         )
         checkpoint = campaign.load()
-        if not _auto_epoch_allowed(result, checkpoint):
+        continuing = _auto_epoch_allowed(result, checkpoint)
+        print(json.dumps({
+            "event": "amr_epoch_finalized",
+            "run_id": result.run_id,
+            "campaign_id": result.campaign_id,
+            "artifacts_finalized": result.artifacts_finalized,
+            "auto_continue": continuing,
+            "remaining_campaign_seconds": checkpoint.remaining_seconds,
+        }, ensure_ascii=False), file=sys.stderr, flush=True)
+        if not continuing:
             break
         previous_epoch_id = campaign.latest_continuable_epoch()
         if previous_epoch_id != result.epoch_id:
@@ -643,7 +660,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         epoch_hours=epoch_hours, max_director=None, max_research_workers=None,
         max_audit=None, max_mechanical_subworkers=None, budget=None, config=None,
         profile=args.profile, dry_run=args.dry_run, mock=args.mock, resume=None,
-        auto_epochs=False,
+        auto_epochs=args.auto_epochs,
         run_id=None, recover_candidates_from=None, campaign_id=args.campaign,
         previous_epoch_id=previous_epoch_id,
     )
@@ -892,6 +909,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         try:
             return asyncio.run(_run_command(args))
+        except KeyboardInterrupt:
+            print(json.dumps({
+                "interrupted": True,
+                "internal_failure": False,
+                "error_type": "KeyboardInterrupt",
+                "error": "operator interrupted the AMR CLI",
+                "project": str(args.project.resolve()),
+                "action": "inspect campaign/run status before continuing",
+            }, ensure_ascii=False, indent=2))
+            return 130
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             print(json.dumps({
                 "internal_failure": True,

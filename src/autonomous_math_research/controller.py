@@ -19,7 +19,8 @@ from .audit_gate import AuditGate
 from .backend import AppServerBackend, CodexBackend, MockCodexBackend, TurnDirective
 from .canonical_state import (
     capture_canonical_state, director_canonical_view, director_overlay_text,
-    load_canonical_state, updated_markdown_state_views,
+    load_canonical_state, planning_context_fingerprint,
+    updated_markdown_state_views,
     validate_canonical_mathematical_state, validate_canonical_state,
     verify_live_startup_sources,
 )
@@ -37,6 +38,14 @@ from .contracts import (
     mechanical_lifecycle_metrics,
 )
 from .eventing import CandidateInbox
+from .director_context import (
+    DIRECTOR_PROMPT_HARD_LIMIT_BYTES,
+    DIRECTOR_PROMPT_TARGET_BYTES,
+    DirectorPromptTooLarge,
+    build_compact_snapshot,
+    enforce_director_prompt_limit,
+    load_full_context_archive,
+)
 from .engine import DynamicScheduler
 from .lifecycle import (
     AuditLeaseBook, AuditLeaseStatus, MonotoneLifecycle, RouteLedger,
@@ -541,6 +550,7 @@ class RunResult:
     campaign_id: str = ""
     epoch_id: str = ""
     campaign_status: str = "PAUSED"
+    artifacts_finalized: bool = False
 
 
 class AutonomousController:
@@ -576,11 +586,13 @@ class AutonomousController:
         self.epoch_id = self.run_id
         self.previous_epoch_id = previous_epoch_id
         self._previous_epoch_checkpoint_imported = previous_epoch_id is None
+        self._checkpoint_planning_mirror: dict[str, Any] | None = None
         self._attempt_id = uuid4().hex
         self._attempt_started_sequence = 0
         self._recovery_completed = not resume
         self._bootstrap_completed = False
         self._secondary_failures: list[dict[str, Any]] = []
+        self._operator_interrupted = False
         self.campaign_hours = float(campaign_hours)
         self.epoch_hours = float(epoch_hours)
         if self.campaign_hours <= 0 or self.epoch_hours <= 0:
@@ -843,6 +855,8 @@ class AutonomousController:
         self._director_snapshot_version = 0
         self._director_applied_version = -1
         self._snapshot_generation = 0
+        self._latest_director_context_path: Path | None = None
+        self._latest_director_prompt_bytes = 0
         self._director_not_before = 0.0
         self._replan_after_wave = False
         self.director_constraints: list[dict[str, Any]] = []
@@ -4135,6 +4149,128 @@ class AutonomousController:
                 "historical_campaign_input": True,
             })
 
+    def _checkpoint_claim_state_provenance(
+        self, claim_graph_sha256: str,
+    ) -> dict[str, Any]:
+        if not self.persist_shared_state:
+            return {
+                "schema_version": 1,
+                "planning_context_sha256": self._canonical_state[
+                    "planning_context_sha256"
+                ],
+            }
+        live_graph_sha256 = file_digest(self.layout.claim_graph_path)
+        if live_graph_sha256 != claim_graph_sha256:
+            raise ValueError(
+                "checkpoint ClaimGraph bytes differ from controller state"
+            )
+        trusted_bytes = self.layout.trusted_state_path.read_bytes()
+        trusted_sha256 = bytes_sha256(trusted_bytes)
+        trusted = json.loads(trusted_bytes)
+        if not isinstance(trusted, dict):
+            raise ValueError("checkpoint trusted state is not a JSON object")
+        bound_graph_sha256 = str(trusted.get("claim_graph_sha256") or "")
+        if bound_graph_sha256 and bound_graph_sha256 != claim_graph_sha256:
+            raise ValueError(
+                "checkpoint trusted state is not bound to the controller ClaimGraph"
+            )
+        transition_id = str(trusted.get("last_transition_id") or "") or None
+        committed = [
+            record for record in self.canonical_transitions.records()
+            if record.get("kind") == "COMMITTED"
+        ]
+        if committed and str(committed[-1].get("transition_id") or "") != transition_id:
+            raise ValueError(
+                "checkpoint trusted state is not bound to the latest canonical transition"
+            )
+        if not bound_graph_sha256 and (
+            committed
+            or claim_graph_sha256 != self._canonical_state["claim_graph"]["sha256"]
+            or trusted_sha256 != self._canonical_state["trusted_state"]["sha256"]
+        ):
+            raise ValueError(
+                "changed checkpoint claim state lacks an audited transition binding"
+            )
+        return {
+            "schema_version": 2,
+            "planning_context_sha256": planning_context_fingerprint(
+                self._canonical_state,
+                claim_graph_sha256=claim_graph_sha256,
+                trusted_state_sha256=trusted_sha256,
+            ),
+            "claim_graph_sha256": claim_graph_sha256,
+            "trusted_state_sha256": trusted_sha256,
+            "canonical_transition_id": transition_id,
+        }
+
+    def _legacy_checkpoint_planning_context(
+        self,
+        *,
+        snapshot: dict[str, Any],
+        previous_run: Path,
+        previous_state: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """Rebind a v1 checkpoint only to its own last committed transition."""
+        provenance = snapshot.get("snapshot_provenance") or {}
+        canonical_view = snapshot.get("canonical_state") or {}
+        if (
+            int(provenance.get("schema_version", 0)) != 1
+            or canonical_view.get("canonical_state_sha256")
+            != previous_state.get("canonical_state_sha256")
+        ):
+            return None
+        graph_sha256 = str(canonical_view.get("claim_graph_sha256") or "")
+        if not graph_sha256 or graph_sha256 != str(
+            self._canonical_state["claim_graph"]["sha256"]
+        ):
+            return None
+        trusted_path = self.layout.trusted_state_path
+        trusted_bytes = trusted_path.read_bytes()
+        trusted_sha256 = bytes_sha256(trusted_bytes)
+        if trusted_sha256 != str(
+            self._canonical_state["trusted_state"]["sha256"]
+        ):
+            return None
+        trusted = json.loads(trusted_bytes)
+        if not isinstance(trusted, dict) or str(
+            trusted.get("claim_graph_sha256") or ""
+        ) != graph_sha256:
+            return None
+        transition_id = str(trusted.get("last_transition_id") or "")
+        if not transition_id:
+            return None
+        event_watermark = int(provenance.get("event_watermark", 0))
+        transition_events = [
+            event for event in read_jsonl(previous_run / "EVENTS.jsonl")
+            if event.get("kind") == "CANONICAL_TRANSITION_COMMITTED"
+            and int(event.get("sequence", 0)) <= event_watermark
+        ]
+        if not transition_events:
+            return None
+        last_transition = transition_events[-1].get("payload") or {}
+        if (
+            str(last_transition.get("transition_id") or "") != transition_id
+            or str(last_transition.get("claim_graph_sha256") or "")
+            != graph_sha256
+        ):
+            return None
+        committed = [
+            record for record in self.canonical_transitions.records()
+            if record.get("kind") == "COMMITTED"
+        ]
+        if not committed or str(
+            committed[-1].get("transition_id") or ""
+        ) != transition_id:
+            return None
+        return (
+            planning_context_fingerprint(
+                previous_state,
+                claim_graph_sha256=graph_sha256,
+                trusted_state_sha256=trusted_sha256,
+            ),
+            transition_id,
+        )
+
     def _import_previous_epoch_checkpoint(self) -> None:
         """Import only durable, nonterminal frontier state into a new epoch.
 
@@ -4156,22 +4292,115 @@ class AutonomousController:
             or campaign.get("epoch_id") != self.previous_epoch_id
         ):
             raise ValueError("previous epoch checkpoint belongs to another campaign")
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        if not isinstance(snapshot, dict):
+        compact_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        if not isinstance(compact_snapshot, dict):
             raise ValueError("previous epoch compact snapshot is invalid")
+        snapshot = load_full_context_archive(snapshot_path, compact_snapshot)
         previous_canonical = snapshot.get("canonical_state")
         if not isinstance(previous_canonical, dict):
             raise ValueError(
                 "previous epoch planning mirror lacks canonical-state provenance"
             )
-        previous_context = str(
-            previous_canonical.get("planning_context_sha256") or ""
+        previous_state_path = previous_run / "state" / "canonical_state.json"
+        previous_state = load_canonical_state(
+            previous_state_path, epoch_id=self.previous_epoch_id,
         )
+        validate_canonical_state(previous_state, run_dir=previous_run)
+        provenance = snapshot.get("snapshot_provenance") or {}
+        provenance_schema = int(provenance.get("schema_version", 0))
+        previous_context = str(
+            provenance.get("planning_context_sha256")
+            or previous_canonical.get("planning_context_sha256")
+            or ""
+        )
+        if provenance_schema >= 2:
+            graph_sha256 = str(provenance.get("claim_graph_sha256") or "")
+            trusted_sha256 = str(provenance.get("trusted_state_sha256") or "")
+            transition_id = str(
+                provenance.get("canonical_transition_id") or ""
+            ) or None
+            if (
+                not graph_sha256
+                or not trusted_sha256
+                or graph_sha256
+                != str(previous_canonical.get("claim_graph_sha256") or "")
+                or previous_canonical.get("canonical_transition_id")
+                != transition_id
+                or planning_context_fingerprint(
+                    previous_state,
+                    claim_graph_sha256=graph_sha256,
+                    trusted_state_sha256=trusted_sha256,
+                ) != previous_context
+            ):
+                raise ValueError(
+                    "previous epoch checkpoint canonical provenance is invalid"
+                )
+            if transition_id is None:
+                if (
+                    graph_sha256 != previous_state["claim_graph"]["sha256"]
+                    or trusted_sha256
+                    != previous_state["trusted_state"]["sha256"]
+                ):
+                    raise ValueError(
+                        "previous epoch checkpoint lacks its canonical transition id"
+                    )
+            else:
+                prepared = next(
+                    (
+                        record for record in reversed(
+                            self.canonical_transitions.records()
+                        )
+                        if record.get("kind") == "PREPARED"
+                        and record.get("transition_id") == transition_id
+                    ),
+                    None,
+                )
+                expected_targets = {
+                    "project://" + self.layout.claim_graph_path.resolve()
+                    .relative_to(self.config.project_root.resolve()).as_posix():
+                    graph_sha256,
+                    "project://" + self.layout.trusted_state_path.resolve()
+                    .relative_to(self.config.project_root.resolve()).as_posix():
+                    trusted_sha256,
+                }
+                observed_targets = {
+                    str(target.get("path") or ""): str(
+                        target.get("after_sha256") or ""
+                    )
+                    for target in (prepared or {}).get("targets") or []
+                }
+                if any(
+                    observed_targets.get(path) != digest
+                    for path, digest in expected_targets.items()
+                ):
+                    raise ValueError(
+                        "previous epoch checkpoint transition binding is invalid"
+                    )
         current_context = str(
             (self._canonical_state or {}).get("planning_context_sha256") or ""
         )
         if not previous_context or not current_context:
             raise ValueError("canonical planning-context provenance is incomplete")
+        if previous_context != current_context and provenance_schema == 1:
+            reconciled = self._legacy_checkpoint_planning_context(
+                snapshot=snapshot,
+                previous_run=previous_run,
+                previous_state=previous_state,
+            )
+            if reconciled is not None and reconciled[0] == current_context:
+                previous_context = reconciled[0]
+                self.store.append(
+                    "LEGACY_CHECKPOINT_CANONICAL_PROVENANCE_RECONCILED",
+                    {
+                        "source_epoch_id": self.previous_epoch_id,
+                        "canonical_transition_id": reconciled[1],
+                        "planning_context_sha256": reconciled[0],
+                        "action": (
+                            "accepted the sealed v1 checkpoint at its own last "
+                            "audited canonical transition"
+                        ),
+                    },
+                )
         if previous_context != current_context:
             unsafe_audit_state = bool(
                 snapshot.get("candidate_audit_frontier")
@@ -4207,6 +4436,13 @@ class AutonomousController:
                 immediate=True,
             )
             return
+
+        self._checkpoint_planning_mirror = {
+            "previous_state_available": True,
+            "previous_planning_context_sha256": previous_context,
+            "drift_detected": False,
+            "disposition": "reuse_after_checkpoint_integrity_checks",
+        }
 
         recovered_active_leases = self.audit_leases.recover_stale_active()
         if recovered_active_leases:
@@ -4494,6 +4730,7 @@ class AutonomousController:
             "campaign_status": campaign_status,
             "report": str(report_path) if report_path.is_file() else None,
             "outcome": str(outcome_path) if outcome_path.is_file() else None,
+            "artifacts_finalized": False,
             "action": "epoch remains unsealed and resumable",
         }
         self.live_store.append("LIVE_ATTEMPT_FAILED", payload)
@@ -4846,7 +5083,10 @@ class AutonomousController:
             "planning_context_sha256": self._canonical_state[
                 "planning_context_sha256"
             ],
-            "planning_mirror": self._canonical_state["planning_mirror"],
+            "planning_mirror": (
+                self._checkpoint_planning_mirror
+                or self._canonical_state["planning_mirror"]
+            ),
             "snapshot": str(startup_snapshot),
             "canonical_files_modified": False,
         })
@@ -5067,6 +5307,8 @@ class AutonomousController:
                 await asyncio.sleep(float(self.config.raw["engine"].get("poll_interval_seconds", 0.2)))
         except asyncio.CancelledError:
             stopped_reason = "controller interrupted by operator"
+            self._stop_after_epoch = True
+            self._operator_interrupted = True
             self.store.append("CONTROLLER_INTERRUPTED", {"reason": stopped_reason})
         except Exception as exc:
             stopped_reason = (
@@ -5116,15 +5358,39 @@ class AutonomousController:
     def _write_compact_snapshot(self) -> Path:
         self._assert_startup_canonical_sources()
         active_tasks = [active.task.to_dict() for active in self.active.values()]
-        snapshot = self.graph.compact_snapshot(active_tasks, self.governor.snapshot(), self.recent_changes)
+        current_changes = [
+            _bounded_value(item) for item in self.recent_changes[-20:]
+        ]
+        snapshot = self.graph.compact_snapshot(
+            active_tasks, self.governor.snapshot(), current_changes,
+        )
         graph_payload = self.graph.to_payload()
-        graph_digest = bytes_sha256(json_bytes(graph_payload))
+        graph_digest = (
+            file_digest(self.layout.claim_graph_path)
+            if self.persist_shared_state
+            else bytes_sha256(json_bytes(graph_payload))
+        )
+        checkpoint_claim_state = self._checkpoint_claim_state_provenance(
+            graph_digest,
+        )
         canonical_view = director_canonical_view(
             self._canonical_state,
             run_dir=self.run_dir,
             claim_graph=graph_payload,
             claim_graph_sha256=graph_digest,
         )
+        if self._checkpoint_planning_mirror is not None:
+            canonical_view["planning_mirror"] = self._checkpoint_planning_mirror
+        canonical_view["planning_context_sha256"] = checkpoint_claim_state[
+            "planning_context_sha256"
+        ]
+        if int(checkpoint_claim_state["schema_version"]) >= 2:
+            canonical_view["trusted_state_sha256"] = checkpoint_claim_state[
+                "trusted_state_sha256"
+            ]
+            canonical_view["canonical_transition_id"] = checkpoint_claim_state[
+                "canonical_transition_id"
+            ]
         snapshot["canonical_state"] = canonical_view
         snapshot["claim_state_provenance"] = {
             "authority": "controller_claim_graph",
@@ -5160,7 +5426,7 @@ class AutonomousController:
         ) + 1
         replayed = self.store.replay()
         snapshot["snapshot_provenance"] = {
-            "schema_version": 1,
+            **checkpoint_claim_state,
             "campaign_id": self.campaign_id,
             "epoch_id": self.epoch_id,
             "attempt_id": self._attempt_id,
@@ -5170,9 +5436,6 @@ class AutonomousController:
             ),
             "canonical_state_sha256": self._canonical_state[
                 "canonical_state_sha256"
-            ],
-            "planning_context_sha256": self._canonical_state[
-                "planning_context_sha256"
             ],
             "rebuilt_from_events": self.resume and self._recovery_completed,
         }
@@ -5273,9 +5536,62 @@ class AutonomousController:
             latest_routes[key] for key in sorted(latest_routes)
         ]
         snapshot["research_policy"] = self._policy_view(Role.DIRECTOR)
-        path = self.run_dir / "state" / "compact_snapshot.json"
-        atomic_write_json(path, snapshot)
         state_root = self.run_dir / "state"
+        snapshot["director_constraints"] = deepcopy(self.director_constraints)
+        snapshot["director_overlay"] = (
+            {
+                "text": self._director_overlay,
+                "sha256": bytes_sha256(self._director_overlay.encode("utf-8")),
+            }
+            if isinstance(self._director_overlay, str) else None
+        )
+        snapshot["history_archive"] = {
+            "events_path": str(self.run_dir / "EVENTS.jsonl"),
+            "live_events_path": str(self.run_dir / "LIVE_EVENTS.jsonl"),
+            "rule": (
+                "append-only complete event history; current context does not embed "
+                "prior prompts, transcripts, or prior snapshots"
+            ),
+        }
+        snapshot["snapshot_kind"] = "complete_current_director_context"
+        archive_relative = Path("director_context_archive") / (
+            f"context-{self._snapshot_generation:08d}.json"
+        )
+        archive_path = state_root / archive_relative
+        archive_payload = (
+            json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if archive_path.exists():
+            if archive_path.read_bytes() != archive_payload:
+                raise ValueError(
+                    "append-only Director context archive generation already exists "
+                    "with different content"
+                )
+        else:
+            atomic_write_json(archive_path, snapshot)
+        archive_reference = {
+            "relative_path": archive_relative.as_posix(),
+            "uri": (
+                f"epoch://{self.epoch_id}/state/{archive_relative.as_posix()}"
+            ),
+            "sha256": file_digest(archive_path),
+            "bytes": archive_path.stat().st_size,
+            "generation": self._snapshot_generation,
+            "kind": "complete_current_context_without_recursive_history",
+        }
+        compact = build_compact_snapshot(
+            snapshot,
+            full_context_reference=archive_reference,
+            history_archive={
+                "events_path": str(self.run_dir / "EVENTS.jsonl"),
+                "live_events_path": str(self.run_dir / "LIVE_EVENTS.jsonl"),
+                "context_archive_directory": str(archive_path.parent),
+                "rule": "append-only full history; never inline into a Director prompt",
+            },
+        )
+        path = state_root / "compact_snapshot.json"
+        atomic_write_json(path, compact)
+        self._latest_director_context_path = archive_path
         route_records = self.route_ledger.records()
         write_core_capsule(
             state_root / "CORE_CAPSULE.json",
@@ -5425,12 +5741,22 @@ class AutonomousController:
             self._begin_internal_failure_drain(reason, source="canonical_state")
             return
         snapshot_version = self._director_requested_version
+        full_context = self._latest_director_context_path
+        if full_context is None or not full_context.is_file():
+            reason = "external Director context archive was not created"
+            self.store.append("DIRECTOR_CONTEXT_ARCHIVE_FAILED", {
+                "snapshot": str(snapshot),
+                "action": "fail closed without launching a Director",
+            })
+            self._begin_internal_failure_drain(reason, source="director_context")
+            return
         task = ResearchTask(
             task_id=f"director-{uuid4().hex[:12]}", role=Role.DIRECTOR,
             target_claim="FRONTIER", exact_objective="Select the next highest-value research portfolio.",
             why_now="initial planning or audited state change", dependencies=[],
             expected_information_gain="portfolio decision", mathematical_impact="HIGH",
-            estimated_cost_tier="MEDIUM", required_files=[str(snapshot)],
+            estimated_cost_tier="MEDIUM",
+            required_files=[str(snapshot), str(full_context)],
             stop_conditions=["return one schema-valid plan"], output_contract="director_plan.schema.json",
         )
         job_id = self._new_job_id()
@@ -5438,25 +5764,64 @@ class AutonomousController:
             task.task_id, job_id=job_id,
         )
         packet = self.workspace.write_task_packet(workspace, {
-            "task": task.to_dict(), "snapshot": str(snapshot), "constraints": self.director_constraints,
+            "task": task.to_dict(),
+            "compact_snapshot": str(snapshot),
+            "full_context_archive": str(full_context),
+            "history_archive": str(self.run_dir / "EVENTS.jsonl"),
+            "constraints": self.director_constraints,
             "output_protocol_version": OUTPUT_PROTOCOL_VERSION,
             "state_version": snapshot_version,
             "research_policy": self._policy_view(Role.DIRECTOR),
             "workspace": metadata,
         })
-        prompt = director_prompt(
-            self.config.project_root, snapshot, self.director_constraints,
-            self._policy_view(Role.DIRECTOR),
-            project_overlay=self._director_overlay,
-        )
+        try:
+            prompt = director_prompt(
+                self.config.project_root, snapshot, self.director_constraints,
+                self._policy_view(Role.DIRECTOR),
+                project_overlay=self._director_overlay,
+                task_packet_path=packet,
+                full_context_path=full_context,
+            )
+            prompt_bytes = enforce_director_prompt_limit(prompt)
+            self._start_job(
+                task, prompt, self._schema("director_plan.schema.json"), workspace, writable,
+                "director", estimated_tokens=estimated, job_id=job_id,
+            )
+            prompt_bytes = self._latest_director_prompt_bytes
+        except DirectorPromptTooLarge as exc:
+            self.store.append("DIRECTOR_PROMPT_REJECTED", {
+                "prompt_bytes": exc.size_bytes,
+                "hard_limit_bytes": exc.hard_limit_bytes,
+                "target_bytes": DIRECTOR_PROMPT_TARGET_BYTES,
+                "snapshot": str(snapshot),
+                "full_context_archive": str(full_context),
+                "action": "rejected before App Server thread/start",
+            })
+            self._begin_internal_failure_drain(
+                str(exc), source="director_prompt_guard",
+            )
+            return
         self.director_needed = False
         self._director_active = True
         self._director_incremental = concurrent_work
         self._director_snapshot_version = snapshot_version
         self._director_not_before = 0.0
+        self.store.append("DIRECTOR_PROMPT_PREPARED", {
+            "prompt_bytes": prompt_bytes,
+            "target_bytes": DIRECTOR_PROMPT_TARGET_BYTES,
+            "hard_limit_bytes": DIRECTOR_PROMPT_HARD_LIMIT_BYTES,
+            "target_met": prompt_bytes < DIRECTOR_PROMPT_TARGET_BYTES,
+            "compact_snapshot": str(snapshot),
+            "full_context_archive": str(full_context),
+            "task_packet": str(packet),
+            "inline_snapshot": False,
+            "inline_transcript": False,
+        })
         if concurrent_work:
             self.store.append("DIRECTOR_INCREMENTAL_LAUNCHED", {
                 "snapshot": str(snapshot),
+                "full_context_archive": str(full_context),
+                "prompt_bytes": prompt_bytes,
                 "snapshot_version": snapshot_version,
                 "requested_version": self._director_requested_version,
                 "pending_research": len(self.pending_research),
@@ -5469,10 +5834,6 @@ class AutonomousController:
                 ),
                 "action": "coalesced state update; do not wait for global wave drain",
             })
-        self._start_job(
-            task, prompt, self._schema("director_plan.schema.json"), workspace, writable,
-            "director", estimated_tokens=estimated, job_id=job_id,
-        )
 
     def _new_job_id(self) -> str:
         while True:
@@ -5590,6 +5951,14 @@ class AutonomousController:
         if MECHANICAL_BROKER_COMMAND_MARKER in prompt:
             self.governor.release(job_id)
             raise RuntimeError("mechanical broker command marker was not resolved")
+        if task.role == Role.DIRECTOR:
+            try:
+                self._latest_director_prompt_bytes = enforce_director_prompt_limit(
+                    prompt
+                )
+            except DirectorPromptTooLarge:
+                self.governor.release(job_id)
+                raise
         try:
             backend_kwargs: dict[str, Any] = {
                 "job_id": job_id,
@@ -8696,125 +9065,275 @@ class AutonomousController:
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
             and (self.final_conjecture_proved or self.final_conjecture_refuted)
         )
-        if execution_mode == "real":
-            run_outcome = (
-                "failed real run" if self._internal_failure else
-                "completed real campaign" if campaign_completed else
-                "stopped real campaign after epoch" if campaign_status == "STOPPED" else
-                "paused real campaign epoch"
-            )
-        elif execution_mode == "mock":
-            run_outcome = (
-                "failed mock run" if self._internal_failure else
-                "completed mock campaign" if campaign_completed else
-                "stopped mock campaign after epoch" if campaign_status == "STOPPED" else
-                "paused mock campaign epoch"
-            )
-        else:
-            run_outcome = "failed dry-run" if self._internal_failure else "dry-run validation"
         outcome_dir = self.layout.outcomes_root / self.run_id
         outcome_path = outcome_dir / "OUTCOME.md"
         report_dir = self.layout.nightly_root / self.run_id
         report_path = report_dir / "NIGHTLY_REPORT.md"
-        attempt_kind = "ATTEMPT_FAILED" if self._internal_failure else "ATTEMPT_COMPLETED"
+        report_ready = False
+        outcome_ready = False
+        artifacts_finalized = False
+        operator_interrupted = self._operator_interrupted
+
+        def current_run_outcome() -> str:
+            if operator_interrupted:
+                return f"interrupted {execution_mode} run after epoch seal"
+            if execution_mode == "real":
+                return (
+                    "failed real run" if self._internal_failure else
+                    "completed real campaign" if campaign_completed else
+                    "stopped real campaign after epoch" if campaign_status == "STOPPED" else
+                    "paused real campaign epoch"
+                )
+            if execution_mode == "mock":
+                return (
+                    "failed mock run" if self._internal_failure else
+                    "completed mock campaign" if campaign_completed else
+                    "stopped mock campaign after epoch" if campaign_status == "STOPPED" else
+                    "paused mock campaign epoch"
+                )
+            return "failed dry-run" if self._internal_failure else "dry-run validation"
+
+        def write_summary(*, artifact_error: str | None = None) -> None:
+            summary_events = self.store.replay()
+            summary_lifecycle = job_lifecycle_metrics(summary_events)
+            summary_mechanical = mechanical_lifecycle_metrics(summary_events)
+            atomic_write_json(report_dir / "RUN_SUMMARY.json", {
+                "run_id": self.run_id, "reason": reason,
+                "report": (
+                    f"project://{report_path.relative_to(self.config.project_root).as_posix()}"
+                    if report_ready else None
+                ),
+                "outcome": (
+                    f"project://{outcome_path.relative_to(self.config.project_root).as_posix()}"
+                    if outcome_ready else None
+                ),
+                "execution_mode": execution_mode,
+                "run_outcome": current_run_outcome(),
+                "internal_failure": self._internal_failure,
+                "campaign_id": self.campaign_id,
+                "epoch_id": self.epoch_id,
+                "previous_epoch_id": self.previous_epoch_id,
+                "campaign_status": campaign_status,
+                "final_conjecture_proved": self.final_conjecture_proved,
+                "final_conjecture_refuted": self.final_conjecture_refuted,
+                "events": len(summary_events),
+                "artifact_event_watermark": (
+                    int(summary_events[-1].get("sequence", 0)) if summary_events else 0
+                ),
+                "artifacts_finalized": artifacts_finalized,
+                "artifact_error": artifact_error,
+                "jobs": summary_lifecycle.jobs_terminal,
+                **summary_lifecycle.to_dict(),
+                "mechanical_subtasks": summary_mechanical.to_dict(),
+                "token_governor": self.governor.snapshot(),
+                "mechanical_token_governor": self.mechanical_governor.snapshot(),
+                "canonical_changed": changed,
+                "policy_manifest": self._run_manifest.get(
+                    "research_policy", {}
+                ).get("manifest"),
+                "policy_manifest_sha256": (
+                    self.policy_manifest["manifest_sha256"]
+                    if self.policy_manifest else None
+                ),
+                "policy_source_drift": bool(
+                    self.policy_status and self.policy_status["source_drift"]
+                ),
+                "requested_service_tier": None,
+                "observed_service_tiers": sorted({
+                    str(job.get("observed_service_tier") or "unobservable")
+                    for job in self.completed_jobs
+                }),
+            })
+
+        artifact_start = {
+            "attempt_id": self._attempt_id,
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
+            "report": str(report_path),
+            "outcome": str(outcome_path),
+        }
+        self.store.append("RUN_ARTIFACT_FINALIZATION_STARTED", artifact_start)
+        self.live_store.append("LIVE_RUN_ARTIFACT_FINALIZATION_STARTED", artifact_start)
+        try:
+            artifact_events = self.store.replay()
+            write_report(
+                report_path,
+                run_id=self.run_id,
+                graph=self.graph,
+                events=artifact_events,
+                jobs=self.completed_jobs,
+                mechanical_jobs=self.completed_mechanical_jobs,
+                stopped_reason=reason,
+                capability_snapshot=self.capability_snapshot,
+                policy_manifest=self.policy_manifest,
+                policy_status=self.policy_status,
+                promotion_allowed=(
+                    execution_mode == "real" and not self._internal_failure
+                ),
+                execution_mode=execution_mode,
+                run_outcome=current_run_outcome(),
+                internal_failure=self._internal_failure,
+                final_claim_id=self.final_conjecture_claim_id,
+                final_conjecture_proved=self.final_conjecture_proved,
+                final_conjecture_refuted=self.final_conjecture_refuted,
+                campaign_id=self.campaign_id,
+                epoch_id=self.epoch_id,
+                campaign_status=campaign_status,
+            )
+            report_ready = True
+            self.live_store.append("LIVE_RUN_ARTIFACT_FINALIZATION_PROGRESS", {
+                **artifact_start, "stage": "report", "completed": 1, "total": 1,
+            })
+
+            def publish_artifact_progress(update: dict[str, Any]) -> None:
+                self.live_store.append(
+                    "LIVE_RUN_ARTIFACT_FINALIZATION_PROGRESS",
+                    {**artifact_start, **update},
+                )
+
+            outcome_path = write_outcome_archive(
+                project_root=self.config.project_root,
+                outcome_dir=outcome_dir,
+                run_dir=self.run_dir,
+                report_path=report_path,
+                run_id=self.run_id,
+                execution_mode=execution_mode,
+                run_outcome=current_run_outcome(),
+                stopped_reason=reason,
+                internal_failure=self._internal_failure,
+                jobs=self.completed_jobs,
+                mechanical_jobs=self.completed_mechanical_jobs,
+                events=artifact_events,
+                final_claim_id=self.final_conjecture_claim_id,
+                final_claim=self._final_claim(),
+                final_conjecture_proved=self.final_conjecture_proved,
+                final_conjecture_refuted=self.final_conjecture_refuted,
+                campaign_id=self.campaign_id,
+                epoch_id=self.epoch_id,
+                campaign_status=campaign_status,
+                project_id=self.config.project_name,
+                progress=publish_artifact_progress,
+            )
+            outcome_ready = True
+            artifacts_finalized = True
+            write_summary()
+            completed_payload = {
+                **artifact_start,
+                "artifact_event_watermark": int(
+                    artifact_events[-1].get("sequence", 0)
+                ) if artifact_events else 0,
+                "artifacts_finalized": True,
+            }
+            self.store.append(
+                "RUN_ARTIFACT_FINALIZATION_COMPLETED", completed_payload,
+            )
+            self.live_store.append(
+                "LIVE_RUN_ARTIFACT_FINALIZATION_COMPLETED", completed_payload,
+            )
+        except KeyboardInterrupt:
+            artifacts_finalized = False
+            operator_interrupted = True
+            interruption_reason = "operator interrupted during artifact finalization"
+            if self._internal_failure:
+                self._secondary_failures.append({
+                    "kind": "RUN_ARTIFACT_FINALIZATION_INTERRUPTED",
+                    "detail": interruption_reason,
+                })
+            else:
+                reason = interruption_reason
+            interrupted_payload = {
+                **artifact_start,
+                "reason": interruption_reason,
+                "report_ready": report_ready,
+                "outcome_ready": outcome_ready,
+                "artifacts_finalized": False,
+            }
+            self.store.append(
+                "RUN_ARTIFACT_FINALIZATION_INTERRUPTED", interrupted_payload,
+            )
+            self.live_store.append(
+                "LIVE_RUN_ARTIFACT_FINALIZATION_INTERRUPTED", interrupted_payload,
+            )
+            try:
+                write_summary(artifact_error=interruption_reason)
+            except Exception as summary_exc:
+                self._secondary_failures.append({
+                    "kind": "RUN_SUMMARY_WRITE_FAILED",
+                    "detail": _sanitize_live_text(summary_exc)[:800],
+                })
+        except Exception as exc:
+            artifacts_finalized = False
+            artifact_reason = (
+                f"artifact finalization failed: {type(exc).__name__}: "
+                f"{_sanitize_live_text(exc)[:800]}"
+            )
+            if self._internal_failure or operator_interrupted:
+                self._secondary_failures.append({
+                    "kind": "RUN_ARTIFACT_FINALIZATION_FAILED",
+                    "detail": artifact_reason,
+                })
+            else:
+                reason = artifact_reason
+            self._internal_failure = True
+            failed_payload = {
+                **artifact_start,
+                "reason": artifact_reason,
+                "report_ready": report_ready,
+                "outcome_ready": outcome_ready,
+                "artifacts_finalized": False,
+            }
+            self.store.append("RUN_ARTIFACT_FINALIZATION_FAILED", failed_payload)
+            self.live_store.append(
+                "LIVE_RUN_ARTIFACT_FINALIZATION_FAILED", failed_payload,
+            )
+            try:
+                write_summary(artifact_error=artifact_reason)
+            except Exception as summary_exc:
+                self._secondary_failures.append({
+                    "kind": "RUN_SUMMARY_WRITE_FAILED",
+                    "detail": _sanitize_live_text(summary_exc)[:800],
+                })
+
+        attempt_kind = (
+            "ATTEMPT_INTERRUPTED" if operator_interrupted else
+            "ATTEMPT_FAILED" if self._internal_failure else "ATTEMPT_COMPLETED"
+        )
         self.store.append(attempt_kind, {
             "attempt_id": self._attempt_id,
             "reason": reason,
             "internal_failure": self._internal_failure,
+            "operator_interrupted": operator_interrupted,
             "recovery_completed": self._recovery_completed,
             "campaign_status": campaign_status,
+            "artifacts_finalized": artifacts_finalized,
         })
+        terminal_lifecycle = job_lifecycle_metrics(self.store.replay())
+        terminal_mechanical = mechanical_lifecycle_metrics(self.store.replay())
         stop_payload = {
-            "reason": reason, "internal_failure": self._internal_failure,
-            "execution_mode": execution_mode, "run_outcome": run_outcome,
+            "reason": reason,
+            "internal_failure": self._internal_failure,
+            "operator_interrupted": operator_interrupted,
+            "artifacts_finalized": artifacts_finalized,
+            "execution_mode": execution_mode,
+            "run_outcome": current_run_outcome(),
             "lifecycle_phase": self.lifecycle.phase,
-            "campaign_id": self.campaign_id, "epoch_id": self.epoch_id,
+            "campaign_id": self.campaign_id,
+            "epoch_id": self.epoch_id,
             "campaign_status": campaign_status,
             "token_governor": self.governor.snapshot(),
             "mechanical_token_governor": self.mechanical_governor.snapshot(),
             "secondary_failures": list(self._secondary_failures),
-            "report": str(report_path),
-            "outcome": str(outcome_path),
-            **lifecycle.to_dict(),
+            "report": str(report_path) if report_ready else None,
+            "outcome": str(outcome_path) if outcome_ready else None,
+            **terminal_lifecycle.to_dict(),
         }
         self.live_store.append("LIVE_RUN_STOPPED", stop_payload)
         self.store.append("RUN_STOPPED", stop_payload)
         events = self.store.replay()
         lifecycle = job_lifecycle_metrics(events)
         mechanical_lifecycle = mechanical_lifecycle_metrics(events)
-        write_report(
-            report_path,
-            run_id=self.run_id,
-            graph=self.graph,
-            events=events,
-            jobs=self.completed_jobs,
-            mechanical_jobs=self.completed_mechanical_jobs,
-            stopped_reason=reason,
-            capability_snapshot=self.capability_snapshot,
-            policy_manifest=self.policy_manifest,
-            policy_status=self.policy_status,
-            promotion_allowed=execution_mode == "real" and not self._internal_failure,
-            execution_mode=execution_mode,
-            run_outcome=run_outcome,
-            internal_failure=self._internal_failure,
-            final_claim_id=self.final_conjecture_claim_id,
-            final_conjecture_proved=self.final_conjecture_proved,
-            final_conjecture_refuted=self.final_conjecture_refuted,
-            campaign_id=self.campaign_id,
-            epoch_id=self.epoch_id,
-            campaign_status=campaign_status,
-        )
-        atomic_write_json(report_dir / "RUN_SUMMARY.json", {
-            "run_id": self.run_id, "reason": reason,
-            "report": f"project://{report_path.relative_to(self.config.project_root).as_posix()}",
-            "outcome": f"project://{outcome_path.relative_to(self.config.project_root).as_posix()}",
-            "execution_mode": execution_mode, "run_outcome": run_outcome,
-            "internal_failure": self._internal_failure,
-            "campaign_id": self.campaign_id,
-            "epoch_id": self.epoch_id,
-            "previous_epoch_id": self.previous_epoch_id,
-            "campaign_status": campaign_status,
-            "final_conjecture_proved": self.final_conjecture_proved,
-            "final_conjecture_refuted": self.final_conjecture_refuted,
-            "events": len(events), "jobs": lifecycle.jobs_terminal,
-            **lifecycle.to_dict(),
-            "mechanical_subtasks": mechanical_lifecycle.to_dict(),
-            "token_governor": self.governor.snapshot(),
-            "mechanical_token_governor": self.mechanical_governor.snapshot(),
-            "canonical_changed": changed,
-            "policy_manifest": self._run_manifest.get("research_policy", {}).get("manifest"),
-            "policy_manifest_sha256": (
-                self.policy_manifest["manifest_sha256"] if self.policy_manifest else None
-            ),
-            "policy_source_drift": bool(self.policy_status and self.policy_status["source_drift"]),
-            "requested_service_tier": None,
-            "observed_service_tiers": sorted({
-                str(job.get("observed_service_tier") or "unobservable")
-                for job in self.completed_jobs
-            }),
-        })
-        outcome_path = write_outcome_archive(
-            project_root=self.config.project_root,
-            outcome_dir=outcome_dir,
-            run_dir=self.run_dir,
-            report_path=report_path,
-            run_id=self.run_id,
-            execution_mode=execution_mode,
-            run_outcome=run_outcome,
-            stopped_reason=reason,
-            internal_failure=self._internal_failure,
-            jobs=self.completed_jobs,
-            mechanical_jobs=self.completed_mechanical_jobs,
-            events=events,
-            final_claim_id=self.final_conjecture_claim_id,
-            final_claim=self._final_claim(),
-            final_conjecture_proved=self.final_conjecture_proved,
-            final_conjecture_refuted=self.final_conjecture_refuted,
-            campaign_id=self.campaign_id,
-            epoch_id=self.epoch_id,
-            campaign_status=campaign_status,
-            project_id=self.config.project_name,
-        )
+        if operator_interrupted:
+            raise KeyboardInterrupt
         return RunResult(
             run_id=self.run_id,
             report_path=report_path,
@@ -8830,10 +9349,11 @@ class AutonomousController:
             mechanical_subtasks_terminal=mechanical_lifecycle.terminal,
             internal_failure=self._internal_failure,
             run_mode=execution_mode,
-            outcome_path=outcome_path,
+            outcome_path=outcome_path if outcome_ready else None,
             campaign_id=self.campaign_id,
             epoch_id=self.epoch_id,
             campaign_status=campaign_status,
+            artifacts_finalized=artifacts_finalized,
         )
 
 

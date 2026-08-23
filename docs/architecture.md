@@ -71,6 +71,14 @@ be safely rebound to the changed state, startup fails closed before any model
 turn. Canonical inputs are rechecked before every Director snapshot, closing the
 read-to-launch race.
 
+An epoch checkpoint binds its planning fingerprint to the ClaimGraph and trusted
+state produced by the last committed canonical transition at that checkpoint's
+event watermark. Consequently, controller-authorized transitions made during an
+epoch remain usable by its successor. A different later state still counts as
+drift. Legacy v1 checkpoints are accepted only when their embedded ClaimGraph,
+live trusted-state binding, transition ledger, run event, and watermark all name
+the same final committed transition; the reconciliation is append-only.
+
 ## Trust path
 
 ```text
@@ -105,7 +113,8 @@ each epoch contains top-level jobs and isolated mechanical subtasks. Epochs are
 the units of sealing, recovery, policy pinning, and handoff.
 
 A controller process is an attempt within an epoch. `ATTEMPT_STARTED`,
-`RECOVERY_COMPLETED`, and `ATTEMPT_FAILED` record that process lifecycle without
+`RECOVERY_COMPLETED`, `ATTEMPT_FAILED`, and `ATTEMPT_INTERRUPTED` record that
+process lifecycle without
 pretending that the epoch ended. Resume validates the original `RUN_MANIFEST`,
 including campaign identity and absolute deadline, before constructing a
 controller or writing a campaign record. A failure before recovery leaves the
@@ -123,6 +132,16 @@ Once dispatch leaves `RUNNING`, a continuation cannot reopen the same epoch.
 New information becomes a constraint for a later epoch. A crash resume remains
 within the same epoch; campaign continuation creates a new one.
 
+Epoch sealing and run artifact finalization are separate commits. After the
+checkpoint is sealed, `RUN_ARTIFACT_FINALIZATION_STARTED` covers report,
+immutable-file hash index, semantic index, outcome, and run-summary generation.
+Only a successful `RUN_ARTIFACT_FINALIZATION_COMPLETED` may be followed by
+`ATTEMPT_COMPLETED` and terminal `RUN_STOPPED`. Append-only event logs are
+identified by the outcome's event watermark rather than hashed as immutable
+files before their terminal records exist. An artifact failure or operator
+interrupt records a terminal diagnostic and cannot enter the automatic epoch
+loop.
+
 With `amr run --auto-epochs`, an ordinary epoch-time seal immediately launches
 a new controller and epoch using the latest usable checkpoint. The campaign
 duration remains the outer budget; the last epoch is shortened to the remaining
@@ -130,8 +149,9 @@ time. A fresh controller repeats canonical refresh, consistency checks, stale-
 planning disposal, and derived-state rebuild every time. Only the exact clean
 epoch-time boundary is auto-continuable. Quota pause, canonical/bootstrap
 failure, internal failure, stop-after-epoch steering, final-claim completion,
-and campaign-budget exhaustion terminate the loop. The existing
-`amr campaign continue` command is unchanged.
+and campaign-budget exhaustion terminate the loop. `amr campaign continue`
+remains compatible and accepts optional `--auto-epochs` for unattended
+continuation from an already sealed checkpoint.
 
 The same loop may follow a crash recovery with
 `amr run --resume EPOCH_ID --auto-epochs`: the resumed epoch must first recover

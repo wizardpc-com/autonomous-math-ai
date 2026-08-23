@@ -21,9 +21,14 @@ from autonomous_math_research.canonical_transition import (
 from autonomous_math_research.config import load_config
 from autonomous_math_research.controller import ActiveJob, AutonomousController, RunResult
 from autonomous_math_research.cli import (
-    ResumeContext, _execute_epoch, _latest_run, _run_command,
+    ResumeContext, _auto_epoch_allowed, _execute_epoch, _latest_run, _run_command,
 )
 from autonomous_math_research.engine.scheduler import DynamicScheduler
+from autonomous_math_research.director_context import (
+    DIRECTOR_PROMPT_HARD_LIMIT_BYTES,
+    DIRECTOR_PROMPT_TARGET_BYTES,
+    utf8_size,
+)
 from autonomous_math_research.eventing import CandidateInbox
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.lifecycle.audit_lease import AuditLeaseBook
@@ -266,9 +271,14 @@ class NextArchitectureTests(unittest.TestCase):
             self.project, snapshot_path, [], second._policy_view("director"),
             project_overlay=second._director_overlay,
         )
-        self.assertIn("FRONTIER-V1", prompt)
-        self.assertIn("FRONTIER-V2", prompt)
-        self.assertGreater(prompt.rfind("FRONTIER-V2"), prompt.rfind("FRONTIER-V1"))
+        self.assertNotIn("FRONTIER-V1", prompt)
+        self.assertNotIn("FRONTIER-V2", prompt)
+        self.assertIn("compact_state_path=", prompt)
+        self.assertIn("full_context_archive_path=", prompt)
+        self.assertLess(utf8_size(prompt), DIRECTOR_PROMPT_TARGET_BYTES)
+        archive = second._latest_director_context_path.read_text(encoding="utf-8")
+        self.assertIn("FRONTIER-V1", archive)
+        self.assertIn("FRONTIER-V2", archive)
         capsule = (second.run_dir / "state" / "CORE_CAPSULE.json").read_text(
             encoding="utf-8"
         )
@@ -291,9 +301,13 @@ class NextArchitectureTests(unittest.TestCase):
         )
 
         self.assertIsNone(controller._director_overlay)
-        self.assertIn("AMR TOOL-LEVEL DIRECTOR POLICY", prompt)
-        self.assertIn('"authority": "controller_claim_graph"', prompt)
+        self.assertIn("AMR DIRECTOR TURN", prompt)
+        self.assertNotIn('"authority": "controller_claim_graph"', prompt)
         self.assertNotIn("late unpinned overlay", prompt)
+        self.assertLess(utf8_size(prompt), DIRECTOR_PROMPT_HARD_LIMIT_BYTES)
+        archive = controller._latest_director_context_path.read_text(encoding="utf-8")
+        self.assertIn('"authority": "controller_claim_graph"', archive)
+        self.assertNotIn("late unpinned overlay", archive)
 
     def test_canonical_drift_discards_previous_epoch_planning(self) -> None:
         config = load_config(self.project)
@@ -352,6 +366,143 @@ class NextArchitectureTests(unittest.TestCase):
             second._import_previous_epoch_checkpoint()
         self.assertEqual(second.pending_research, [])
 
+    def test_audited_transition_rebases_open_audit_checkpoint_and_legacy_v1(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=False,
+            run_id="audited-rebase-first", campaign_id="audited-rebase",
+        )
+        first._pin_run_inputs(0.01, False)
+        candidate = CandidateEvent(
+            event_id="audited-rebase-candidate", producer_thread_id=None,
+            producer_task_id="audited-rebase-task", claim_id="C_ROOT",
+            parent_claim_id=None, type="KEY_LEMMA", impact="HIGH",
+            concise_summary="candidate awaiting audit",
+            exact_statement="One exact candidate remains under audit.",
+            artifact_paths=[], reproduction_commands=[], dependency_impact=[],
+        )
+        first.audit_gate.register(candidate)
+        first.graph.claims["C_ROOT"].priority["score"] = 0.9
+        transition_id = first._commit_claim_state_transition(
+            transition_kind="CONTROLLER_PRIORITY_UPDATE",
+            authorization={
+                "claim_id": "C_ROOT", "task_id": "audited-rebase-task",
+                "reason": "tested audited state-neutral priority update",
+                "trust_upgrade": False,
+            },
+        )
+        snapshot_path = first._write_compact_snapshot()
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        provenance = snapshot["snapshot_provenance"]
+
+        self.assertEqual(provenance["schema_version"], 2)
+        self.assertEqual(provenance["canonical_transition_id"], transition_id)
+        self.assertNotEqual(
+            provenance["planning_context_sha256"],
+            first._canonical_state["planning_context_sha256"],
+        )
+
+        second = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="audited-rebase-second", campaign_id="audited-rebase",
+            previous_epoch_id=first.run_id,
+        )
+        second._pin_run_inputs(0.01, False)
+        second._import_previous_epoch_checkpoint()
+        self.assertIn(candidate.fingerprint, second.audit_gate.states)
+        rebound_snapshot = json.loads(
+            second._write_compact_snapshot().read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            rebound_snapshot["canonical_state"]["planning_mirror"][
+                "disposition"
+            ],
+            "reuse_after_checkpoint_integrity_checks",
+        )
+        self.assertFalse(any(
+            event["kind"] == "STALE_PLANNING_STATE_DISCARDED"
+            for event in second.store.replay()
+        ))
+
+        snapshot["snapshot_provenance"]["trusted_state_sha256"] = "0" * 64
+        snapshot_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tampered = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="audited-rebase-tampered", campaign_id="audited-rebase",
+            previous_epoch_id=first.run_id,
+        )
+        tampered._pin_run_inputs(0.01, False)
+        with self.assertRaisesRegex(ValueError, "canonical provenance is invalid"):
+            tampered._import_previous_epoch_checkpoint()
+
+        snapshot["snapshot_provenance"]["trusted_state_sha256"] = file_digest(
+            self.runtime / "state" / "nightly_trusted.json"
+        )
+        snapshot["snapshot_provenance"]["canonical_transition_id"] = (
+            "transition-forged"
+        )
+        snapshot["canonical_state"]["canonical_transition_id"] = (
+            "transition-forged"
+        )
+        snapshot_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        forged = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="audited-rebase-forged", campaign_id="audited-rebase",
+            previous_epoch_id=first.run_id,
+        )
+        forged._pin_run_inputs(0.01, False)
+        with self.assertRaisesRegex(ValueError, "transition binding is invalid"):
+            forged._import_previous_epoch_checkpoint()
+
+        snapshot["snapshot_provenance"]["canonical_transition_id"] = transition_id
+        snapshot["canonical_state"]["canonical_transition_id"] = transition_id
+        snapshot["snapshot_provenance"] = {
+            **snapshot["snapshot_provenance"],
+            "schema_version": 1,
+            "planning_context_sha256": first._canonical_state[
+                "planning_context_sha256"
+            ],
+        }
+        for field in (
+            "claim_graph_sha256", "trusted_state_sha256",
+            "canonical_transition_id",
+        ):
+            snapshot["snapshot_provenance"].pop(field, None)
+        snapshot["canonical_state"]["planning_context_sha256"] = (
+            first._canonical_state["planning_context_sha256"]
+        )
+        snapshot["canonical_state"].pop("trusted_state_sha256", None)
+        snapshot["canonical_state"].pop("canonical_transition_id", None)
+        snapshot_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        legacy = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="audited-rebase-legacy", campaign_id="audited-rebase",
+            previous_epoch_id=first.run_id,
+        )
+        legacy._pin_run_inputs(0.01, False)
+        legacy._import_previous_epoch_checkpoint()
+
+        self.assertIn(candidate.fingerprint, legacy.audit_gate.states)
+        reconciliation = [
+            event for event in legacy.store.replay()
+            if event["kind"]
+            == "LEGACY_CHECKPOINT_CANONICAL_PROVENANCE_RECONCILED"
+        ]
+        self.assertEqual(len(reconciliation), 1)
+        self.assertEqual(
+            reconciliation[0]["payload"]["canonical_transition_id"],
+            transition_id,
+        )
+
     def test_canonical_change_after_refresh_blocks_snapshot_and_director(self) -> None:
         controller = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=True,
@@ -409,7 +560,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.1")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.3")
         self.assertIn("canonical_state", run_manifest)
 
     def test_stale_trusted_binding_fails_before_model_turn(self) -> None:
@@ -963,6 +1114,111 @@ class NextArchitectureTests(unittest.TestCase):
         ]
         self.assertEqual(len(compatible), 1)
 
+    def test_run_stops_only_after_artifact_finalization_completes(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+        )
+
+        def write_outcome(**kwargs):
+            kinds = [event["kind"] for event in controller.store.replay()]
+            self.assertIn("RUN_ARTIFACT_FINALIZATION_STARTED", kinds)
+            self.assertNotIn("ATTEMPT_COMPLETED", kinds)
+            self.assertNotIn("RUN_STOPPED", kinds)
+            target = kwargs["outcome_dir"] / "OUTCOME.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# finalized\n", encoding="utf-8")
+            return target
+
+        with patch(
+            "autonomous_math_research.controller.write_outcome_archive",
+            side_effect=write_outcome,
+        ):
+            result = asyncio.run(controller.run(0.001, dry_run=True))
+
+        kinds = [event["kind"] for event in controller.store.replay()]
+        self.assertTrue(result.artifacts_finalized)
+        self.assertEqual(kinds[-3:], [
+            "RUN_ARTIFACT_FINALIZATION_COMPLETED",
+            "ATTEMPT_COMPLETED",
+            "RUN_STOPPED",
+        ])
+        self.assertTrue(json.loads(
+            (
+                self.runtime / "nightly" / controller.run_id / "RUN_SUMMARY.json"
+            ).read_text(encoding="utf-8")
+        )["artifacts_finalized"])
+
+    def test_artifact_failure_is_terminal_and_blocks_auto_continuation(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+        )
+        with patch(
+            "autonomous_math_research.controller.write_outcome_archive",
+            side_effect=OSError("injected archive failure"),
+        ):
+            result = asyncio.run(controller.run(0.001, dry_run=True))
+
+        events = controller.store.replay()
+        self.assertTrue(result.internal_failure)
+        self.assertFalse(result.artifacts_finalized)
+        self.assertIsNone(result.outcome_path)
+        self.assertIn("injected archive failure", result.stopped_reason)
+        self.assertEqual(events[-1]["kind"], "RUN_STOPPED")
+        self.assertFalse(events[-1]["payload"]["artifacts_finalized"])
+        self.assertIn("RUN_ARTIFACT_FINALIZATION_FAILED", {
+            event["kind"] for event in events
+        })
+        checkpoint = controller.campaign_store.load()
+        self.assertFalse(_auto_epoch_allowed(result, checkpoint))
+
+    def test_artifact_interrupt_writes_structured_terminal_before_propagating(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+        )
+        with (
+            patch(
+                "autonomous_math_research.controller.write_outcome_archive",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            asyncio.run(controller.run(0.001, dry_run=True))
+
+        events = controller.store.replay()
+        self.assertEqual(events[-2]["kind"], "ATTEMPT_INTERRUPTED")
+        self.assertEqual(events[-1]["kind"], "RUN_STOPPED")
+        self.assertTrue(events[-1]["payload"]["operator_interrupted"])
+        self.assertFalse(events[-1]["payload"]["artifacts_finalized"])
+        self.assertIsNone(controller.campaign_store.unsealed_epoch())
+
+    def test_operator_cancel_drains_and_finalizes_before_exit_130(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+        )
+        controller._operator_interrupted = True
+        controller._stop_after_epoch = True
+
+        def write_outcome(**kwargs):
+            target = kwargs["outcome_dir"] / "OUTCOME.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# interrupted but finalized\n", encoding="utf-8")
+            return target
+
+        with (
+            patch(
+                "autonomous_math_research.controller.write_outcome_archive",
+                side_effect=write_outcome,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            asyncio.run(controller.run(0.001, dry_run=True))
+
+        events = controller.store.replay()
+        self.assertEqual(controller.campaign_store.load().status, "STOPPED")
+        self.assertEqual(events[-2]["kind"], "ATTEMPT_INTERRUPTED")
+        self.assertTrue(events[-1]["payload"]["artifacts_finalized"])
+        self.assertTrue(events[-1]["payload"]["operator_interrupted"])
+
     def test_auto_epochs_continue_only_at_clean_epoch_boundaries(self) -> None:
         config = load_config(self.project)
         calls: list[argparse.Namespace] = []
@@ -1009,6 +1265,7 @@ class NextArchitectureTests(unittest.TestCase):
                 campaign_id=campaign_id,
                 epoch_id=epoch_id,
                 campaign_status=status,
+                artifacts_finalized=True,
             ), config
 
         args = argparse.Namespace(

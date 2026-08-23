@@ -65,6 +65,12 @@ provenance. Resume validates that record before any campaign write. Existing
 schema-v12 run manifests remain readable; they are marked as legacy-unpinned in
 the append-only event log rather than rewritten.
 
+The derived `INTERMEDIATE_INDEX.json` format is schema v2. It hashes finalized
+immutable artifacts and records a lifecycle event watermark separately;
+`EVENTS.jsonl` and `LIVE_EVENTS.jsonl` remain append-only evidence and are not
+misrepresented as immutable before their terminal records are committed. This
+does not change `autonomous/project.json` or any canonical mathematical file.
+
 `amr init <directory> [--project-id ID] [--final-claim-id ID]` creates a neutral
 complete skeleton. `amr validate --strict` additionally requires every scaffold
 directory and checklist, exact claim-ID agreement, nonempty canonical inputs,

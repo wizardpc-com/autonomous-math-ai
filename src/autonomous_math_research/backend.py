@@ -17,7 +17,8 @@ from .app_server import (
     parse_structured_message, redact_auth_material,
 )
 from .config import HarnessConfig
-from .models import CandidateEvent, JobOutcome, ResearchTask, TokenUsage, utc_now
+from .director_context import DirectorPromptTooLarge, enforce_director_prompt_limit
+from .models import CandidateEvent, JobOutcome, ResearchTask, Role, TokenUsage, utc_now
 from .schema import (
     OutputSchemaCompatibilityError, SchemaError, validate,
     validate_output_schema_compatibility,
@@ -149,6 +150,12 @@ def _turn_error_details(exc: AppServerTurnFailed) -> dict[str, Any]:
 
 
 def _classify_failure(exc: Exception) -> tuple[str, bool, dict[str, Any] | None]:
+    if isinstance(exc, DirectorPromptTooLarge):
+        return "director_prompt_too_large", False, {
+            "prompt_bytes": exc.size_bytes,
+            "hard_limit_bytes": exc.hard_limit_bytes,
+            "action": "rejected before App Server thread/start",
+        }
     if isinstance(exc, OutputSchemaCompatibilityError):
         return "invalid_output_schema", False, {
             "issues": [
@@ -319,6 +326,8 @@ class AppServerBackend:
             validate_output_schema_compatibility(
                 output_schema, schema_path=f"{task.output_contract} ({task.role})",
             )
+            if task.role == Role.DIRECTOR:
+                enforce_director_prompt_limit(prompt)
             started = await self.client.start_thread(
                 model=model, cwd=workspace, sandbox="workspace-write", developer_instructions=developer
             )
