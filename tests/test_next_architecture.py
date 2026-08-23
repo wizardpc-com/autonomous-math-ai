@@ -598,7 +598,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.5")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.6")
         self.assertIn("canonical_state", run_manifest)
 
     def test_stale_trusted_binding_fails_before_model_turn(self) -> None:

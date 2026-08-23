@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -26,6 +27,25 @@ from .schema import (
 
 
 CandidateSink = Callable[[CandidateEvent], Awaitable[None]]
+
+
+def _local_tool_contract() -> str:
+    common = (
+        "Use only the controller packet, snapshot, policy references, and explicitly listed "
+        "project files as research context. Never inspect global Codex memories, session history, "
+        "configuration, plugins, apps, or ambient user-profile files unrelated to those listed "
+        "inputs. The AMR Python runtime is available as python. Do not assume optional commands "
+        "such as rg, jq, py, python3, or pwsh exist. "
+    )
+    if os.name != "nt":
+        return common
+    return common + (
+        "This host uses Windows PowerShell. Use Get-Content, Get-ChildItem, and Select-String for "
+        "file inspection; read JSON with Get-Content -Raw -Encoding UTF8 before ConvertFrom-Json. "
+        "PowerShell statements such as foreach, for, and if cannot be piped directly: assign their "
+        "output to a variable before piping it. Invoke an absolute executable path with the & call "
+        "operator. "
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +340,7 @@ class AppServerBackend:
             "delegate_mechanical_task command in the job workspace; never invoke codex exec or "
             "another worker directly. "
             + tier_instruction
+            + _local_tool_contract()
             + "Do not modify canonical claims, proofs, certificates, protocols, state, "
             + "artifacts, or historical experiments. Write only inside the supplied job workspace."
         )

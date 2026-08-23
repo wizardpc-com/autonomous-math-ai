@@ -56,6 +56,24 @@ Mechanical routes remain null. Requested and observed values are recorded in
 the run manifest and append-only job events, and mismatches stop before trust
 accounting.
 
+## Role tool boundary
+
+Controller-owned App Server processes retain `CODEX_HOME` only so Codex can use
+the existing login. Ambient `AGENTS.md` loading is bounded to zero bytes, and
+memories, plugins, apps, and multi-agent features are disabled at process
+startup; roles must use the run-local packet, canonical snapshot, pinned policy
+references, and explicitly listed project files. The AMR runtime's Python
+executable is placed on the role command path. A stable developer contract also
+identifies optional commands as untrusted until detected and supplies Windows
+PowerShell rules for UTF-8 JSON, statement pipelines, and executable
+invocation.
+
+The live monitor treats a nonzero `commandExecution` exit as a recoverable
+local-command failure within the current Agent turn. A failed MCP or dynamic
+tool call is reported separately as a tool-call failure. Both remain preserved
+verbatim in `LIVE_EVENTS.jsonl`; this display distinction does not change job,
+audit, or canonical-state semantics.
+
 ## Startup canonical-state refresh
 
 Every new `amr run` performs a zero-model-turn refresh before backend startup or

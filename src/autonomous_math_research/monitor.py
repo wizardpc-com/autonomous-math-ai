@@ -704,7 +704,7 @@ def _tool_activity(payload: dict[str, Any], *, completed: bool) -> tuple[str, st
             "failed", "error",
         }
         if completed and failed:
-            return "工具失败", f"{action}失败（退出码 {exit_code}）"
+            return "命令未成功", f"{action}未成功（退出码 {exit_code}；当前 Agent turn 可继续）"
         if completed:
             try:
                 duration_ms = float(payload.get("duration_ms") or 0)
@@ -722,6 +722,11 @@ def _tool_activity(payload: dict[str, Any], *, completed: bool) -> tuple[str, st
         return "资料检索", f"正在检索：{query}" if not completed else f"资料检索完成：{query}"
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         tool = _compact(payload.get("tool"), 80)
+        failed = payload.get("success") is False or str(
+            payload.get("status") or ""
+        ).lower() in {"failed", "error"}
+        if completed and failed:
+            return "工具调用失败", f"{tool} 调用失败"
         return "外部工具", f"正在调用 {tool}" if not completed else f"{tool} 调用完成"
     if item_type == "collabToolCall":
         return "协作", "正在协调其他 Agent" if not completed else "Agent 协作步骤完成"
@@ -1122,7 +1127,8 @@ _ROLE_COLORS = {
     "系统": "\x1b[97m", "监视器": "\x1b[96m",
 }
 _NATURE_COLORS = {
-    "错误": "\x1b[91m", "警告": "\x1b[91m", "工具失败": "\x1b[91m",
+    "错误": "\x1b[91m", "警告": "\x1b[91m", "工具调用失败": "\x1b[91m",
+    "命令未成功": "\x1b[93m",
     "取消": "\x1b[91m", "调度停止": "\x1b[91m", "完成": "\x1b[92m",
     "可信状态": "\x1b[92m", "审计结果": "\x1b[93m", "候选结果": "\x1b[93m",
     "审计": "\x1b[93m", "开始": "\x1b[96m", "新任务": "\x1b[96m",
@@ -2330,7 +2336,7 @@ class _RepeatFolder:
             if activity is None:
                 return True
             action = _describe_command(payload.get("command")) if payload.get("item_type") == "commandExecution" else str(payload.get("item_type") or activity[1])
-            failed = activity[0] in {"工具失败"}
+            failed = activity[0] in {"命令未成功", "工具调用失败"}
             signature = (
                 str(payload.get("role") or ""), str(payload.get("claim_id") or ""),
                 action, "failed" if failed else "completed",

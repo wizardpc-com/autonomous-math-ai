@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -20,6 +21,10 @@ from .schema import validate_output_schema_compatibility
 
 
 NotificationHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+_DISABLED_APP_SERVER_FEATURES = (
+    "memories", "multi_agent", "plugins", "apps",
+)
 
 _AUTH_SECRET_KEYS = {
     "accesstoken", "refreshtoken", "idtoken", "authtoken", "sessiontoken",
@@ -91,8 +96,28 @@ def app_server_environment() -> dict[str, str]:
             marker in normalized for marker in secret_markers
         ):
             environment.pop(key, None)
+    path_key = next((key for key in environment if key.upper() == "PATH"), "PATH")
+    runtime_bin = str(Path(sys.executable).resolve().parent)
+    existing = str(environment.get(path_key) or "")
+    entries = [entry for entry in existing.split(os.pathsep) if entry]
+    if os.path.normcase(runtime_bin) not in {
+        os.path.normcase(str(Path(entry).expanduser())) for entry in entries
+    }:
+        entries.insert(0, runtime_bin)
+    environment[path_key] = os.pathsep.join(entries)
     # Keep CODEX_HOME so App Server can let Codex read its own existing login.
     return environment
+
+
+def app_server_command(codex_executable: str) -> list[str]:
+    command = [
+        codex_executable, "app-server", "--strict-config",
+        "-c", "project_doc_max_bytes=0",
+    ]
+    for feature in _DISABLED_APP_SERVER_FEATURES:
+        command.extend(["--disable", feature])
+    command.append("--stdio")
+    return command
 
 
 class AppServerError(RuntimeError):
@@ -564,7 +589,7 @@ class AppServerClient:
         self._transport_generation += 1
         generation = self._transport_generation
         process = subprocess.Popen(
-            [self.codex_executable, "app-server", "--stdio"],
+            app_server_command(self.codex_executable),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

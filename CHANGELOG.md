@@ -6,6 +6,17 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Controller-owned App Server roles no longer inherit ambient `AGENTS.md`,
+  Codex memories, plugins, apps, or multi-agent tools. The role environment now
+  exposes the pinned AMR Python runtime and a platform-aware command contract,
+  avoiding repeated missing-command, PowerShell pipeline, and UTF-8 JSON
+  failures.
+- The monitor distinguishes a recoverable nonzero local-command exit from an
+  actual App Server tool-call failure instead of reporting both as the same
+  red tool error.
+
 ### Added
 
 - Selectable, strictly validated bundled policy packs for `math-research`,

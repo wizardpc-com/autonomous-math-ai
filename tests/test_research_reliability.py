@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import shutil
+import sys
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.app_server import (
     AppServerClient, AppServerRequestError, AppServerRequestTimeout,
     AppServerTransportClosed, AppServerTurnTimeout,
     AppServerTurnTransportLost, TurnOwnershipRegistry,
+    app_server_command, app_server_environment,
 )
 from autonomous_math_research.backend import (
     AppServerBackend, TurnDirective, _classify_failure,
@@ -112,11 +116,13 @@ class SequenceAppServerClient:
     def __init__(self, results: list[tuple[dict[str, object], int]]):
         self.results = list(results)
         self.start_thread_calls = 0
+        self.start_thread_kwargs: list[dict[str, object]] = []
         self.goal_calls = 0
         self.turn_calls: list[dict[str, object]] = []
 
     async def start_thread(self, **kwargs):  # type: ignore[no-untyped-def]
         self.start_thread_calls += 1
+        self.start_thread_kwargs.append(dict(kwargs))
         return {
             "thread": {"id": "thread-proof"},
             "model": kwargs["model"],
@@ -193,6 +199,40 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.succeeded)
         self.assertEqual(client.goal_calls, 0)
         self.assertEqual(len(client.turn_calls), 1)
+
+    async def test_role_receives_a_bounded_local_tool_contract(self) -> None:
+        client = SequenceAppServerClient([
+            (worker_result("BLOCKED", status="BLOCKED"), 900),
+        ])
+        self.backend.client = client  # type: ignore[assignment]
+
+        async def stop(_outcome: JobOutcome, _turn_index: int) -> TurnDirective:
+            return TurnDirective.stop("verified blocker")
+
+        await self.backend.run_job(
+            job_id="job-tool-contract",
+            task=research_task(),
+            prompt="start",
+            output_schema=json.loads(
+                (Path(__file__).resolve().parents[1]
+                 / "src/autonomous_math_research/resources/schemas/worker_result.schema.json")
+                .read_text(encoding="utf-8")
+            ),
+            workspace=self.project,
+            writable_roots=[self.project],
+            timeout=1,
+            token_budget=10_000,
+            candidate_sink=lambda _event: None,  # type: ignore[arg-type]
+            turn_controller=stop,
+        )
+
+        developer = str(client.start_thread_kwargs[0]["developer_instructions"])
+        self.assertIn("Never inspect global Codex memories", developer)
+        self.assertIn("AMR Python runtime is available as python", developer)
+        self.assertIn("Do not assume optional commands such as rg", developer)
+        if os.name == "nt":
+            self.assertIn("Get-Content -Raw -Encoding UTF8", developer)
+            self.assertIn("cannot be piped directly", developer)
 
     async def test_same_thread_multi_turn_is_explicitly_controller_owned(self) -> None:
         client = SequenceAppServerClient([
@@ -688,6 +728,37 @@ class _RequestTimeoutClient(AppServerClient):
 
     async def _send(self, message: dict[str, object]) -> None:
         del message
+
+
+class AppServerLaunchIsolationTests(unittest.TestCase):
+    def test_launch_disables_ambient_agent_features(self) -> None:
+        command = app_server_command("codex")
+
+        self.assertEqual(command[:3], ["codex", "app-server", "--strict-config"])
+        self.assertIn(["-c", "project_doc_max_bytes=0"], [
+            command[index:index + 2] for index in range(len(command) - 1)
+        ])
+        self.assertEqual(command[-1], "--stdio")
+        for feature in ("memories", "multi_agent", "plugins", "apps"):
+            self.assertIn(["--disable", feature], [
+                command[index:index + 2] for index in range(len(command) - 1)
+            ])
+
+    def test_environment_exposes_runtime_python_without_forwarding_secrets(self) -> None:
+        with patch.dict(os.environ, {
+            "PATH": str(Path("C:/system-tools")),
+            "CODEX_HOME": str(Path("C:/codex-home")),
+            "UNIT_TEST_API_KEY": "must-not-leak",
+        }, clear=True):
+            environment = app_server_environment()
+
+        entries = environment["PATH"].split(os.pathsep)
+        self.assertEqual(
+            os.path.normcase(entries[0]),
+            os.path.normcase(str(Path(sys.executable).resolve().parent)),
+        )
+        self.assertEqual(environment["CODEX_HOME"], str(Path("C:/codex-home")))
+        self.assertNotIn("UNIT_TEST_API_KEY", environment)
 
 
 class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):

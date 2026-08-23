@@ -23,7 +23,7 @@ from autonomous_math_research.lifecycle.campaign import CampaignStore
 from autonomous_math_research.lifecycle.state import LifecyclePhase, MonotoneLifecycle
 from autonomous_math_research.resources import policy_resource, schema_resource
 from autonomous_math_research.monitor import (
-    _TerminalMouseInput, build_status, resolve_run, watch_run,
+    _TerminalMouseInput, build_status, format_live_event, resolve_run, watch_run,
 )
 from autonomous_math_research.storage import EventStore, ProjectLayout, file_digest
 from autonomous_math_research.storage_layer.steering import append_steering, ingest_asset
@@ -164,6 +164,32 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertFalse(mouse.enabled)
         self.assertEqual(mouse.parser.pending, "")
         self.assertIn("\x1b[?1003l\x1b[?1006l", output.getvalue())
+
+    def test_monitor_distinguishes_command_exit_from_tool_call_failure(self) -> None:
+        command_event = {
+            "kind": "AGENT_ITEM_COMPLETED",
+            "timestamp": "2026-08-24T00:00:00Z",
+            "payload": {
+                "role": "director", "item_type": "commandExecution",
+                "command": "rg missing-file", "status": "failed", "exit_code": 1,
+            },
+        }
+        tool_event = {
+            "kind": "AGENT_ITEM_COMPLETED",
+            "timestamp": "2026-08-24T00:00:01Z",
+            "payload": {
+                "role": "director", "item_type": "dynamicToolCall",
+                "tool": "example_tool", "status": "failed", "success": False,
+            },
+        }
+
+        command_line = str(format_live_event(command_event))
+        tool_line = str(format_live_event(tool_event))
+        self.assertIn("命令未成功", command_line)
+        self.assertIn("当前 Agent turn 可继续", command_line)
+        self.assertNotIn("工具调用失败", command_line)
+        self.assertIn("工具调用失败", tool_line)
+        self.assertIn("example_tool 调用失败", tool_line)
 
     def test_run_keyboard_interrupt_returns_structured_exit_130(self) -> None:
         self._init()
