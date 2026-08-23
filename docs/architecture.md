@@ -58,15 +58,39 @@ accounting.
 
 ## Role tool boundary
 
-Controller-owned App Server processes retain `CODEX_HOME` only so Codex can use
-the existing login. Ambient `AGENTS.md` loading is bounded to zero bytes, and
-memories, plugins, apps, and multi-agent features are disabled at process
-startup; roles must use the run-local packet, canonical snapshot, pinned policy
-references, and explicitly listed project files. The AMR runtime's Python
-executable is placed on the role command path. A stable developer contract also
-identifies optional commands as untrusted until detected and supplies Windows
-PowerShell rules for UTF-8 JSON, statement pipelines, and executable
-invocation.
+Controller-owned App Server processes retain `CODEX_HOME` so Codex can reuse
+the operator login and load its own configuration. Ambient `AGENTS.md` loading
+is bounded to zero bytes. Goals, hooks, memories, plugins, apps,
+browser/computer/image tools, dynamic skill discovery, workspace dependency
+tools, and multi-agent features are disabled at process startup; web search and
+image viewing are disabled separately. Configured standalone MCP ids are
+enumerated and disabled before launch, and initialization fails closed if the
+live inventory still exposes an MCP tool, resource, template, or server.
+
+Each process receives a controller-owned permission profile. The project tree,
+Python runtime, and minimal platform paths needed by common tools are readable;
+only the exact runtime workspace roots are writable, network is disabled, and
+every thread attests the selected profile. The Codex executable itself is
+explicitly denied even when it shares a directory with an allowed runtime.
+Login-shell requests are rejected. The role shell receives an allowlisted
+non-login environment without `CODEX_HOME`, `USERPROFILE`, or auth-like
+variables. Codex-only entrypoint directories are
+removed from `PATH`; the executable-level deny also covers runtimes installed
+beside Codex. A prompt contract further limits usage to the run-local packet,
+canonical snapshot, pinned policy references, and explicitly listed project
+files; that last list is a usage rule, while the mechanical filesystem boundary
+is project-wide read-only. The developer contract also identifies optional
+commands as untrusted until detected and supplies Windows PowerShell rules for
+UTF-8 JSON, statement pipelines, and executable invocation.
+
+Current Windows Codex runtimes treat the App Server's own `CODEX_HOME` as a
+special readable location: a sandbox probe can read `config.toml` by absolute
+path even though the role environment omits its location and the permission
+profile denies other project-external siblings. Therefore this boundary
+isolates ambient tools, MCP, environment, writes, and network, but is not a
+credential-filesystem isolation boundary. Core trust transitions never depend
+on keeping operator configuration hidden, and roles are explicitly forbidden
+from inspecting it.
 
 The live monitor treats a nonzero `commandExecution` exit as a recoverable
 local-command failure within the current Agent turn. A failed MCP or dynamic

@@ -390,14 +390,20 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
                 assert params is not None
                 self.calls.append((method, dict(params)))
                 if method == "thread/start":
-                    return {"thread": {"id": "thread-fast"}}
+                    return {
+                        "thread": {"id": "thread-fast"},
+                        "activePermissionProfile": {
+                            "id": self.permission_profile,
+                        },
+                    }
                 if method == "turn/start":
                     return {"turn": {"id": "turn-fast", "status": "completed"}}
                 raise AssertionError(f"unexpected request: {method}")
 
         client = CaptureClient()
         await client.start_thread(
-            model="gpt-5.6-sol", cwd=self.workspace, service_tier="fast",
+            model="gpt-5.6-sol", cwd=self.workspace,
+            writable_roots=[self.workspace], service_tier="fast",
         )
         await client.start_turn(
             thread_id="thread-fast", prompt="{}", cwd=self.workspace,

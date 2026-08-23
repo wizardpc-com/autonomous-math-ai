@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from typing import Any
+from uuid import uuid4
 
 from .models import TokenUsage
 from .provider_config import (
@@ -23,8 +24,46 @@ from .schema import validate_output_schema_compatibility
 NotificationHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 _DISABLED_APP_SERVER_FEATURES = (
-    "memories", "multi_agent", "plugins", "apps",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "goals",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "tool_suggest",
+    "workspace_dependencies",
 )
+
+_MODEL_SHELL_ENVIRONMENT_FILTERS = (
+    "COLORTERM",
+    "COMSPEC",
+    "FORCE_COLOR",
+    "LANG",
+    "LC_*",
+    "NO_COLOR",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "WINDIR",
+)
+_DEFAULT_APP_SERVER_PERMISSION_PROFILE = "amr-role"
 
 _AUTH_SECRET_KEYS = {
     "accesstoken", "refreshtoken", "idtoken", "authtoken", "sessiontoken",
@@ -78,7 +117,9 @@ def _redacted_stderr_tail(lines: list[str], limit: int = 20) -> str:
     return str(redact_auth_material(text))[-4000:]
 
 
-def app_server_environment() -> dict[str, str]:
+def app_server_environment(
+    *, blocked_executable: Path | None = None,
+) -> dict[str, str]:
     """Use the existing Codex login path without forwarding ambient secrets."""
     environment = dict(os.environ)
     secret_markers = (
@@ -99,7 +140,24 @@ def app_server_environment() -> dict[str, str]:
     path_key = next((key for key in environment if key.upper() == "PATH"), "PATH")
     runtime_bin = str(Path(sys.executable).resolve().parent)
     existing = str(environment.get(path_key) or "")
-    entries = [entry for entry in existing.split(os.pathsep) if entry]
+    blocked_directory = (
+        os.path.normcase(str(blocked_executable.resolve().parent))
+        if blocked_executable is not None else None
+    )
+    entries: list[str] = []
+    for entry in existing.split(os.pathsep):
+        if not entry:
+            continue
+        entry_path = Path(entry.strip().strip('"')).expanduser()
+        normalized = os.path.normcase(str(entry_path.resolve()))
+        if blocked_directory is not None and normalized == blocked_directory:
+            continue
+        if any(
+            (entry_path / name).is_file()
+            for name in ("codex", "codex.exe", "codex.cmd", "codex.bat")
+        ):
+            continue
+        entries.append(entry)
     if os.path.normcase(runtime_bin) not in {
         os.path.normcase(str(Path(entry).expanduser())) for entry in entries
     }:
@@ -109,13 +167,135 @@ def app_server_environment() -> dict[str, str]:
     return environment
 
 
-def app_server_command(codex_executable: str) -> list[str]:
-    command = [
-        codex_executable, "app-server", "--strict-config",
-        "-c", "project_doc_max_bytes=0",
-    ]
+def _toml_inline_string_map(values: dict[str, str]) -> str:
+    return "{ " + ", ".join(
+        f"{json.dumps(key)} = {json.dumps(value)}"
+        for key, value in values.items()
+    ) + " }"
+
+
+def _configured_mcp_server_names(
+    codex_executable: str,
+    *,
+    project_root: Path,
+    environment: dict[str, str],
+) -> tuple[str, ...]:
+    """Return only configured MCP ids so launch can disable each one."""
+    command = [codex_executable, "-C", str(project_root.resolve())]
     for feature in _DISABLED_APP_SERVER_FEATURES:
         command.extend(["--disable", feature])
+    command.extend(["mcp", "list", "--json"])
+    try:
+        result = subprocess.run(
+            command,
+            cwd=project_root.resolve(),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AppServerError(
+            f"failed to inspect inherited MCP configuration: {type(exc).__name__}"
+        ) from exc
+    if result.returncode != 0:
+        detail = str(redact_auth_material(result.stderr or ""))[-1000:]
+        suffix = f": {detail}" if detail else ""
+        raise AppServerError(
+            f"inherited MCP configuration probe failed with exit {result.returncode}{suffix}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AppServerError("inherited MCP configuration probe returned invalid JSON") from exc
+    if not isinstance(payload, list):
+        raise AppServerError("inherited MCP configuration probe did not return a list")
+    names: list[str] = []
+    for item in payload:
+        name = item.get("name") if isinstance(item, dict) else None
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or name != name.strip()
+            or len(name) > 256
+            or any(ord(character) < 32 for character in name)
+            or re.fullmatch(r"[A-Za-z0-9_-]+", name) is None
+        ):
+            raise AppServerError("inherited MCP configuration contains an invalid server id")
+        names.append(name)
+    if len(names) != len(set(names)):
+        raise AppServerError("inherited MCP configuration contains duplicate server ids")
+    return tuple(sorted(names))
+
+
+def app_server_command(
+    codex_executable: str,
+    *,
+    project_root: Path | None = None,
+    permission_profile: str = _DEFAULT_APP_SERVER_PERMISSION_PROFILE,
+    mcp_server_names: tuple[str, ...] = (),
+    model_shell_path: str | None = None,
+    runtime_read_roots: tuple[Path, ...] = (),
+    blocked_executable: Path | None = None,
+) -> list[str]:
+    root = (project_root or Path.cwd()).resolve()
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", permission_profile):
+        raise AppServerError("invalid App Server permission profile name")
+    if model_shell_path is None:
+        model_shell_path = app_server_environment().get("PATH", "")
+    command = [
+        codex_executable, "app-server", "--strict-config",
+    ]
+    filesystem_entries: dict[str, str] = {
+        ":root": "deny",
+        ":minimal": "read",
+    }
+    filesystem_entries[str(root)] = "read"
+    for path in runtime_read_roots:
+        filesystem_entries[str(path.resolve())] = "read"
+    if blocked_executable is not None:
+        filesystem_entries[str(blocked_executable.resolve())] = "deny"
+    filesystem = _toml_inline_string_map(filesystem_entries)
+    filesystem = filesystem[:-2] + (
+        ', ":workspace_roots" = { "." = "write" } }'
+    )
+    config_overrides = (
+        "allow_login_shell=false",
+        "approval_policy=\"never\"",
+        f"default_permissions={json.dumps(permission_profile)}",
+        "project_doc_max_bytes=0",
+        (
+            f"projects={{ {json.dumps(str(root))} = "
+            "{ trust_level = \"untrusted\" } }"
+        ),
+        "web_search=\"disabled\"",
+        "tools.view_image=false",
+        "shell_environment_policy.inherit=\"core\"",
+        "shell_environment_policy.ignore_default_excludes=false",
+        "shell_environment_policy.experimental_use_profile=false",
+        "shell_environment_policy.filters=" + _toml_inline_string_map({
+            pattern: "include" for pattern in _MODEL_SHELL_ENVIRONMENT_FILTERS
+        }),
+        "shell_environment_policy.set.PATH=" + json.dumps(model_shell_path),
+        f"permissions.{permission_profile}.description=\"AMR controller-owned role\"",
+        f"permissions.{permission_profile}.filesystem={filesystem}",
+        f"permissions.{permission_profile}.network.enabled=false",
+    )
+    for override in config_overrides:
+        command.extend(["-c", override])
+    for feature in _DISABLED_APP_SERVER_FEATURES:
+        command.extend(["--disable", feature])
+    for name in sorted(set(mcp_server_names)):
+        if re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+            raise AppServerError("invalid MCP server id for App Server isolation")
+        command.extend([
+            "-c", f"mcp_servers.{name}.enabled=false",
+        ])
     command.append("--stdio")
     return command
 
@@ -426,9 +606,17 @@ def attest_model_route(payload: Any, phase: str, requested_model: str) -> str:
 class AppServerClient:
     """Thin JSONL client for the local Codex App Server stdio protocol."""
 
-    def __init__(self, codex_executable: str = "codex", notification_handler: NotificationHandler | None = None):
+    def __init__(
+        self,
+        codex_executable: str = "codex",
+        notification_handler: NotificationHandler | None = None,
+        *,
+        project_root: Path | None = None,
+    ):
         self.codex_executable = _resolve_codex(codex_executable)
         self.notification_handler = notification_handler
+        self.project_root = project_root.resolve() if project_root is not None else None
+        self.permission_profile = f"amr-role-{uuid4().hex[:16]}"
         self.process: subprocess.Popen[bytes] | None = None
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -588,13 +776,35 @@ class AppServerClient:
         self._loop = asyncio.get_running_loop()
         self._transport_generation += 1
         generation = self._transport_generation
+        if self.project_root is None or not self.project_root.is_dir():
+            raise AppServerError("App Server launch requires an existing project root")
+        environment = app_server_environment(
+            blocked_executable=Path(self.codex_executable),
+        )
+        mcp_server_names = _configured_mcp_server_names(
+            self.codex_executable,
+            project_root=self.project_root,
+            environment=environment,
+        )
+        path_key = next(
+            (key for key in environment if key.upper() == "PATH"), "PATH",
+        )
         process = subprocess.Popen(
-            app_server_command(self.codex_executable),
+            app_server_command(
+                self.codex_executable,
+                project_root=self.project_root,
+                permission_profile=self.permission_profile,
+                mcp_server_names=mcp_server_names,
+                model_shell_path=str(environment.get(path_key) or ""),
+                runtime_read_roots=(Path(sys.executable).resolve().parent,),
+                blocked_executable=Path(self.codex_executable),
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
-            env=app_server_environment(),
+            cwd=self.project_root,
+            env=environment,
         )
         self.process = process
         self._transport_alive = True
@@ -617,6 +827,8 @@ class AppServerClient:
                 "capabilities": {"experimentalApi": True},
             })
             await self.notify("initialized", {})
+            await self._attest_permission_profile_available()
+            await self._attest_no_mcp_servers()
         except Exception as exc:
             # The reader may observe stdout EOF slightly before the stderr
             # reader drains the actual startup diagnostic.
@@ -625,6 +837,79 @@ class AppServerClient:
             await self.close()
             suffix = f"; app-server stderr: {detail}" if detail else ""
             raise AppServerError(f"App Server initialize failed: {exc}{suffix}") from exc
+
+    async def _attest_permission_profile_available(self) -> None:
+        cursor: str | None = None
+        while True:
+            response = await self.request("permissionProfile/list", {
+                "cursor": cursor,
+                "limit": 100,
+                "cwd": str(self.project_root),
+            })
+            if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+                raise AppServerError("App Server permission profile response is invalid")
+            for item in response["data"]:
+                if not isinstance(item, dict):
+                    raise AppServerError("App Server permission profile entry is invalid")
+                if item.get("id") == self.permission_profile:
+                    if item.get("allowed") is not True:
+                        raise AppServerError(
+                            "controller-owned App Server permission profile is not allowed"
+                        )
+                    return
+            next_cursor = response.get("nextCursor")
+            if next_cursor is None:
+                raise AppServerError(
+                    "controller-owned App Server permission profile is unavailable"
+                )
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise AppServerError("App Server permission profile cursor is invalid")
+            cursor = next_cursor
+
+    async def _attest_no_mcp_servers(self) -> None:
+        cursor: str | None = None
+        while True:
+            response = await self.request("mcpServerStatus/list", {
+                "cursor": cursor,
+                "limit": 100,
+                "detail": "full",
+                "threadId": None,
+            })
+            if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+                raise AppServerError("App Server MCP inventory response is invalid")
+            for server in response["data"]:
+                if not isinstance(server, dict):
+                    raise AppServerError("App Server MCP inventory entry is invalid")
+                if (
+                    not isinstance(server.get("name"), str)
+                    or not server["name"]
+                    or server.get("authStatus") not in {
+                        "unknown", "unsupported", "notLoggedIn",
+                        "bearerToken", "oAuth",
+                    }
+                    or not isinstance(server.get("tools"), dict)
+                    or not isinstance(server.get("resources"), list)
+                    or not isinstance(server.get("resourceTemplates"), list)
+                    or (
+                        "serverInfo" in server
+                        and server["serverInfo"] is not None
+                        and not isinstance(server["serverInfo"], dict)
+                    )
+                ):
+                    raise AppServerError("App Server MCP inventory entry is invalid")
+                if (
+                    server.get("tools")
+                    or server.get("resources")
+                    or server.get("resourceTemplates")
+                    or server.get("serverInfo") is not None
+                ):
+                    raise AppServerError("App Server exposed an inherited MCP server")
+            next_cursor = response.get("nextCursor")
+            if next_cursor is None:
+                return
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise AppServerError("App Server MCP inventory cursor is invalid")
+            cursor = next_cursor
 
     async def close(self) -> None:
         process = self.process
@@ -890,22 +1175,32 @@ class AppServerClient:
         *,
         model: str,
         cwd: Path,
-        sandbox: str = "workspace-write",
+        writable_roots: list[Path],
         developer_instructions: str | None = None,
         service_tier: str | None = None,
     ) -> dict[str, Any]:
+        roots = list(dict.fromkeys(
+            str(path.resolve()) for path in [cwd, *writable_roots]
+        ))
         params: dict[str, Any] = {
             "model": model,
             "cwd": str(cwd.resolve()),
             "approvalPolicy": "never",
-            "sandbox": sandbox,
+            "permissions": self.permission_profile,
+            "runtimeWorkspaceRoots": roots,
             "serviceName": "autonomous_math_research",
             "serviceTier": service_tier,
             "allowProviderModelFallback": False,
         }
         if developer_instructions:
             params["developerInstructions"] = developer_instructions
-        return await self.request("thread/start", params)
+        response = await self.request("thread/start", params)
+        active = response.get("activePermissionProfile") if isinstance(response, dict) else None
+        if not isinstance(active, dict) or active.get("id") != self.permission_profile:
+            raise AppServerError(
+                "App Server did not attest the controller-owned permission profile"
+            )
+        return response
 
     async def set_goal(self, thread_id: str, objective: str, token_budget: int | None) -> dict[str, Any]:
         params: dict[str, Any] = {"threadId": thread_id, "objective": objective, "status": "active"}
@@ -944,11 +1239,10 @@ class AppServerClient:
             "input": inputs,
             "cwd": str(cwd.resolve()),
             "approvalPolicy": "never",
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [str(path.resolve()) for path in writable_roots],
-                "networkAccess": False,
-            },
+            "permissions": self.permission_profile,
+            "runtimeWorkspaceRoots": list(dict.fromkeys(
+                str(path.resolve()) for path in [cwd, *writable_roots]
+            )),
             "model": model,
             "effort": effort,
             "summary": "concise",

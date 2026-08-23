@@ -5,16 +5,17 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.app_server import (
-    AppServerClient, AppServerRequestError, AppServerRequestTimeout,
+    AppServerClient, AppServerError, AppServerRequestError, AppServerRequestTimeout,
     AppServerTransportClosed, AppServerTurnTimeout,
     AppServerTurnTransportLost, TurnOwnershipRegistry,
-    app_server_command, app_server_environment,
+    _configured_mcp_server_names, app_server_command, app_server_environment,
 )
 from autonomous_math_research.backend import (
     AppServerBackend, TurnDirective, _classify_failure,
@@ -490,6 +491,7 @@ class _CorrelatedTurnClient(AppServerClient):
         self.completion_orders = list(completion_orders)
         self.mismatched_response_ids = mismatched_response_ids
         self.turn_number = 0
+        self.turn_params: list[dict[str, object]] = []
         self.traced: list[dict[str, object]] = []
         self.notification_handler = self.traced.append
 
@@ -539,6 +541,7 @@ class _CorrelatedTurnClient(AppServerClient):
         if method != "turn/start":
             raise AssertionError(f"unexpected request: {method}")
         assert params is not None
+        self.turn_params.append(dict(params))
         self.turn_number += 1
         number = self.turn_number
         thread_id = str(params["threadId"])
@@ -732,17 +735,97 @@ class _RequestTimeoutClient(AppServerClient):
 
 class AppServerLaunchIsolationTests(unittest.TestCase):
     def test_launch_disables_ambient_agent_features(self) -> None:
-        command = app_server_command("codex")
+        project = Path.cwd().resolve()
+        command = app_server_command(
+            "codex",
+            project_root=project,
+            permission_profile="amr-role-test",
+            mcp_server_names=("plain", "server_two"),
+            model_shell_path=str(Path("C:/runtime")),
+            runtime_read_roots=(Path("C:/runtime"),),
+            blocked_executable=Path("C:/runtime/codex.exe"),
+        )
 
         self.assertEqual(command[:3], ["codex", "app-server", "--strict-config"])
         self.assertIn(["-c", "project_doc_max_bytes=0"], [
             command[index:index + 2] for index in range(len(command) - 1)
         ])
         self.assertEqual(command[-1], "--stdio")
-        for feature in ("memories", "multi_agent", "plugins", "apps"):
+        for feature in (
+            "apps", "browser_use", "computer_use", "goals", "hooks",
+            "image_generation", "memories", "multi_agent", "plugins",
+            "skill_search", "workspace_dependencies",
+        ):
             self.assertIn(["--disable", feature], [
                 command[index:index + 2] for index in range(len(command) - 1)
             ])
+        overrides = [
+            command[index + 1]
+            for index, item in enumerate(command[:-1])
+            if item == "-c"
+        ]
+        self.assertIn("allow_login_shell=false", overrides)
+        self.assertIn("web_search=\"disabled\"", overrides)
+        self.assertIn("tools.view_image=false", overrides)
+        self.assertIn("shell_environment_policy.inherit=\"core\"", overrides)
+        self.assertIn("shell_environment_policy.ignore_default_excludes=false", overrides)
+        filesystem_override = next(
+            item for item in overrides
+            if item.startswith("permissions.amr-role-test.filesystem={")
+        )
+        self.assertIn("\":root\" = \"deny\"", filesystem_override)
+        self.assertIn("\":minimal\" = \"read\"", filesystem_override)
+        self.assertIn(
+            f"{json.dumps(str(Path('C:/runtime').resolve()))} = \"read\"",
+            filesystem_override,
+        )
+        self.assertIn(
+            f"{json.dumps(str(Path('C:/runtime/codex.exe').resolve()))} = \"deny\"",
+            filesystem_override,
+        )
+        self.assertIn(
+            "\":workspace_roots\" = { \".\" = \"write\" }",
+            filesystem_override,
+        )
+        self.assertIn(
+            "mcp_servers.plain.enabled=false", overrides,
+        )
+        self.assertIn(
+            "mcp_servers.server_two.enabled=false", overrides,
+        )
+        self.assertFalse(any(item == "--ignore-user-config" for item in command))
+
+    def test_mcp_inventory_is_parsed_without_exposing_configuration(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps([
+                {"name": "zeta", "transport": {"url": "secret"}},
+                {"name": "alpha", "auth_status": "oAuth"},
+            ]),
+            stderr="",
+        )
+        with patch(
+            "autonomous_math_research.app_server.subprocess.run",
+            return_value=completed,
+        ) as run:
+            names = _configured_mcp_server_names(
+                "codex", project_root=Path.cwd(), environment={"PATH": "safe"},
+            )
+
+        self.assertEqual(names, ("alpha", "zeta"))
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "safe"})
+
+    def test_mcp_inventory_failure_is_fail_closed(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="not-json", stderr="",
+        )
+        with patch(
+            "autonomous_math_research.app_server.subprocess.run",
+            return_value=completed,
+        ), self.assertRaisesRegex(AppServerError, "invalid JSON"):
+            _configured_mcp_server_names(
+                "codex", project_root=Path.cwd(), environment={},
+            )
 
     def test_environment_exposes_runtime_python_without_forwarding_secrets(self) -> None:
         with patch.dict(os.environ, {
@@ -759,6 +842,173 @@ class AppServerLaunchIsolationTests(unittest.TestCase):
         )
         self.assertEqual(environment["CODEX_HOME"], str(Path("C:/codex-home")))
         self.assertNotIn("UNIT_TEST_API_KEY", environment)
+
+    def test_environment_removes_the_codex_entrypoint_from_role_path(self) -> None:
+        codex = Path("C:/codex-bin/codex.exe")
+        with patch.dict(os.environ, {
+            "PATH": os.pathsep.join((str(codex.parent), str(Path("C:/tools")))),
+        }, clear=True):
+            environment = app_server_environment(blocked_executable=codex)
+
+        entries = {
+            os.path.normcase(str(Path(item)))
+            for item in environment["PATH"].split(os.pathsep)
+        }
+        self.assertNotIn(os.path.normcase(str(codex.parent)), entries)
+
+    def test_environment_preserves_colocated_runtime_for_exact_executable_deny(self) -> None:
+        codex = Path(sys.executable).resolve().with_name("codex")
+        with patch.dict(os.environ, {
+            "PATH": str(codex.parent),
+        }, clear=True):
+            environment = app_server_environment(blocked_executable=codex)
+
+        entries = {
+            os.path.normcase(str(Path(item).resolve()))
+            for item in environment["PATH"].split(os.pathsep)
+        }
+        self.assertIn(os.path.normcase(str(codex.parent.resolve())), entries)
+
+
+class AppServerThreadPermissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_accepts_only_empty_disabled_mcp_inventory(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            del timeout
+            self.assertEqual(method, "mcpServerStatus/list")
+            self.assertEqual(params["detail"], "full")
+            return {
+                "data": [{
+                    "name": "configured-but-disabled",
+                    "authStatus": "unsupported",
+                    "tools": {},
+                    "resources": [],
+                    "resourceTemplates": [],
+                    "serverInfo": None,
+                }],
+                "nextCursor": None,
+            }
+
+        client.request = request  # type: ignore[method-assign]
+        await client._attest_no_mcp_servers()
+
+    async def test_startup_rejects_exposed_mcp_tools(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            del method, params, timeout
+            return {
+                "data": [{
+                    "name": "ambient",
+                    "authStatus": "unsupported",
+                    "tools": {"unexpected": {"name": "unexpected"}},
+                    "resources": [],
+                    "resourceTemplates": [],
+                    "serverInfo": None,
+                }],
+                "nextCursor": None,
+            }
+
+        client.request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(AppServerError, "exposed an inherited MCP"):
+            await client._attest_no_mcp_servers()
+
+    async def test_startup_rejects_malformed_mcp_inventory(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            del method, params, timeout
+            return {"data": [{}], "nextCursor": None}
+
+        client.request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(AppServerError, "entry is invalid"):
+            await client._attest_no_mcp_servers()
+
+    async def test_startup_rejects_disallowed_permission_profile(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            del method, params, timeout
+            return {
+                "data": [{
+                    "id": client.permission_profile,
+                    "allowed": False,
+                }],
+                "nextCursor": None,
+            }
+
+        client.request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(AppServerError, "is not allowed"):
+            await client._attest_permission_profile_available()
+
+    async def test_thread_uses_and_attests_controller_permission_profile(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+        captured: dict[str, object] = {}
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            del timeout
+            self.assertEqual(method, "thread/start")
+            captured.update(params)
+            return {
+                "thread": {"id": "thread-isolated"},
+                "activePermissionProfile": {"id": client.permission_profile},
+            }
+
+        client.request = request  # type: ignore[method-assign]
+        await client.start_thread(
+            model="gpt-5.6-sol",
+            cwd=Path.cwd(),
+            writable_roots=[Path.cwd()],
+        )
+
+        self.assertEqual(captured["permissions"], client.permission_profile)
+        self.assertEqual(
+            captured["runtimeWorkspaceRoots"], [str(Path.cwd().resolve())],
+        )
+        self.assertNotIn("sandbox", captured)
+
+    async def test_thread_permission_profile_mismatch_fails_closed(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            del method, params, timeout
+            return {
+                "thread": {"id": "thread-isolated"},
+                "activePermissionProfile": {"id": ":workspace"},
+            }
+
+        client.request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(AppServerError, "did not attest"):
+            await client.start_thread(
+                model="gpt-5.6-sol",
+                cwd=Path.cwd(),
+                writable_roots=[Path.cwd()],
+            )
 
 
 class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
@@ -811,6 +1061,18 @@ class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.turn_ownership.unmanaged_continuations, [])
         self.assertEqual(client._completed_thread_turns, {})
         self.assertEqual(client._completed_turns, {})
+
+    async def test_turn_uses_controller_permission_profile_and_exact_roots(self) -> None:
+        client = _CorrelatedTurnClient(["after_response"])
+
+        await self._start_turn(client)
+
+        params = client.turn_params[0]
+        self.assertEqual(params["permissions"], client.permission_profile)
+        self.assertEqual(
+            params["runtimeWorkspaceRoots"], [str(Path.cwd().resolve())],
+        )
+        self.assertNotIn("sandboxPolicy", params)
 
     async def test_mismatched_response_and_stream_ids_remain_correlated(self) -> None:
         client = _CorrelatedTurnClient(

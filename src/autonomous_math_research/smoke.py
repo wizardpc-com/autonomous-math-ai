@@ -365,7 +365,7 @@ async def run_real_smoke(
         })
         try:
             started = await client.start_thread(
-                model=model, cwd=workspace, sandbox="workspace-write",
+                model=model, cwd=workspace, writable_roots=[workspace],
                 developer_instructions=(
                     "This is a bounded App Server protocol smoke with the configured service tier. Do not spawn "
                     "subagents, access the network, or modify canonical project files. "
@@ -379,8 +379,6 @@ async def run_real_smoke(
                 started, "thread/start", requested_tier,
             )
             attest_model_route(started, "thread/start", model)
-            if budget is not None and config.per_thread_limit_action == "interrupt":
-                await client.set_goal(thread_id, f"Complete the bounded {role} smoke task", budget)
             final_prompt = prompt
             if include_policy:
                 assert policy_manifest is not None
@@ -522,7 +520,10 @@ async def run_real_smoke(
         })
         if smoke_adapter == "codex_app_server":
             capability = inspect_generated_schema(work_root=run_dir / "schema-probe")
-            client = client_factory(notification_handler=trace)
+            client = client_factory(
+                notification_handler=trace,
+                project_root=config.project_root,
+            )
             await client.start()
             live = await client.probe_capabilities(config.project_root)
             capability["live_probe"] = live

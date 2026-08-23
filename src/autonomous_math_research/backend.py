@@ -282,7 +282,10 @@ class AppServerBackend:
     ):
         self.config = config
         self.provider_name = provider_name
-        self.client = AppServerClient(notification_handler=trace_notification)
+        self.client = AppServerClient(
+            notification_handler=trace_notification,
+            project_root=config.project_root,
+        )
         self.active: dict[str, tuple[str, str]] = {}
 
     def set_economy_mode(self, enabled: bool) -> None:
@@ -359,7 +362,7 @@ class AppServerBackend:
             if task.role == Role.DIRECTOR:
                 enforce_director_prompt_limit(prompt)
             started = await self.client.start_thread(
-                model=model, cwd=workspace, sandbox="workspace-write",
+                model=model, cwd=workspace, writable_roots=writable_roots,
                 developer_instructions=developer, service_tier=requested_tier,
             )
             thread = started["thread"]

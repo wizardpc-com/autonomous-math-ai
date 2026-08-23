@@ -719,7 +719,7 @@ async def _probe_command(args: argparse.Namespace) -> int:
     # Python 3.14 TemporaryDirectory can install an unusable ACL on Windows;
     # inspect_generated_schema owns and removes its UUID-named child instead.
     result = inspect_generated_schema(work_root=Path(tempfile.gettempdir()))
-    client = AppServerClient()
+    client = AppServerClient(project_root=project)
     await client.start()
     try:
         result["live"] = await client.probe_capabilities(project)

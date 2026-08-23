@@ -13,7 +13,8 @@ from uuid import uuid4
 REQUIRED_METHODS = [
     "thread/start", "thread/resume", "thread/fork",
     "turn/start", "turn/steer", "turn/interrupt",
-    "permissionProfile/list", "account/rateLimits/read", "account/usage/read",
+    "permissionProfile/list", "mcpServerStatus/list",
+    "account/rateLimits/read", "account/usage/read",
 ]
 REQUIRED_NOTIFICATIONS = ["turn/started", "turn/completed", "thread/tokenUsage/updated"]
 
