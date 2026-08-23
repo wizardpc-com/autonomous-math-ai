@@ -366,7 +366,17 @@ class NextArchitectureTests(unittest.TestCase):
             second._import_previous_epoch_checkpoint()
         self.assertEqual(second.pending_research, [])
 
-    def test_audited_transition_rebases_open_audit_checkpoint_and_legacy_v1(self) -> None:
+    @patch(
+        "autonomous_math_research.provenance._codex_identity",
+        return_value={
+            "codex_cli_version": "test-codex",
+            "app_server_schema_sha256": "1" * 64,
+            "app_server_required_protocol_sha256": "2" * 64,
+        },
+    )
+    def test_audited_transition_rebases_open_audit_checkpoint_and_legacy_v1(
+        self, _codex_identity_mock,
+    ) -> None:
         config = load_config(self.project)
         first = AutonomousController(
             config, backend=MockCodexBackend(), mock=False,
