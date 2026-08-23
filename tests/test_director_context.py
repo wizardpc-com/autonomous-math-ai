@@ -18,6 +18,30 @@ from autonomous_math_research.prompts import director_prompt
 
 
 class DirectorContextBoundsTests(unittest.TestCase):
+    def test_nonmath_domain_and_negative_frontier_survive_compaction(self) -> None:
+        compact = build_compact_snapshot(
+            {
+                "domain": "empirical-research",
+                "strictly_trusted": [],
+                "strictly_negative": [{"claim_id": "C_NEG"}],
+                "open_frontier": [],
+                "active_tasks": [],
+                "recent_changes": [],
+            },
+            full_context_reference={
+                "relative_path": "director_context_archive/context.json",
+                "sha256": "0" * 64,
+                "bytes": 3,
+                "generation": 1,
+            },
+            history_archive={"events_path": "EVENTS.jsonl"},
+        )
+
+        self.assertEqual(compact["domain"], "empirical-research")
+        self.assertEqual(compact["strictly_negative"], [{"claim_id": "C_NEG"}])
+        self.assertNotIn("strictly_refuted", compact)
+        self.assertEqual(compact["summary_counts"]["strictly_negative"], 1)
+
     def test_many_director_rounds_do_not_grow_the_first_user_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

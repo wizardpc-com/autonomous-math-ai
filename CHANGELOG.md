@@ -8,6 +8,16 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Selectable, strictly validated bundled policy packs for `math-research`,
+  `certified-computational-research`, and `empirical-research`, with pinned
+  domain contracts, role resources, audit requirements, and fail-closed resume.
+- A deterministic, non-LLM Experiment Runner API and `amr experiment` CLI with
+  strict frozen-input manifests, content-addressed raw outputs, append-only
+  per-case evidence, verified resume/checkpoint recovery, and an injected
+  Docker adapter seam.
+- Neutral certified-checker and frozen empirical-protocol fixtures and their
+  documentation-only manifest schema.
+
 - Artifact-finalization progress events, structured operator-interrupt
   terminals, and `campaign continue --auto-epochs`.
 
@@ -37,6 +47,11 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   diagnostic-only reasoning health monitor.
 
 ### Changed
+
+- `math-research` remains the default and preserves legacy math ClaimGraph and
+  schema-v5 pinned-policy resume behavior; the `autonomous-math-ai`
+  distribution, `autonomous_math_research` namespace, and `amr` command names
+  are unchanged. Empirical outcomes never become mathematical `PROVED` state.
 
 - Incremental Director turns now receive a sub-4-KiB routing envelope instead
   of inline snapshots or transcripts. Complete current context is stored in a

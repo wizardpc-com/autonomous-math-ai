@@ -26,7 +26,12 @@ amr validate --project <temporary-target> --strict
 ```
 
 The freshly initialized target is expected to fail the last command until its
-explicit `AMR_PLACEHOLDER` mathematical content is replaced.
+explicit `AMR_PLACEHOLDER` research content is replaced.
+
+Also initialize and run the deterministic mock lifecycle for all three bundled
+domains, and validate/run/resume both neutral Experiment Runner manifests. These
+checks must remain zero-model and empirical output must never be reported as
+mathematical `PROVED` state.
 
 ## Build
 
@@ -35,7 +40,7 @@ python -m build
 ```
 
 Inspect both wheel and source distribution. They may contain only package code,
-neutral templates, schemas, the bundled policy pack, documentation, tests, and
+neutral templates, schemas, the bundled policy packs, documentation, tests, and
 standard release metadata. Reject campaign runs, generated outcomes, historical
 evidence archives, credentials, private keys, machine-specific paths, and
 conjecture-specific identifiers.
@@ -56,7 +61,7 @@ python -m venv <temporary-directory>
 ```
 
 The dry run must report zero model turns. Mock telemetry must be labeled
-synthetic and must not be presented as mathematical evidence.
+synthetic and must not be presented as scientific evidence.
 
 ## Cross-platform CI
 

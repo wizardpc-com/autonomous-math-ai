@@ -152,7 +152,7 @@ def write_core_capsule(
     frontier_source = [
         {
             "claim_id": claim.claim_id,
-            "status": claim.math_status,
+            "status": claim.research_status,
             "trust": claim.trust_status,
             "evidence": claim.evidence_level,
             "gaps": claim.current_gaps[:3],
@@ -160,7 +160,7 @@ def write_core_capsule(
             "representation_id": representations.get(claim.claim_id),
         }
         for claim in graph.claims.values()
-        if claim.math_status in {"OPEN", "PLAUSIBLE", "REDUCED_TO"}
+        if graph.semantics.is_frontier(claim.research_status)
     ]
     frontier_source.sort(key=lambda item: _priority_key(item, "claim_id"))
     active_source = sorted(
@@ -210,6 +210,8 @@ def write_core_capsule(
             "truncated_values": stats["truncated_values"],
         },
     }
+    if graph.semantics.domain != "math-research":
+        capsule["domain"] = graph.semantics.domain
     while True:
         encoded = _serialize_core_capsule(capsule)
         if len(encoded) <= CORE_CAPSULE_MAX_BYTES:
@@ -245,10 +247,15 @@ def write_research_map(
     representations: dict[str, str],
     canonical_state: dict[str, Any] | None = None,
 ) -> None:
+    status_field = (
+        "math_status"
+        if graph.semantics.domain == "math-research"
+        else "research_status"
+    )
     claims = [
         {
             "claim_id": claim.claim_id,
-            "math_status": claim.math_status,
+            status_field: claim.research_status,
             "trust_status": claim.trust_status,
             "evidence_level": claim.evidence_level,
             "dependencies": claim.dependencies,
@@ -269,6 +276,8 @@ def write_research_map(
         "claims": claims,
         "routes": route_records,
     }
+    if graph.semantics.domain != "math-research":
+        payload["domain"] = graph.semantics.domain
     atomic_write_json(json_path, payload)
     rows = [
         "# Research Map",
@@ -276,11 +285,17 @@ def write_research_map(
         "> Derived navigation only; claim graph and independent audits remain authoritative.",
         "> ClaimGraph supplies the current frontier; startup-frozen inputs are context only.",
         "",
-        "| Claim | Math | Trust | Evidence | Representation |",
+        (
+            "| Claim | Math | Trust | Evidence | Representation |"
+            if graph.semantics.domain == "math-research"
+            else "| Claim | Research status | Trust | Evidence | Representation |"
+        ),
         "|---|---|---|---|---|",
     ]
     rows.extend(
-        "| {claim_id} | {math_status} | {trust_status} | {evidence_level} | {representation_id} |".format(**item)
+        (
+            "| {claim_id} | {status} | {trust_status} | {evidence_level} | {representation_id} |"
+        ).format(status=item[status_field], **item)
         for item in claims
     )
     atomic_write_text(markdown_path, "\n".join(rows) + "\n")

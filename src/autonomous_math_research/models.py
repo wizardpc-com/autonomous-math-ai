@@ -111,6 +111,14 @@ class EventType(StrEnum):
     COMPUTATIONAL_COLLISION = "COMPUTATIONAL_COLLISION"
     COMPUTATIONAL_PATTERN = "COMPUTATIONAL_PATTERN"
     REPRESENTATION_BRIDGE = "REPRESENTATION_BRIDGE"
+    CHECKER_SUPPORT = "CHECKER_SUPPORT"
+    CHECKER_REFUTATION = "CHECKER_REFUTATION"
+    CERTIFICATE = "CERTIFICATE"
+    EXPERIMENT_SUPPORT = "EXPERIMENT_SUPPORT"
+    EXPERIMENT_NOT_SUPPORTED = "EXPERIMENT_NOT_SUPPORTED"
+    CONFIRMATION = "CONFIRMATION"
+    REPLICATION = "REPLICATION"
+    INCONCLUSIVE = "INCONCLUSIVE"
 
 
 class Role(StrEnum):
@@ -138,7 +146,7 @@ TERMINAL_LIFECYCLE_PHASES = frozenset({
 })
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class ResearchTask:
     task_id: str
     role: str
@@ -147,7 +155,7 @@ class ResearchTask:
     why_now: str
     dependencies: list[str]
     expected_information_gain: str
-    mathematical_impact: str
+    research_impact: str
     estimated_cost_tier: str
     required_files: list[str]
     stop_conditions: list[str]
@@ -160,26 +168,87 @@ class ResearchTask:
         default_factory=lambda: RepresentationContract.legacy().to_dict()
     )
 
+    def __init__(
+        self,
+        task_id: str,
+        role: str,
+        target_claim: str,
+        exact_objective: str,
+        why_now: str,
+        dependencies: list[str],
+        expected_information_gain: str,
+        research_impact: str | None = None,
+        estimated_cost_tier: str | None = None,
+        required_files: list[str] | None = None,
+        stop_conditions: list[str] | None = None,
+        output_contract: str = "worker_result.schema.json",
+        priority: float = 0.5,
+        route_family: str = "main",
+        modifies_code: bool = False,
+        metadata: dict[str, Any] | None = None,
+        representation: dict[str, Any] | None = None,
+        *,
+        mathematical_impact: str | None = None,
+    ):
+        if research_impact is None:
+            research_impact = mathematical_impact
+        elif mathematical_impact is not None and mathematical_impact != research_impact:
+            raise ValueError("research_impact and mathematical_impact disagree")
+        if research_impact is None:
+            raise TypeError("missing required research impact")
+        if estimated_cost_tier is None:
+            raise TypeError("missing required estimated_cost_tier")
+        if required_files is None:
+            raise TypeError("missing required required_files")
+        if stop_conditions is None:
+            raise TypeError("missing required stop_conditions")
+        self.task_id = task_id
+        self.role = role
+        self.target_claim = target_claim
+        self.exact_objective = exact_objective
+        self.why_now = why_now
+        self.dependencies = dependencies
+        self.expected_information_gain = expected_information_gain
+        self.research_impact = research_impact
+        self.estimated_cost_tier = estimated_cost_tier
+        self.required_files = required_files
+        self.stop_conditions = stop_conditions
+        self.output_contract = output_contract
+        self.priority = priority
+        self.route_family = route_family
+        self.modifies_code = modifies_code
+        self.metadata = {} if metadata is None else metadata
+        self.representation = (
+            RepresentationContract.legacy().to_dict()
+            if representation is None else representation
+        )
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ResearchTask":
-        allowed = {f.name for f in cls.__dataclass_fields__.values()}
+        allowed = {f.name for f in cls.__dataclass_fields__.values()} | {"mathematical_impact"}
         unknown = set(data) - allowed
         if unknown:
             raise ValueError(f"unknown task fields: {sorted(unknown)}")
         required = {
             "task_id", "role", "target_claim", "exact_objective", "why_now",
-            "dependencies", "expected_information_gain", "mathematical_impact",
+            "dependencies", "expected_information_gain",
             "estimated_cost_tier", "required_files", "stop_conditions",
         }
         missing = required - set(data)
         if missing:
             raise ValueError(f"missing task fields: {sorted(missing)}")
+        impact_fields = {"research_impact", "mathematical_impact"} & set(data)
+        if not impact_fields:
+            raise ValueError("missing task field: research_impact")
+        if len(impact_fields) == 2 and data["research_impact"] != data["mathematical_impact"]:
+            raise ValueError("research_impact and mathematical_impact disagree")
         if data["role"] not in {r.value for r in Role if r not in {Role.DIRECTOR, Role.AUDITOR, Role.EVALUATOR_AUDITOR}}:
             raise ValueError(f"unsupported research role: {data['role']}")
         if not data["stop_conditions"]:
             raise ValueError("task requires at least one stop condition")
-        if data["mathematical_impact"] not in {item.value for item in Impact}:
-            raise ValueError("invalid task mathematical impact")
+        impact = data.get("research_impact", data.get("mathematical_impact"))
+        if impact not in {item.value for item in Impact}:
+            raise ValueError("invalid task research impact")
         if data["estimated_cost_tier"] not in {"LOW", "MEDIUM", "HIGH"}:
             raise ValueError("invalid task cost tier")
         if data["expected_information_gain"] not in {"LOW", "MEDIUM", "HIGH"}:
@@ -187,6 +256,8 @@ class ResearchTask:
         if not 0 <= float(data.get("priority", 0.5)) <= 1:
             raise ValueError("task priority must be between 0 and 1")
         normalized = dict(data)
+        normalized["research_impact"] = impact
+        normalized.pop("mathematical_impact", None)
         normalized.setdefault("output_contract", "worker_result.schema.json")
         normalized.setdefault("representation", RepresentationContract.legacy().to_dict())
         representation = RepresentationContract.from_dict(normalized["representation"])
@@ -194,6 +265,15 @@ class ResearchTask:
         if normalized["output_contract"] != "worker_result.schema.json":
             raise ValueError("research task output contract must be worker_result.schema.json")
         return cls(**normalized)
+
+    @property
+    def mathematical_impact(self) -> str:
+        """Compatibility alias for pre-domain task callers and persisted plans."""
+        return self.research_impact
+
+    @mathematical_impact.setter
+    def mathematical_impact(self, value: str) -> None:
+        self.research_impact = value
 
     @property
     def representation_contract(self) -> RepresentationContract:
@@ -529,8 +609,24 @@ class Claim:
     proof_obligations: list[ProofObligation] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Claim":
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        semantics: Any | None = None,
+    ) -> "Claim":
+        if semantics is None:
+            from .domain_semantics import domain_semantics_from_contract
+
+            semantics = domain_semantics_from_contract(None)
         normalized = dict(data)
+        if "research_status" in normalized:
+            if (
+                "math_status" in normalized
+                and normalized["math_status"] != normalized["research_status"]
+            ):
+                raise ValueError("research_status and math_status disagree")
+            normalized["math_status"] = normalized.pop("research_status")
         normalized.setdefault("parent_claim_id", None)
         normalized.setdefault("evidence_level", infer_evidence_level(normalized.get("source_status")))
         normalized["proof_obligations"] = [
@@ -538,8 +634,7 @@ class Claim:
             for item in normalized.get("proof_obligations", [])
         ]
         obj = cls(**normalized)
-        if obj.math_status not in {x.value for x in MathStatus}:
-            raise ValueError(f"invalid math status for {obj.claim_id}")
+        semantics.validate_status(obj.math_status)
         if obj.trust_status not in {x.value for x in TrustStatus}:
             raise ValueError(f"invalid trust status for {obj.claim_id}")
         evidence_rank(obj.evidence_level)
@@ -550,6 +645,14 @@ class Claim:
         if result.get("parent_claim_id") is None:
             result.pop("parent_claim_id", None)
         return result
+
+    @property
+    def research_status(self) -> str:
+        return self.math_status
+
+    @research_status.setter
+    def research_status(self, value: str) -> None:
+        self.math_status = value
 
 
 @dataclass(slots=True)

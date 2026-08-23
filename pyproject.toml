@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autonomous-math-ai"
 version = "0.2.3"
-description = "Auditable, falsification-first AI orchestration for long-horizon mathematical research"
+description = "Auditable AI orchestration for mathematical, certified-computational, and empirical research"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -15,6 +15,8 @@ keywords = [
   "artificial intelligence",
   "autonomous agents",
   "automated reasoning",
+  "computational research",
+  "empirical research",
   "mathematical research",
   "reproducible research",
   "theorem proving",
@@ -29,6 +31,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Topic :: Scientific/Engineering :: Mathematics",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -53,9 +56,9 @@ where = ["src"]
 [tool.setuptools.package-data]
 autonomous_math_research = [
   "resources/schemas/*.json",
-  "resources/policy_packs/math-research/**/*.md",
-  "resources/policy_packs/math-research/**/*.json",
-  "resources/policy_packs/math-research/**/*.py",
+  "resources/policy_packs/**/*.md",
+  "resources/policy_packs/**/*.json",
+  "resources/policy_packs/**/*.py",
 ]
 
 [tool.unittest]

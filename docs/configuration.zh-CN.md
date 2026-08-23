@@ -22,6 +22,30 @@ v9 新增了 `campaign.hours`（默认 12）和 `campaign.epoch_hours`（默认 
 未传对应参数时读取项目值；显式 `--hours`、`--epoch-hours` 保持最高优先级。
 `config summary` 会脱敏输出项目、campaign、并发、预算、逐角色路由和机械路由摘要。
 
+## 研究 policy pack
+
+以下配置片段通过 `policy.pack` 选择一个内置 domain contract：
+
+```json
+{
+  "policy": {
+    "pack": "math-research"
+  }
+}
+```
+
+可选值是 `math-research`、`certified-computational-research` 和
+`empirical-research`。内置 profile 与未传 `--domain` 的 `amr init` 都默认
+`math-research`，因此现有数学项目保持兼容。`amr init --domain PACK` 会写入同一配置项，
+并创建对应域的初始 ClaimGraph。未知名称、非内置目录或 profile 注入的自定义 pack 都会
+校验失败。
+
+新 run 会严格校验选中 pack 的 descriptor，并把 descriptor、skill、角色 prompt、
+reference、domain contract、audit requirements 和机械资源连同 SHA-256 快照固定到
+run-local policy 目录。resume 使用这些已验证快照并报告已安装源码 drift；快照缺失、
+被修改或跨 pack 重绑定时 fail closed。详见
+[研究域与 policy pack](research-domains.md)。
+
 启动 canonical refresh 没有可关闭的配置开关，项目配置或用户 profile 均不能绕过。
 `amr run` 在任何模型 turn 之前冻结 manifest 声明的 canonical inputs、SHA-256、可用的
 Git revision、结构化 claim/trust mirror 与可选 Director overlay。崩溃 resume 必须继续

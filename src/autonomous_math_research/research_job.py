@@ -9,7 +9,12 @@ from .reasoning_health import ReasoningHealthSignal
 class ResearchTurnPolicy:
     """Controller policy for deciding whether one logical research job is done."""
 
-    def __init__(self, *, max_turns: int | dict[str, int]):
+    def __init__(
+        self,
+        *,
+        max_turns: int | dict[str, int],
+        domain: str = "math-research",
+    ):
         if isinstance(max_turns, int) and not isinstance(max_turns, bool):
             if max_turns < 1:
                 raise ValueError("max_turns must be positive")
@@ -29,6 +34,7 @@ class ResearchTurnPolicy:
             self.max_turns = dict(max_turns)
         else:
             raise ValueError("max_turns must be an integer or per-role mapping")
+        self.domain = domain
 
     def max_turns_for(self, role: str) -> int:
         if role not in self.max_turns:
@@ -79,21 +85,32 @@ class ResearchTurnPolicy:
             )
         if result_type == "TOOL_ERROR":
             return TurnDirective.stop(f"explicit execution terminal: {result_type}")
-        # A model's PROOF/COUNTEREXAMPLE label is not controller-verified
+        # A model's claimed result is not controller-verified
         # progress and cannot terminate the job without a validated candidate.
         return TurnDirective.continue_with(
             self._continuation_prompt(result, "untrusted role result"),
             reason="untrusted role result did not meet a strict stop condition",
         )
 
-    @staticmethod
-    def _continuation_prompt(result: dict[str, Any], reason: str) -> str:
+    def _continuation_prompt(self, result: dict[str, Any], reason: str) -> str:
         next_question = str(result.get("next_suggested_question") or "").strip()
+        if self.domain == "math-research":
+            instruction = (
+                "Continue the same controller-owned proof task in this thread. "
+                f"The prior turn ended because {reason}. "
+                "Do not treat a self-reported PROOF, a finite search, or a plausible sketch as "
+                "canonical progress. Resolve the next open proof obligation, submit any auditable "
+                "candidate through the installed helper, or report a concrete verified blocker. "
+            )
+        else:
+            instruction = (
+                "Continue the same controller-owned research task in this thread. "
+                f"The prior turn ended because {reason}. "
+                "Do not treat a self-reported result or finite experiment as trusted progress. "
+                "Resolve the next domain obligation, submit auditable evidence through the "
+                "installed helper, or report a concrete verified blocker. "
+            )
         return (
-            "Continue the same controller-owned proof task in this thread. "
-            f"The prior turn ended because {reason}. "
-            "Do not treat a self-reported PROOF, a finite search, or a plausible sketch as "
-            "canonical progress. Resolve the next open proof obligation, submit any auditable "
-            "candidate through the installed helper, or report a concrete verified blocker. "
+            instruction
             + (f"Next recorded question: {next_question}" if next_question else "")
         )

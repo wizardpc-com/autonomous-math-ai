@@ -35,6 +35,17 @@ action also opens a separate monitor window pinned to the newly allocated run ID
 amr init ./research-target --project-id research-target --final-claim-id C_ROOT
 ```
 
+This selects the backward-compatible `math-research` pack. To create a neutral
+project for another bundled Phase 1 domain, add one of:
+
+```console
+amr init ./checker-target --domain certified-computational-research
+amr init ./study-target --domain empirical-research
+```
+
+The distribution/import/CLI names do not change. See
+[research domains and policy packs](research-domains.md).
+
 The generated directory contains:
 
 ```text
@@ -59,7 +70,7 @@ research-target/
 └── artifacts/
 ```
 
-Replace the neutral claim and prompts with your exact mathematical statement,
+Replace the neutral claim and prompts with your exact research statement,
 domain, quantifiers, assumptions, and evidence boundaries. Keep generated wire
 schemas and controller policy in the installed package; a target may narrow
 policy but must not relax the trust protocol.
@@ -80,7 +91,7 @@ no-fast/no-priority policy, bundled schemas, and protocol
 compatibility. The result includes `model_turns_started: 0`.
 
 The new scaffold intentionally fails strict validation until the exact
-mathematical placeholders are replaced consistently in `claims/CLAIMS.md` and
+research placeholders are replaced consistently in `claims/CLAIMS.md` and
 the claim graph:
 
 ```console
@@ -95,7 +106,7 @@ amr run --project ./research-target --mock --hours 0.01
 
 The mock exercises Director, research, candidate, audit, reporting, and
 finalization paths with synthetic responses and synthetic telemetry. A mock
-verdict is never mathematical evidence and does not authorize changes to a
+verdict is never research evidence and does not authorize changes to a
 shared canonical state outside its isolated run.
 
 Inspect the result:
@@ -137,7 +148,7 @@ amr run --project ./research-target --hours 12 --epoch-hours 2 --auto-epochs
 ```
 
 Automatic continuation occurs only after a clean epoch-time boundary. Quota
-pause, unsafe canonical state, internal failure, operator stop, or mathematical
+pause, unsafe canonical state, internal failure, operator stop, or a domain
 completion returns control instead of starting another epoch.
 
 This command is intentionally shown but should not be run until the preceding

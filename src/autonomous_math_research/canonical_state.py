@@ -110,14 +110,16 @@ def planning_context_fingerprint(
 
 
 def _graph_state_view_payload(graph_payload: dict[str, Any], graph_digest: str) -> dict[str, Any]:
-    return {
+    domain = str(graph_payload.get("domain") or "math-research")
+    status_field = "math_status" if domain == "math-research" else "research_status"
+    payload = {
         "schema_version": 1,
         "authority": "claim_graph",
         "claim_graph_sha256": graph_digest,
         "claims": [
             {
                 "claim_id": item["claim_id"],
-                "math_status": item["math_status"],
+                status_field: item[status_field],
                 "trust_status": item["trust_status"],
                 "evidence_level": item.get("evidence_level"),
                 "current_gaps": list(item.get("current_gaps") or []),
@@ -128,6 +130,9 @@ def _graph_state_view_payload(graph_payload: dict[str, Any], graph_digest: str) 
             )
         ],
     }
+    if domain != "math-research":
+        payload["domain"] = domain
+    return payload
 
 
 def render_markdown_state_block(graph_payload: dict[str, Any], graph_digest: str) -> str:
@@ -178,7 +183,7 @@ def canonical_markdown_state_views(manifest: ProjectManifest) -> tuple[Path, ...
     return tuple(views)
 
 
-def validate_canonical_mathematical_state(manifest: ProjectManifest) -> tuple[Path, ...]:
+def validate_canonical_research_state(manifest: ProjectManifest) -> tuple[Path, ...]:
     graph_path = manifest.resolve(manifest.claim_graph, must_exist=True)
     graph_bytes = graph_path.read_bytes()
     graph_digest = sha256(graph_bytes).hexdigest()
@@ -210,6 +215,10 @@ def validate_canonical_mathematical_state(manifest: ProjectManifest) -> tuple[Pa
     return views
 
 
+# Compatibility for callers and persisted diagnostics using the pre-domain name.
+validate_canonical_mathematical_state = validate_canonical_research_state
+
+
 def updated_markdown_state_views(
     manifest: ProjectManifest,
     *,
@@ -234,7 +243,7 @@ def capture_canonical_state(
     previous_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_root = manifest.project_root
-    state_views = validate_canonical_mathematical_state(manifest)
+    state_views = validate_canonical_research_state(manifest)
     snapshot_root = run_dir / "state" / "canonical_inputs"
     sources: dict[str, dict[str, Any]] = {}
     ordered_paths: list[str] = []
@@ -408,7 +417,7 @@ def director_canonical_view(
     return {
         "authority": "controller_claim_graph",
         "precedence": (
-            "The controller ClaimGraph below is the sole mathematical-status and proof-"
+            "The controller ClaimGraph below is the sole domain-status and research-"
             "frontier authority. Startup-frozen Markdown inputs are context only and may "
             "not override it. Marked Markdown state blocks are accepted only after exact "
             "ClaimGraph consistency checks. Claim/trust transitions remain audit-gated."

@@ -894,7 +894,7 @@ class AppServerClient:
         inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if skill_path is not None:
             inputs.append({
-                "type": "skill", "name": "math-research",
+                "type": "skill", "name": skill_path.parent.name,
                 "path": str(skill_path.resolve()),
             })
         params = {

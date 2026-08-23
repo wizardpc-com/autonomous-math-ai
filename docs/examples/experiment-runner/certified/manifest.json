@@ -1,0 +1,46 @@
+{
+  "adapter": {
+    "config": {},
+    "kind": "subprocess"
+  },
+  "cases": [
+    {
+      "argv": [
+        "python",
+        "certified/checker.py",
+        "certified/certificate.json"
+      ],
+      "case_id": "verify-toy-certificate",
+      "cwd": "."
+    }
+  ],
+  "config": {
+    "acceptance": "checker_exit_zero",
+    "case_order": "declared"
+  },
+  "cost_metadata": {
+    "billing": "none",
+    "llm_budget": 0
+  },
+  "experiment_id": "toy-certified-checker",
+  "inputs": [
+    {
+      "path": "certified/checker.py",
+      "sha256": "05d70e7e4b8f0b01cf638fbb4e4a8b3f00eb738bc84da8ad550e5b2d855f512c"
+    },
+    {
+      "path": "certified/certificate.json",
+      "sha256": "9297f9f54fe3847fc6a848ec8c3ca0d85b4853ec07f3e18ed82cc1c0e8f6ade3"
+    }
+  ],
+  "protocol_version": "toy-certificate-v1",
+  "resource_metadata": {
+    "worker_slots": 1
+  },
+  "schema_version": 1,
+  "timeout_seconds": 10,
+  "versions": {
+    "example": "1",
+    "python": "3.11-or-later"
+  }
+}

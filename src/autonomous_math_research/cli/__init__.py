@@ -21,6 +21,7 @@ from ..controller import (
     AutonomousController, build_mock_full_cycle_backend,
 )
 from ..eventing import CandidateInbox
+from ..experiment import ExperimentManifest, ExperimentRunner
 from ..initializer import initialize_project
 from ..launcher import run_launcher
 from ..lifecycle.campaign import (
@@ -28,6 +29,7 @@ from ..lifecycle.campaign import (
 )
 from ..models import CandidateEvent
 from ..monitor import build_status, format_status, resolve_run, watch_run
+from ..policy import discover_policy_packs
 from ..project import ProjectManifest
 from ..resources import policy_resource, schema_resource
 from ..smoke import (
@@ -118,10 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="amr")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init", help="create a neutral standalone math project")
+    init = sub.add_parser("init", help="create a neutral standalone research project")
     init.add_argument("directory", type=Path)
     init.add_argument("--project-id")
     init.add_argument("--final-claim-id", default="C_ROOT")
+    init.add_argument(
+        "--domain",
+        choices=tuple(discover_policy_packs()),
+        default="math-research",
+    )
 
     check = sub.add_parser("validate", help="validate a project without starting a model")
     check.add_argument("--project", type=Path, required=True)
@@ -270,6 +277,19 @@ def build_parser() -> argparse.ArgumentParser:
         "new-experiment", help="create a policy-compliant experiment record",
     )
     new_experiment.add_argument("experiment_args", nargs=argparse.REMAINDER)
+
+    experiment = sub.add_parser(
+        "experiment", help="validate or run a deterministic no-LLM experiment batch",
+    )
+    experiment_sub = experiment.add_subparsers(
+        dest="experiment_command", required=True,
+    )
+    for name in ("validate", "run"):
+        command = experiment_sub.add_parser(name)
+        command.add_argument("--project", type=Path, required=True)
+        command.add_argument("--manifest", type=Path, required=True)
+        if name == "run":
+            command.add_argument("--resume", action="store_true")
 
     detect_tools = sub.add_parser(
         "detect-tools", help="write a project-local mathematical tool inventory",
@@ -496,17 +516,38 @@ async def _execute_epoch(args: argparse.Namespace):
             "supply a compatible --max-audit explicitly"
         )
     if args.mock:
-        graph = ProjectLayout(project).claim_graph_path
+        layout = ProjectLayout(project)
+        graph = layout.claim_graph_path
         raw_graph = json.loads(graph.read_text(encoding="utf-8"))
         final_claim = next(
             item for item in raw_graph["claims"]
             if item["claim_id"] == config.final_conjecture_claim_id
         )
+        domain = str(config.raw["policy"]["pack"])
+        evidence_path: Path | None = None
+        if domain != "math-research":
+            evidence_path = layout.run_dir(run_id) / "state" / "domain_mock_evidence.json"
+            evidence = {
+                "schema_version": 1,
+                "authority": "deterministic_mock_only",
+                "domain": domain,
+                "claim_id": str(final_claim["claim_id"]),
+                "protocol_frozen": True,
+                "checker": "mock-no-llm",
+                "llm_calls": 0,
+            }
+            if evidence_path.is_file():
+                if json.loads(evidence_path.read_text(encoding="utf-8")) != evidence:
+                    raise ValueError("pinned mock domain evidence changed")
+            else:
+                atomic_write_json(evidence_path, evidence)
         backend = build_mock_full_cycle_backend(
             claim_id=str(final_claim["claim_id"]),
             statement=str(final_claim["statement"]),
             assumptions=list(final_claim.get("assumptions") or []),
             dependencies=list(final_claim.get("dependencies") or []),
+            domain=domain,
+            evidence_path=str(evidence_path) if evidence_path else None,
         )
     else:
         backend = None
@@ -696,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.directory,
                 project_id=args.project_id,
                 final_claim_id=args.final_claim_id,
+                domain=args.domain,
             )
             result = validate_project(root)
         except (ValueError, OSError, json.JSONDecodeError) as exc:
@@ -884,6 +926,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runpy.run_path(str(runner), run_name="__main__")
             finally:
                 sys.argv = previous
+        return 0
+    if args.command == "experiment":
+        project = args.project.resolve()
+        try:
+            manifest = ExperimentManifest.load(project, args.manifest)
+            if args.experiment_command == "validate":
+                payload = {
+                    "valid": True,
+                    "experiment_id": manifest.experiment_id,
+                    "protocol_version": manifest.protocol_version,
+                    "adapter": manifest.adapter_kind,
+                    "case_ids": [case.case_id for case in manifest.cases],
+                    "llm_execution_allowed": False,
+                }
+            else:
+                summary = ExperimentRunner(project).run(
+                    manifest, resume=args.resume,
+                )
+                payload = {
+                    "completed": True,
+                    "experiment_id": summary.experiment_id,
+                    "run_id": summary.run_id,
+                    "experiment_fingerprint": summary.experiment_fingerprint,
+                    "root": str(summary.root),
+                    "executed_case_ids": list(summary.executed_case_ids),
+                    "resumed_case_ids": list(summary.resumed_case_ids),
+                    "recovered_case_ids": list(summary.recovered_case_ids),
+                    "infrastructure_failure_case_ids": list(
+                        summary.infrastructure_failure_case_ids
+                    ),
+                    "research_result_interpreted": False,
+                    "llm_calls": 0,
+                }
+        except (ValueError, OSError, RuntimeError, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                "valid": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "llm_calls": 0,
+            }, ensure_ascii=False, indent=2))
+            return 2
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "detect-tools":
         with policy_resource("scripts/detect_math_tools.py") as runner:

@@ -1,0 +1,8 @@
+{
+  "items": [
+    {"square": 4, "value": 2},
+    {"square": 9, "value": 3},
+    {"square": 25, "value": 5}
+  ],
+  "schema_version": 1
+}

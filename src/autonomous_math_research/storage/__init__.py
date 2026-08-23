@@ -111,6 +111,10 @@ class ProjectLayout:
         return self.autonomous_root / "outcomes"
 
     @property
+    def experiments_root(self) -> Path:
+        return self.autonomous_root / "experiments"
+
+    @property
     def catalog_root(self) -> Path:
         return self.autonomous_root / "catalog"
 

@@ -19,32 +19,6 @@ from .project import ProjectManifest
 MECHANICAL_BROKER_COMMAND_MARKER = "{{CONTROLLED_MECHANICAL_BROKER_COMMAND}}"
 _PROJECT_OVERLAY_UNSET = object()
 
-_DIRECTOR_CORE = """AMR TOOL-LEVEL DIRECTOR POLICY
-
-Authority and precedence:
-- The controller-supplied dynamic canonical snapshot is the sole current source for
-  frontier, open/closed claim descriptions, and recent progress.
-- A project Director overlay may add stable project-specific constraints only. Ignore
-  any overlay statement about the current frontier or progress that conflicts with the
-  dynamic snapshot.
-- Director output is planning only. It cannot change mathematical status, trust,
-  evidence level, representation compatibility, audit verdicts, or lifecycle state.
-
-Scheduling policy:
-- Score the full current frontier. Prefer the cheapest exact falsification before an
-  expensive proof route, and bound every task with explicit stop conditions.
-- Enforce the controller representation-compatibility view. Cross-representation work
-  requires an independently audited REPRESENTATION_BRIDGE before consuming an
-  incompatible dependency.
-- Respect pending audit gates and exact candidate fingerprints. Model output alone is
-  never proof, refutation, or trusted progress.
-- Respect controller route state as a kill gate: do not retry a failed or paused route
-  until its recorded retry condition is satisfied.
-- Prefer route novelty and information gain; do not duplicate active or pending task
-  fingerprints, and diversify away from a saturated dominant route.
-"""
-
-
 def _render_prompt_text(text: str, name: str) -> str:
     replacements = {
         "{{OUTPUT_PROTOCOL_VERSION}}": str(OUTPUT_PROTOCOL_VERSION),
@@ -85,18 +59,47 @@ def _policy_block(policy_view: dict[str, Any]) -> str:
     for raw in policy_view.get("required_reference_snapshots") or []:
         path = Path(str(raw))
         references.append(f"--- {path.name} ---\n{path.read_text(encoding='utf-8').strip()}")
+    policy_sections: list[str] = []
+    raw_role_prompt = policy_view.get("role_prompt_snapshot")
+    if (
+        not raw_role_prompt
+        and policy_view.get("policy_name") == "math-research"
+    ):
+        return (
+            "\n\nPINNED MATH-RESEARCH POLICY\n"
+            f"manifest_sha256={policy_view['manifest_sha256']}\n"
+            f"role={policy_view['role']}\n"
+            f"stable_core={policy_view['stable_core']}\n"
+            f"precedence={policy_view['precedence']}\n"
+            "one_shot_compute_worker="
+            f"{json.dumps(policy_view.get('one_shot_compute_worker'), ensure_ascii=False, sort_keys=True)}\n"
+            "The complete math-research skill is injected as an App Server skill input. "
+            "The controller has also loaded every required role reference below; do not re-read "
+            "these policy files with shell tools.\n"
+            + "\n\n".join(references)
+        )
+    if raw_role_prompt:
+        prompt_path = Path(str(raw_role_prompt))
+        policy_sections.append(
+            f"PINNED DOMAIN ROLE PROMPT\n"
+            f"--- {prompt_path.name} ---\n"
+            f"{prompt_path.read_text(encoding='utf-8').strip()}"
+        )
+    policy_sections.extend(references)
     return (
-        "\n\nPINNED MATH-RESEARCH POLICY\n"
+        "\n\nPINNED DOMAIN POLICY\n"
+        f"policy_name={policy_view.get('policy_name', 'unknown')}\n"
+        f"domain={policy_view.get('domain', 'unknown')}\n"
         f"manifest_sha256={policy_view['manifest_sha256']}\n"
         f"role={policy_view['role']}\n"
         f"stable_core={policy_view['stable_core']}\n"
         f"precedence={policy_view['precedence']}\n"
         "one_shot_compute_worker="
         f"{json.dumps(policy_view.get('one_shot_compute_worker'), ensure_ascii=False, sort_keys=True)}\n"
-        "The complete math-research skill is injected as an App Server skill input. "
+        "The complete domain policy is injected as an App Server skill input. "
         "The controller has also loaded every required role reference below; do not re-read "
         "these policy files with shell tools.\n"
-        + "\n\n".join(references)
+        + "\n\n".join(policy_sections)
     )
 
 
@@ -111,7 +114,7 @@ def _mechanical_broker_block(command: str) -> str:
         "packet inside this job workspace, then replace PATH_TO_MECHANICAL_TASK_PACKET.json in "
         "the command with that path. Never call codex exec or another agent directly. Never "
         "delegate strategy, lemma/invariant choice, interpretation, prioritization, or any task "
-        "requiring mathematical judgment. The returned configured-route result is mechanical evidence "
+        "requiring research judgment. The returned configured-route result is mechanical evidence "
         "only; you remain responsible for interpretation and, for an Auditor, the final verdict. "
         "The delegated child is one-shot and cannot delegate further."
     )
@@ -141,7 +144,7 @@ def director_prompt(
             full_context_path = snapshot_path.parent / relative
     prompt = (
         "AMR DIRECTOR TURN\n"
-        "Plan the next bounded, highest-information research portfolio for the exact "
+        "Plan the next bounded, highest-information portfolio for the exact "
         "current controller state. This message is only a routing envelope; no snapshot "
         "or transcript is inline.\n\n"
         f"run_id={provenance.get('epoch_id') or provenance.get('run_id') or 'unknown'}\n"
@@ -160,11 +163,12 @@ def director_prompt(
         "2. Read full_context_archive_path only for details omitted/truncated by the bounded summary.\n"
         "3. Read canonical/policy reference paths listed there as needed. Read the append-only "
         "history only when provenance or prior attempts matter; never copy history into output.\n"
-        "The controller ClaimGraph is the sole status/frontier authority. Model output cannot "
+        "The controller ClaimGraph is the sole domain-status/frontier authority. Model output cannot "
         "change trust, evidence, representation compatibility, audit verdicts, or lifecycle state.\n\n"
         "SCHEDULING RULES\n"
-        "Prefer cheap exact falsification, explicit stop conditions, route novelty, and information "
-        "gain. Do not duplicate active/pending task fingerprints. Dependencies are existing ClaimGraph "
+        "Apply the pinned domain policy. Prefer the cheapest decisive check or falsification, explicit "
+        "stop conditions, route novelty, and information gain. Do not duplicate active/pending task "
+        "fingerprints. Dependencies are existing ClaimGraph "
         "claim IDs, not task IDs. Cross-representation work needs an independently audited bridge. "
         "Respect route kill/retry state and pending audit gates.\n"
         f"mechanical_broker_command={MECHANICAL_BROKER_COMMAND_MARKER}\n"
@@ -192,7 +196,7 @@ def worker_prompt(
         f"{_mechanical_broker_block(MECHANICAL_BROKER_COMMAND_MARKER)}\n\nDYNAMIC TASK:\n"
         f"task_packet={packet_path.resolve()}\n"
         f"candidate_event_helper={event_command}\n"
-        "Read only the task's listed mathematical files, progressively. Policy references are already "
+        "Read only the task's listed research files, progressively. Policy references are already "
         "embedded above and must not be re-read. The assigned claim, impact, task identity, "
         "representation, and dependency semantics are controller-owned. Resolve every listed "
         "required_files reference through its matching task_packet.required_file_access entry "

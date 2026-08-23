@@ -28,9 +28,12 @@ IMPORTANT_EVENT_KINDS = {
     "AUDIT_FAILURE_ISOLATED",
     "CANDIDATE_ARTIFACT_DRIFT",
     "TRUST_STATE_CHANGED",
+    "REPRESENTATION_BRIDGE_TRUSTED",
     "CLAIM_CONFLICT_DETECTED",
     "FINAL_CONJECTURE_PROVED",
     "FINAL_CONJECTURE_REFUTED",
+    "FINAL_CLAIM_RESOLVED",
+    "FINAL_CLAIM_RESOLVED_AFTER_INTERNAL_FAILURE",
     "FINALIZATION_STARTED",
     "FINALIZATION_COMPLETED",
     "SCHEDULER_STOPPED",
@@ -176,7 +179,12 @@ def _event_detail(event: dict[str, Any]) -> str:
     if kind == "DIRECTOR_PLAN_ACCEPTED":
         return _short(payload.get("short_rationale") or payload.get("assessment"))
     if kind in {"CANDIDATE_PROCESSED", "CANDIDATE_REJECTED", "TRUST_STATE_CHANGED"}:
-        detail = payload.get("reason") or payload.get("math_status") or payload.get("impact")
+        detail = (
+            payload.get("reason")
+            or payload.get("research_status")
+            or payload.get("math_status")
+            or payload.get("impact")
+        )
         return _short(f"{payload.get('claim_id', 'unknown')}: {detail or ''}")
     if kind == "AUDIT_RECORDED":
         return _short(
@@ -205,6 +213,9 @@ def write_outcome_archive(
     final_claim: Claim | None,
     final_conjecture_proved: bool,
     final_conjecture_refuted: bool = False,
+    domain: str = "math-research",
+    final_claim_resolved: bool = False,
+    final_claim_outcome: str | None = None,
     mechanical_jobs: list[dict[str, Any]] | None = None,
     campaign_id: str | None = None,
     epoch_id: str | None = None,
@@ -213,6 +224,7 @@ def write_outcome_archive(
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> Path:
     """Write a human review summary plus a hash index of preserved intermediates."""
+    is_math = domain == "math-research"
     outcome_dir.mkdir(parents=True, exist_ok=True)
     display_project = project_id or project_root.name
     mechanical_jobs = list(mechanical_jobs or [])
@@ -265,7 +277,7 @@ def write_outcome_archive(
         final_state = "未配置或 claim graph 中不存在"
         final_statement = "未记录"
     else:
-        final_state = f"{final_claim.math_status} / {final_claim.trust_status} / {final_claim.evidence_level}"
+        final_state = f"{final_claim.research_status} / {final_claim.trust_status} / {final_claim.evidence_level}"
         final_statement = final_claim.statement
 
     cost_records = [
@@ -325,7 +337,7 @@ def write_outcome_archive(
 
     trust_lines = [
         f"- `{item.get('payload', {}).get('claim_id', 'unknown')}` → "
-        f"`{item.get('payload', {}).get('math_status', 'unknown')}` / "
+        f"`{item.get('payload', {}).get('math_status', 'unknown') if is_math else item.get('payload', {}).get('research_status', 'unknown')}` / "
         f"`{item.get('payload', {}).get('trust_status', 'unknown')}` / "
         f"`{item.get('payload', {}).get('evidence_level', 'unknown')}`"
         for item in trusted
@@ -346,6 +358,31 @@ def write_outcome_archive(
 
     relative_run = f"../../runs/{run_id}"
     relative_report = f"../../nightly/{run_id}/NIGHTLY_REPORT.md"
+    if is_math:
+        final_section = [
+            "## 最终猜想状态", "",
+            f"- 目标 claim：`{final_claim_id or '未配置'}`",
+            f"- 精确陈述：{final_statement}",
+            f"- 当前状态：`{final_state}`",
+            f"- 最终证明是否触发收尾：`{str(final_conjecture_proved).lower()}`",
+            f"- 最终反例是否触发收尾：`{str(final_conjecture_refuted).lower()}`",
+            "- 只有 controller 审计门确认的最终 claim 才能触发收尾；worker 自述不计入。",
+        ]
+    else:
+        finalization_started = any(
+            event.get("kind") == "FINALIZATION_STARTED" for event in events
+        )
+        final_section = [
+            "## 最终研究主张状态", "",
+            f"- Domain：`{domain}`",
+            f"- 目标 claim：`{final_claim_id or '未配置'}`",
+            f"- 精确陈述：{final_statement}",
+            f"- 当前状态：`{final_state}`",
+            f"- 审计领域终态已记录：`{str(final_claim_resolved).lower()}`",
+            f"- 有序收尾已启动：`{str(finalization_started).lower()}`",
+            f"- 终态极性：`{final_claim_outcome or 'none'}`",
+            "- 只有 controller 审计门确认的领域终态才会触发收尾；worker 自述或有限 benchmark 不计入。",
+        ]
     lines = [
         f"# 自动化成果复核 — {run_id}",
         "",
@@ -369,14 +406,7 @@ def write_outcome_archive(
             f"terminal={mechanical_lifecycle.terminal}。"
         ),
         "",
-        "## 最终猜想状态",
-        "",
-        f"- 目标 claim：`{final_claim_id or '未配置'}`",
-        f"- 精确陈述：{final_statement}",
-        f"- 当前状态：`{final_state}`",
-        f"- 最终证明是否触发收尾：`{str(final_conjecture_proved).lower()}`",
-        f"- 最终反例是否触发收尾：`{str(final_conjecture_refuted).lower()}`",
-        "- 只有 controller 审计门确认的最终 claim 才能触发收尾；worker 自述不计入。",
+        *final_section,
         "",
         "## 持久化 job 与中间成果摘要",
         "",
@@ -386,7 +416,11 @@ def write_outcome_archive(
         "## 受控机械子工摘要",
         "",
         *(mechanical_lines or ["- 未请求机械子工。"]),
-        "- 机械子工输出只是父角色可检查的执行证据；不会自行提升 claim 或形成审计 verdict。",
+        (
+            "- 机械子工输出只是父角色可检查的执行证据；不会自行提升 claim 或形成审计 verdict。"
+            if is_math else
+            "- 机械子工输出只是父角色可检查的执行证据；不会自行形成可信领域结论或审计 verdict。"
+        ),
         "",
         "## 审计后信任变化",
         "",
@@ -417,7 +451,15 @@ def write_outcome_archive(
         "",
         "## 复核边界",
         "",
-        "- mock/dry-run 结果只验证工程协议，不构成数学证明。",
+        (
+            "- mock/dry-run 结果只验证工程协议，不构成数学证明。"
+            if is_math else
+            "- mock/dry-run 结果只验证工程协议，不构成可晋升的科学结论。"
+        ),
+        *(
+            ["- 有限 benchmark evidence 不得自动标为数学 PROVED；empirical 终态仍须遵守冻结协议与独立审计。"]
+            if domain == "empirical-research" else []
+        ),
         "- 未进入 `TRUST_STATE_CHANGED` 的 worker 结果均仍是候选或过程材料。",
         "- 中间材料的完整内容以索引所指向的原文件为准。",
         "",

@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "name": "math-research",
+  "skill": "POLICY.md",
+  "roles": {
+    "director": {
+      "prompt": "prompts/director.md",
+      "references": [
+        "references/compute-orchestration.md",
+        "references/falsification-policy.md",
+        "references/project-state.md",
+        "references/verification-levels.md",
+        "references/worker-contract.md"
+      ]
+    },
+    "prover": {
+      "prompt": "prompts/prover.md",
+      "references": [
+        "references/falsification-policy.md",
+        "references/verification-levels.md",
+        "references/worker-contract.md"
+      ]
+    },
+    "falsifier": {
+      "prompt": "prompts/falsifier.md",
+      "references": [
+        "references/falsification-policy.md",
+        "references/tool-routing.md",
+        "references/experiment-protocol.md",
+        "references/verification-levels.md",
+        "references/worker-contract.md"
+      ]
+    },
+    "explorer": {
+      "prompt": "prompts/explorer.md",
+      "references": [
+        "references/compute-orchestration.md",
+        "references/falsification-policy.md",
+        "references/tool-routing.md",
+        "references/experiment-protocol.md",
+        "references/verification-levels.md",
+        "references/worker-contract.md"
+      ]
+    },
+    "auditor": {
+      "prompt": "prompts/auditor.md",
+      "references": [
+        "references/verification-levels.md",
+        "references/formalization-policy.md",
+        "references/worker-contract.md"
+      ]
+    },
+    "evaluator_auditor": {
+      "prompt": "prompts/evaluator_auditor.md",
+      "references": [
+        "references/verification-levels.md",
+        "references/tool-routing.md",
+        "references/experiment-protocol.md",
+        "references/worker-contract.md"
+      ]
+    },
+    "smoke": {
+      "prompt": "prompts/smoke.md",
+      "references": ["references/verification-levels.md"]
+    }
+  },
+  "domain_contract": {
+    "domain": "math-research",
+    "semantics_version": 1,
+    "claim_statuses": [
+      "PROVED",
+      "REDUCED_TO",
+      "PLAUSIBLE",
+      "FAILED",
+      "OPEN",
+      "COMPUTATION_ONLY"
+    ],
+    "initial_status": "OPEN",
+    "candidate_status": "PLAUSIBLE",
+    "frontier_statuses": ["OPEN", "PLAUSIBLE", "REDUCED_TO"],
+    "terminal_positive": ["PROVED"],
+    "terminal_negative": ["FAILED"],
+    "dependency_satisfying": ["PROVED"],
+    "dependency_refuting": ["FAILED"],
+    "obligation_kind": "proof",
+    "event_transitions": {
+      "THEOREM_CANDIDATE": {
+        "status": "PROVED",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "COUNTEREXAMPLE": {
+        "status": "FAILED",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "KEY_LEMMA": {
+        "status": "PROVED",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "KEY_REFUTATION": {
+        "status": "FAILED",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "REDUCTION": {
+        "status": "REDUCED_TO",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "OBSTRUCTION": {
+        "status": "COMPUTATION_ONLY",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "EQUIVALENCE": {
+        "status": "PROVED",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "COMPUTATIONAL_COLLISION": {
+        "status": "COMPUTATION_ONLY",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "COMPUTATIONAL_PATTERN": {
+        "status": "COMPUTATION_ONLY",
+        "trust_change": true,
+        "min_evidence": "E0_SPECULATIVE"
+      },
+      "REPRESENTATION_BRIDGE": {
+        "status": null,
+        "trust_change": false,
+        "min_evidence": "E0_SPECULATIVE"
+      }
+    },
+    "audit_requirements": {
+      "impact_minimums": {"LOW": 0, "MEDIUM": 0, "HIGH": 0, "CRITICAL": 0},
+      "critical_double_audit": true,
+      "deterministic_checker_events": [],
+      "frozen_protocol_events": []
+    }
+  },
+  "mechanical_resources": {
+    "runner": "resources/policy_packs/math-research/scripts/run_worker.py",
+    "task_schema": "resources/policy_packs/math-research/references/worker-task.schema.json",
+    "result_schema": "resources/policy_packs/math-research/references/worker-result.schema.json",
+    "broker_client": "delegate_mechanical_task.py",
+    "schema_validator": "schema.py",
+    "contract_definitions": "contracts.py"
+  }
+}

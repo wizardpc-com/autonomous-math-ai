@@ -11,6 +11,16 @@ amr config explain --project ./research-target
 amr run --project ./research-target --dry-run
 ```
 
+以上 `amr init` 默认选择向后兼容的 `math-research`。另外两个内置 Phase 1 域可用：
+
+```console
+amr init ./checker-target --domain certified-computational-research
+amr init ./study-target --domain empirical-research
+```
+
+发行名 `autonomous-math-ai`、Python namespace `autonomous_math_research` 和 CLI `amr`
+均不改变。详见[研究域与 policy pack](research-domains.md)。
+
 ## 可选：Windows 双击入口
 
 源码仓库根目录提供 [`../amr-launcher.cmd`](../amr-launcher.cmd)，安装后也可直接运行

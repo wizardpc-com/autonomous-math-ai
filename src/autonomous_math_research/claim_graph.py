@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .domain_semantics import (
+    DomainSemantics, builtin_domain_contract, domain_semantics_from_contract,
+)
 from .models import (
     CandidateEvent, Claim, EvidenceLevel, MathStatus, ObligationStatus,
     ProofObligation, TrustStatus, evidence_rank, stable_hash, utc_now,
@@ -17,21 +20,60 @@ class ClaimGraph:
         claims: dict[str, Claim],
         path: Path | None = None,
         updated_at: str | None = None,
+        *,
+        semantics: DomainSemantics | None = None,
+        domain_contract: dict[str, Any] | None = None,
     ):
+        if semantics is not None and domain_contract is not None:
+            raise ValueError("use semantics or domain_contract, not both")
         self.claims = claims
         self.path = path
         self.updated_at = updated_at
+        self.semantics = semantics or domain_semantics_from_contract(domain_contract)
+        for claim in self.claims.values():
+            self.semantics.validate_status(claim.math_status)
         self._ensure_proof_obligations()
         self._rebuild_dependents()
 
     @classmethod
-    def load(cls, path: Path) -> "ClaimGraph":
+    def load(
+        cls,
+        path: Path,
+        *,
+        semantics: DomainSemantics | None = None,
+        domain_contract: dict[str, Any] | None = None,
+    ) -> "ClaimGraph":
+        if semantics is not None and domain_contract is not None:
+            raise ValueError("use semantics or domain_contract, not both")
         raw = json.loads(path.read_text(encoding="utf-8"))
+        has_raw_domain = "domain" in raw
+        raw_domain = raw.get("domain")
+        if has_raw_domain and (
+            not isinstance(raw_domain, str) or not raw_domain.strip()
+        ):
+            raise ValueError("claim graph domain must be a non-empty string")
+        if semantics is not None:
+            resolved_semantics = semantics
+        elif domain_contract is not None:
+            resolved_semantics = domain_semantics_from_contract(domain_contract)
+        elif has_raw_domain:
+            resolved_semantics = domain_semantics_from_contract(
+                builtin_domain_contract(raw_domain)
+            )
+        else:
+            resolved_semantics = domain_semantics_from_contract(None)
+        if has_raw_domain and raw_domain != resolved_semantics.domain:
+            raise ValueError(
+                "claim graph domain does not match the selected domain semantics"
+            )
         version = int(raw.get("schema_version", 1))
         if version not in {1, 2, 3}:
             raise ValueError(f"unsupported claim graph schema_version: {version}")
-        claims = {item["claim_id"]: Claim.from_dict(item) for item in raw["claims"]}
-        return cls(claims, path, raw.get("updated_at"))
+        claims = {
+            item["claim_id"]: Claim.from_dict(item, semantics=resolved_semantics)
+            for item in raw["claims"]
+        }
+        return cls(claims, path, raw.get("updated_at"), semantics=resolved_semantics)
 
     def _rebuild_dependents(self) -> None:
         for claim in self.claims.values():
@@ -52,6 +94,12 @@ class ClaimGraph:
         return f"{claim_id}::OBL::{digest}"
 
     def _ensure_claim_obligations(self, claim: Claim) -> None:
+        if self.semantics.obligation_kind != "proof":
+            if claim.proof_obligations:
+                raise ValueError(
+                    f"{self.semantics.domain} claims cannot contain proof obligations"
+                )
+            return
         if claim.proof_obligations:
             return
         statements = [item for item in claim.current_gaps if str(item).strip()]
@@ -98,6 +146,7 @@ class ClaimGraph:
         if sum(len(claim.proof_obligations) for claim in self.claims.values()) != len(all_obligations):
             raise ValueError("proof obligation ids must be globally unique")
         for claim in self.claims.values():
+            self.semantics.validate_status(claim.math_status)
             missing = set(claim.dependencies) - set(self.claims)
             if missing:
                 raise ValueError(f"{claim.claim_id} has missing dependencies: {sorted(missing)}")
@@ -140,42 +189,64 @@ class ClaimGraph:
         rejected = []
         frontier = []
         for claim in self.claims.values():
+            status_key = (
+                "math_status" if self.semantics.domain == "math-research"
+                else "research_status"
+            )
+            frontier_key = (
+                "proof_frontier" if self.semantics.domain == "math-research"
+                else "research_frontier"
+            )
             row = {
                 "claim_id": claim.claim_id,
                 "parent_claim_id": claim.parent_claim_id,
                 "statement": claim.statement,
-                "math_status": claim.math_status,
+                status_key: claim.math_status,
                 "trust_status": claim.trust_status,
                 "evidence_level": claim.evidence_level,
                 "dependencies": claim.dependencies,
                 "gaps": claim.current_gaps,
                 "priority": claim.priority,
                 "evidence_paths": claim.evidence_paths,
-                "proof_frontier": self.proof_frontier(claim.claim_id),
+                frontier_key: self.research_frontier(claim.claim_id),
             }
             if claim.trust_status in {TrustStatus.CANONICAL_TRUSTED, TrustStatus.AUDITED_NIGHTLY, TrustStatus.FORMALLY_VERIFIED}:
                 trusted.append(row)
-            if claim.math_status == MathStatus.REFUTED:
+            if self.semantics.dependency_is_refuting(claim.math_status):
                 rejected.append(row)
-            if claim.math_status in {MathStatus.OPEN, MathStatus.PLAUSIBLE, MathStatus.REDUCED_TO}:
+            if self.semantics.is_frontier(claim.math_status):
                 frontier.append(row)
-        return {
+        negative_key = (
+            "strictly_refuted" if self.semantics.domain == "math-research"
+            else "strictly_negative"
+        )
+        snapshot = {
             "strictly_trusted": trusted,
-            "strictly_refuted": rejected,
+            negative_key: rejected,
             "open_frontier": sorted(frontier, key=lambda x: float(x["priority"].get("score", 0)), reverse=True),
             "active_tasks": active_tasks,
             "recent_changes": recent[-20:],
             "budget": budget,
         }
+        if self.semantics.domain != "math-research":
+            snapshot["domain"] = self.semantics.domain
+        return snapshot
 
-    def proof_frontier(self, claim_id: str) -> dict[str, Any]:
+    def research_frontier(self, claim_id: str) -> dict[str, Any]:
         """Return the canonical remaining/next view for one claim.
 
-        The frontier is derived from ClaimGraph obligations, not persisted as a
-        second mutable proof-state file.  A blocked obligation remains visible
-        but is not preferred while a dependency-ready OPEN obligation exists.
+        Math derives this view from proof obligations. Other domains expose
+        their obligation kind without synthesizing mathematical obligations.
         """
         claim = self.claims[claim_id]
+        if self.semantics.obligation_kind != "proof":
+            return {
+                "claim_id": claim_id,
+                "obligation_kind": self.semantics.obligation_kind,
+                "obligations": [],
+                "remaining_obligation_ids": [],
+                "next_obligation_id": None,
+            }
         status_by_id = {
             obligation.obligation_id: obligation.status
             for item in self.claims.values()
@@ -191,7 +262,9 @@ class ClaimGraph:
                 if dependency in self.claims:
                     dependency_claim = self.claims[dependency]
                     if not (
-                        dependency_claim.math_status == MathStatus.PROVED
+                        self.semantics.dependency_is_satisfied(
+                            dependency_claim.math_status
+                        )
                         and dependency_claim.trust_status in {
                             TrustStatus.CANONICAL_TRUSTED,
                             TrustStatus.AUDITED_NIGHTLY,
@@ -217,7 +290,12 @@ class ClaimGraph:
             "next_obligation_id": next_item.obligation_id if next_item else None,
         }
 
+    def proof_frontier(self, claim_id: str) -> dict[str, Any]:
+        """Compatibility alias for the mathematical ClaimGraph API."""
+        return self.research_frontier(claim_id)
+
     def mark_candidate(self, event: CandidateEvent) -> None:
+        self.semantics.validate_event_type(event.type)
         claim = self.claims.get(event.claim_id)
         if claim is None:
             missing = set(event.dependencies) - set(self.claims)
@@ -229,7 +307,7 @@ class ClaimGraph:
                 claim_id=event.claim_id,
                 statement=event.exact_statement,
                 assumptions=list(event.assumptions),
-                math_status=MathStatus.PLAUSIBLE,
+                math_status=self.semantics.candidate_status,
                 trust_status=TrustStatus.UNTRUSTED_CANDIDATE,
                 dependencies=list(event.dependencies), downstream_dependents=[], evidence_paths=event.artifact_paths,
                 known_counterexamples=[], current_gaps=["independent audit pending"], active_tasks=[],
@@ -269,33 +347,70 @@ class ClaimGraph:
         if pass_count < required:
             return
         evidence_rank(verified_evidence_level)
-        claim.trust_status = TrustStatus.AUDITED_NIGHTLY
+        transition = self.semantics.transition_for(event.type, verified_evidence_level)
+        if transition["status"] is None and not transition["trust_change"]:
+            return
+        next_status = transition["status"]
+        current_outcome = self.semantics.final_outcome(claim.math_status)
+        next_outcome = (
+            self.semantics.final_outcome(next_status)
+            if next_status is not None else None
+        )
+        if (
+            self.semantics.domain != "math-research"
+            and
+            current_outcome is not None
+            and next_outcome is not None
+            and current_outcome != next_outcome
+        ):
+            raise ValueError(
+                f"audited {event.type} conflicts with terminal status "
+                f"{claim.math_status}"
+            )
+        if transition["trust_change"]:
+            claim.trust_status = TrustStatus.AUDITED_NIGHTLY
         if evidence_rank(verified_evidence_level) > evidence_rank(claim.evidence_level):
             claim.evidence_level = verified_evidence_level
         claim.evidence_paths = sorted(set(claim.evidence_paths + event.artifact_paths))
-        terminal_obligation_status: str | None = None
-        if event.type in {"COUNTEREXAMPLE", "KEY_REFUTATION"}:
-            claim.math_status = MathStatus.REFUTED
+        applied_status = False
+        if next_status is not None:
+            if (
+                next_outcome is not None
+                or (
+                    current_outcome is None
+                    and (
+                        claim.math_status in {
+                            self.semantics.initial_status,
+                            self.semantics.candidate_status,
+                        }
+                        or self.semantics.is_frontier(next_status)
+                    )
+                )
+            ):
+                claim.math_status = next_status
+                applied_status = True
+        outcome = self.semantics.final_outcome(claim.math_status)
+        if (
+            applied_status
+            and outcome == "negative"
+            and self.semantics.domain == "math-research"
+        ):
             claim.known_counterexamples = sorted(set(claim.known_counterexamples + event.artifact_paths))
+        terminal_obligation_status: str | None = None
+        if applied_status and outcome == "negative":
             terminal_obligation_status = ObligationStatus.REFUTED
-        elif event.type in {"THEOREM_CANDIDATE", "KEY_LEMMA", "EQUIVALENCE"}:
-            claim.math_status = MathStatus.PROVED
+        elif applied_status and outcome == "positive":
             terminal_obligation_status = ObligationStatus.DISCHARGED
-        elif event.type == "REDUCTION":
-            if claim.math_status not in {MathStatus.PROVED, MathStatus.REFUTED}:
-                claim.math_status = MathStatus.REDUCED_TO
-        else:
-            if claim.math_status not in {MathStatus.PROVED, MathStatus.REFUTED, MathStatus.REDUCED_TO}:
-                claim.math_status = MathStatus.COMPUTATION_ONLY
         if terminal_obligation_status is not None:
-            now = utc_now()
-            for obligation in claim.proof_obligations:
-                if obligation.status in {ObligationStatus.OPEN, ObligationStatus.BLOCKED}:
-                    obligation.status = terminal_obligation_status
-                    obligation.evidence_paths = sorted(set(
-                        obligation.evidence_paths + event.artifact_paths
-                    ))
-                    obligation.updated_at = now
+            if self.semantics.obligation_kind == "proof":
+                now = utc_now()
+                for obligation in claim.proof_obligations:
+                    if obligation.status in {ObligationStatus.OPEN, ObligationStatus.BLOCKED}:
+                        obligation.status = terminal_obligation_status
+                        obligation.evidence_paths = sorted(set(
+                            obligation.evidence_paths + event.artifact_paths
+                        ))
+                        obligation.updated_at = now
             claim.current_gaps = []
         claim.last_meaningful_progress = utc_now()
 
@@ -310,7 +425,7 @@ class ClaimGraph:
         blocked: dict[str, list[str]] = {}
         failed = {
             claim_id for claim_id, claim in self.claims.items()
-            if claim.math_status == MathStatus.REFUTED
+            if self.semantics.dependency_is_refuting(claim.math_status)
             and claim.trust_status in {TrustStatus.CANONICAL_TRUSTED, TrustStatus.AUDITED_NIGHTLY, TrustStatus.FORMALLY_VERIFIED}
         }
         changed = True
@@ -330,11 +445,21 @@ class ClaimGraph:
             self.updated_at = updated_at
         self._rebuild_dependents()
         self.validate()
-        return {
+        payload = {
             "schema_version": 3,
             "updated_at": self.updated_at,
-            "claims": [self.claims[key].to_dict() for key in sorted(self.claims)],
+            "claims": [self._claim_payload(self.claims[key]) for key in sorted(self.claims)],
         }
+        if self.semantics.domain != "math-research":
+            payload["domain"] = self.semantics.domain
+        return payload
+
+    def _claim_payload(self, claim: Claim) -> dict[str, Any]:
+        payload = claim.to_dict()
+        if self.semantics.domain != "math-research":
+            payload["research_status"] = payload.pop("math_status")
+            payload.pop("proof_obligations", None)
+        return payload
 
     def save(self, path: Path | None = None) -> None:
         target = path or self.path

@@ -34,6 +34,8 @@ def render_nightly_report(
     campaign_status: str | None = None,
 ) -> str:
     mechanical_jobs = list(mechanical_jobs or [])
+    domain = graph.semantics.domain
+    is_math = domain == "math-research"
     lifecycle = job_lifecycle_metrics(events)
     mechanical_lifecycle = mechanical_lifecycle_metrics(events)
     claims = list(graph.claims.values())
@@ -45,10 +47,20 @@ def render_nightly_report(
     rejected_candidates = [e for e in events if e.get("kind") == "CANDIDATE_REJECTED"]
     recovered_candidates = [e for e in events if e.get("kind") == "CANDIDATE_RESCUED_FROM_RUN"]
     trusted_new = [c for c in claims if c.claim_id in trusted_ids]
-    failed = [c for c in claims if c.claim_id in trusted_ids and c.math_status == MathStatus.FAILED]
-    computation = [c for c in claims if c.math_status == MathStatus.COMPUTATION_ONLY]
+    failed = [
+        c for c in claims
+        if c.claim_id in trusted_ids
+        and graph.semantics.final_outcome(c.research_status) == "negative"
+    ]
+    computation = (
+        [c for c in claims if c.math_status == MathStatus.COMPUTATION_ONLY]
+        if is_math else
+        [c for c in claims if c.research_status == "INCONCLUSIVE"]
+    )
     plausible = [c for c in claims if c.trust_status in {TrustStatus.UNTRUSTED_CANDIDATE, TrustStatus.AUDIT_PENDING, TrustStatus.AUDIT_1_PASS}]
-    open_claims = [c for c in claims if c.math_status in {MathStatus.OPEN, MathStatus.REDUCED_TO, MathStatus.PLAUSIBLE}]
+    open_claims = [
+        c for c in claims if graph.semantics.is_frontier(c.research_status)
+    ]
     pruned = [e for e in events if e.get("kind") == "DEPENDENCY_PRUNED"]
     tokens_by_role: dict[str, int] = defaultdict(int)
     useful_by_role: Counter[str] = Counter()
@@ -124,7 +136,7 @@ def render_nightly_report(
             return empty
         return "\n".join(
             f"- `{c.claim_id}` — {c.statement}"
-            f"（{c.math_status} / {c.trust_status} / {c.evidence_level}）"
+            f"（{c.research_status} / {c.trust_status} / {c.evidence_level}）"
             for c in items
         )
 
@@ -132,7 +144,10 @@ def render_nightly_report(
     seeds = [e for e in events if e.get("kind") == "DIRECTOR_PLAN_ACCEPTED"]
     promotable = [
         claim for claim in trusted_new
-        if claim.math_status != MathStatus.COMPUTATION_ONLY
+        if (
+            claim.math_status != MathStatus.COMPUTATION_ONLY
+            if is_math else claim.research_status != "INCONCLUSIVE"
+        )
     ] if promotion_allowed else []
     trusted_display = trusted_new if promotion_allowed else []
     failed_display = failed if promotion_allowed else []
@@ -146,7 +161,11 @@ def render_nightly_report(
         no_failed_message = "- 无；本次运行没有新增通过审计的严格否定。"
         no_promotion_message = "- 无；没有满足人工晋升条件的新结果。"
     elif execution_mode in {"mock", "smoke", "dry-run"}:
-        no_trusted_message = f"- 无；{execution_mode} validation 不产生数学可信结果。"
+        no_trusted_message = (
+            f"- 无；{execution_mode} validation 不产生数学可信结果。"
+            if is_math else
+            f"- 无；{execution_mode} validation 不产生可晋升的领域结论。"
+        )
         no_failed_message = f"- 无；{execution_mode} validation 不产生正式否定。"
         no_promotion_message = f"- 无；{execution_mode} 结果不得晋升。"
     else:
@@ -207,8 +226,44 @@ def render_nightly_report(
                 f"（{(tokens / useful):.1f} tokens/useful）"
             )
         return f"- {role}: 0 个 useful outcome / {tokens} tokens"
+    final_claim = graph.claims.get(final_claim_id) if final_claim_id else None
+    final_status = final_claim.research_status if final_claim is not None else "未配置"
+    if is_math:
+        final_section = [
+            "## 【最终猜想与收尾状态】", "",
+            f"- 最终目标 claim：`{final_claim_id or '未配置'}`",
+            f"- 审计确认最终证明并触发有序收尾：{final_conjecture_proved}",
+            f"- 审计确认最终反例并触发有序收尾：{final_conjecture_refuted}",
+            "- worker 自述不会触发最终收尾；只接受 controller 审计门后的 claim graph 状态。",
+        ]
+    else:
+        resolved = bool(
+            final_claim is not None
+            and graph.semantics.final_outcome(final_claim.research_status) is not None
+            and final_claim.trust_status in {
+                TrustStatus.AUDITED_NIGHTLY,
+                TrustStatus.FORMALLY_VERIFIED,
+                TrustStatus.CANONICAL_TRUSTED,
+            }
+        )
+        finalization_started = any(
+            event.get("kind") == "FINALIZATION_STARTED" for event in events
+        )
+        final_section = [
+            "## 【最终研究主张与收尾状态】", "",
+            f"- Domain：`{domain}`",
+            f"- 最终目标 claim：`{final_claim_id or '未配置'}`",
+            f"- 当前领域状态：`{final_status}`",
+            f"- 审计确认领域终态：{resolved}",
+            f"- 有序收尾已启动：{finalization_started}",
+            "- worker 自述、有限 benchmark 或未审计结果不会自行触发收尾。",
+        ]
     lines = [
-        f"# Autonomous Math AI Nightly Report — {run_id}",
+        (
+            f"# Autonomous Math AI Nightly Report — {run_id}"
+            if is_math else
+            f"# Autonomous Research Core Nightly Report — {run_id}"
+        ),
         "",
         f"执行模式：{execution_mode}",
         f"运行结果：{run_outcome}",
@@ -219,18 +274,16 @@ def render_nightly_report(
         "",
         f"停止原因：{stopped_reason}",
         "",
-        "## 【最终猜想与收尾状态】", "",
-        f"- 最终目标 claim：`{final_claim_id or '未配置'}`",
-        f"- 审计确认最终证明并触发有序收尾：{final_conjecture_proved}",
-        f"- 审计确认最终反例并触发有序收尾：{final_conjecture_refuted}",
-        "- worker 自述不会触发最终收尾；只接受 controller 审计门后的 claim graph 状态。",
+        *final_section,
         "",
         "## 【本夜审计后可相信的新结果】", "",
         claim_lines(trusted_display, no_trusted_message), "",
         "## 【已严格否定】", "",
         claim_lines(failed_display, no_failed_message), "",
-        "## 【仅计算支持】", "", claim_lines(computation), "",
-        "## 【PLAUSIBLE / 未审计】", "", claim_lines(plausible), "",
+        ("## 【仅计算支持】" if is_math else "## 【领域内 INCONCLUSIVE】"),
+        "", claim_lines(computation), "",
+        ("## 【PLAUSIBLE / 未审计】" if is_math else "## 【未审计候选】"),
+        "", claim_lines(plausible), "",
         "## 【被拒绝的 candidate】", "",
         *(
             f"- `{item.get('payload', {}).get('claim_id', 'unknown')}` / "
@@ -287,7 +340,11 @@ def render_nightly_report(
             if mechanical_model_attestations
             else "unobservable（没有 mechanical job）"
         ),
-        "- mechanical worker 结果只是机械执行证据，不自动构成证明或独立审计 verdict。",
+        (
+            "- mechanical worker 结果只是机械执行证据，不自动构成证明或独立审计 verdict。"
+            if is_math else
+            "- mechanical worker 结果只是执行证据，不自动构成可信领域结论或独立审计 verdict。"
+        ),
         "- observed service tier：" + (
             ", ".join(f"{tier} ({count} jobs)" for tier, count in sorted(observed_service_tiers.items()))
             if observed_service_tiers else "unobservable（没有 job telemetry）"
@@ -304,7 +361,11 @@ def render_nightly_report(
             for item in rejected_candidates
         ), "",
         "## 【下一轮建议】", "",
-        "- 由 fresh Director 读取本报告与 compact snapshot 后重新评估；不要从未审计 candidate 直接改写 canonical claims/proofs/state。",
+        (
+            "- 由 fresh Director 读取本报告与 compact snapshot 后重新评估；不要从未审计 candidate 直接改写 canonical claims/proofs/state。"
+            if is_math else
+            "- 由 fresh Director 读取本报告与 compact snapshot 后重新评估；不要从未审计 candidate 直接改写 canonical claim/trust state。"
+        ),
         "",
         "## Run trace", "",
         f"- `EVENTS.jsonl` 保存 {len(events)} 个 append-only 状态转换。",
@@ -319,7 +380,11 @@ def render_nightly_report(
             f"terminal={mechanical_lifecycle.terminal}（completed={mechanical_lifecycle.completed}，"
             f"failed={mechanical_lifecycle.failed}）。"
         ),
-        f"- 保存 {len(jobs)} 个 terminal job 记录；完整推导与计算应留在各 job artifact 目录。",
+        (
+            f"- 保存 {len(jobs)} 个 terminal job 记录；完整推导与计算应留在各 job artifact 目录。"
+            if is_math else
+            f"- 保存 {len(jobs)} 个 terminal job 记录；完整分析与执行证据应留在各 job artifact 目录。"
+        ),
         f"- 保存 {len(mechanical_jobs)} 个 mechanical subtask terminal 记录及其父任务关联。",
         "",
     ]

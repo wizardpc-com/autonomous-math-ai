@@ -3,7 +3,7 @@ include CHANGELOG.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md CITATION.cff
 include amr-launcher.cmd
 recursive-include src/autonomous_math_research/resources *.json *.md *.py
 recursive-include templates/minimal-project *.json *.yaml *.md
-recursive-include docs *.md *.json
+recursive-include docs *.md *.json *.py *.csv .gitattributes
 recursive-include scripts *.py
 recursive-include tests *.py *.json
 prune tests/_runtime

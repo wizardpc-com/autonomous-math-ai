@@ -29,6 +29,14 @@ The CLI accepts any target directory with `--project`. `--workspace-root` may
 pin a containing workspace; otherwise the target's nearest Git root is used.
 No package code assumes a source checkout or fixed collection layout.
 
+The research domain is selected by `policy.pack` in the manifest-selected
+configuration, not by adding a field to `autonomous/project.json`. `amr init
+--domain PACK` writes that configuration. `math-research` keeps the legacy graph
+wire format (`math_status` and `proof_frontier`, with no top-level `domain`);
+non-math graphs carry a top-level `domain`, use `research_status`, and expose a
+`research_frontier` without synthesizing proof obligations. See
+[Research domains and policy packs](research-domains.md).
+
 `canonical_inputs` keeps the existing three role arrays. No manifest migration
 is required. At each new run, AMR resolves every listed file, reads it once,
 records its project-relative path and SHA-256, copies the exact bytes into the
@@ -37,8 +45,8 @@ files are embedded in the startup-generated dynamic snapshot as contextual
 material. They cannot override the dynamic ClaimGraph frontier even when they
 contain stale status prose.
 
-`claim_graph` is the single machine-readable mathematical-status and proof-
-frontier authority. `trusted_state` records audit provenance and, after the
+`claim_graph` is the single machine-readable domain-status and frontier
+authority. `trusted_state` records audit provenance and, after the
 first controller transition, binds to the exact ClaimGraph SHA-256. Legacy
 unbound trusted files remain readable for compatibility. A canonical Markdown
 input can opt into strict consistency checking by containing exactly one
@@ -69,11 +77,11 @@ The derived `INTERMEDIATE_INDEX.json` format is schema v2. It hashes finalized
 immutable artifacts and records a lifecycle event watermark separately;
 `EVENTS.jsonl` and `LIVE_EVENTS.jsonl` remain append-only evidence and are not
 misrepresented as immutable before their terminal records are committed. This
-does not change `autonomous/project.json` or any canonical mathematical file.
+does not change `autonomous/project.json` or any canonical research file.
 
-`amr init <directory> [--project-id ID] [--final-claim-id ID]` creates a neutral
-complete skeleton. `amr validate --strict` additionally requires every scaffold
-directory and checklist, exact claim-ID agreement, nonempty canonical inputs,
-consistent protected paths, and removal of mathematical placeholders. It also
-validates provider/model configuration and secret references without starting a
-model turn.
+`amr init <directory> [--project-id ID] [--final-claim-id ID] [--domain PACK]`
+creates a neutral complete skeleton. `amr validate --strict` additionally
+requires every scaffold directory and checklist, exact claim-ID agreement,
+nonempty canonical inputs, consistent protected paths, and removal of research
+placeholders. It also validates provider/model configuration and secret
+references without starting a model turn.

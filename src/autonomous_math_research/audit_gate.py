@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .domain_semantics import DomainSemantics, domain_semantics_from_contract
 from .models import (
     AuditResult, CandidateEvent, EvidenceLevel, Impact, TrustStatus, evidence_rank,
 )
@@ -17,19 +18,27 @@ class CandidateAuditState:
 
 
 class AuditGate:
-    def __init__(self, high_threshold: str = "HIGH", critical_double_audit: bool = True):
+    def __init__(
+        self,
+        high_threshold: str = "HIGH",
+        critical_double_audit: bool = True,
+        semantics: DomainSemantics | None = None,
+    ):
         self.high_threshold = high_threshold
         self.critical_double_audit = critical_double_audit
+        self.semantics = semantics or domain_semantics_from_contract(None)
         self.states: dict[str, CandidateAuditState] = {}
 
     def required_audits(self, event: CandidateEvent) -> int:
-        if event.impact == Impact.CRITICAL and self.critical_double_audit:
-            return 2
         ranks = {Impact.LOW: 0, Impact.MEDIUM: 1, Impact.HIGH: 2, Impact.CRITICAL: 3}
         threshold = Impact(self.high_threshold)
-        if ranks[Impact(event.impact)] >= ranks[threshold]:
-            return 1
-        return 0
+        configured = int(ranks[Impact(event.impact)] >= ranks[threshold])
+        if event.impact == Impact.CRITICAL and self.critical_double_audit:
+            configured = 2
+        packed = self.semantics.required_independent_audits(
+            event.impact, self.critical_double_audit,
+        )
+        return max(configured, packed)
 
     def register(self, event: CandidateEvent) -> CandidateAuditState:
         state = self.states.get(event.fingerprint)
@@ -47,6 +56,11 @@ class AuditGate:
             return None
         counterexample_types = {"COUNTEREXAMPLE", "KEY_REFUTATION"}
         computation_types = {"COMPUTATIONAL_COLLISION", "COMPUTATIONAL_PATTERN"}
+        if (
+            self.semantics.requires_deterministic_checker(event.type)
+            or self.semantics.requires_frozen_protocol(event.type)
+        ):
+            return "independent_evaluator"
         if not state.results:
             if event.type in counterexample_types:
                 return "counterexample"
@@ -89,13 +103,17 @@ class AuditGate:
         )
         if verified_rank > proposed_rank and not redundant_exact_upgrade:
             raise ValueError("audit evidence level exceeds the candidate evidence without an allowed independent upgrade")
+        if result.verdict == "PASS":
+            self.semantics.transition_for(
+                state.event.type, result.verified_evidence_level,
+            )
         state.results.append(result)
         if result.verdict == "REJECT":
             state.trust_status = TrustStatus.REJECTED
             state.terminal = True
         elif result.verdict == "UNRESOLVED":
             # Preserve the candidate without converting an inconclusive audit
-            # into a mathematical rejection.  A fresh Director may decide to
+            # into a claim refutation.  A fresh Director may decide to
             # create a new audit attempt explicitly.
             state.trust_status = TrustStatus.AUDIT_PENDING
             state.terminal = False

@@ -10,7 +10,7 @@
     "claim_id": {"type": "string", "minLength": 1},
     "parent_claim_id": {"type": ["string", "null"]},
     "source_run_id": {"type": ["string", "null"]},
-    "type": {"type": "string", "enum": ["THEOREM_CANDIDATE", "COUNTEREXAMPLE", "KEY_LEMMA", "KEY_REFUTATION", "REDUCTION", "OBSTRUCTION", "EQUIVALENCE", "COMPUTATIONAL_COLLISION", "COMPUTATIONAL_PATTERN", "REPRESENTATION_BRIDGE"]},
+    "type": {"type": "string", "enum": ["THEOREM_CANDIDATE", "COUNTEREXAMPLE", "KEY_LEMMA", "KEY_REFUTATION", "REDUCTION", "OBSTRUCTION", "EQUIVALENCE", "COMPUTATIONAL_COLLISION", "COMPUTATIONAL_PATTERN", "CHECKER_SUPPORT", "CHECKER_REFUTATION", "CERTIFICATE", "EXPERIMENT_SUPPORT", "EXPERIMENT_NOT_SUPPORTED", "CONFIRMATION", "REPLICATION", "INCONCLUSIVE", "REPRESENTATION_BRIDGE"]},
     "impact": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
     "concise_summary": {"type": "string", "minLength": 1},
     "exact_statement": {"type": "string", "minLength": 1},

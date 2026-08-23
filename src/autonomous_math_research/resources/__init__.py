@@ -28,5 +28,5 @@ def schema_resource(name: str) -> Iterator[Path]:
     return resource(f"schemas/{name}")
 
 
-def policy_resource(name: str) -> Iterator[Path]:
-    return resource(f"policy_packs/math-research/{name}")
+def policy_resource(name: str, pack: str = "math-research") -> Iterator[Path]:
+    return resource(f"policy_packs/{pack}/{name}")

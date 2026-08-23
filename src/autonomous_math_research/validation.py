@@ -69,7 +69,14 @@ def _strict_project_checks(
         if any(marker.casefold() in text for marker in _PLACEHOLDER_MARKERS):
             placeholder_files.append(path.relative_to(root).as_posix())
     if placeholder_files:
-        raise ValueError(f"strict validation found placeholder mathematical content: {placeholder_files}")
+        label = (
+            "mathematical content"
+            if graph.semantics.domain == "math-research"
+            else "research content"
+        )
+        raise ValueError(
+            f"strict validation found placeholder {label}: {placeholder_files}"
+        )
     return {
         "strict": True,
         "initialization_checklist": str(checklist),
@@ -94,6 +101,12 @@ def validate_project(
     layout = ProjectLayout(root)
     graph = ClaimGraph.load(layout.claim_graph_path)
     graph.validate()
+    selected_domain = str(config.raw["policy"]["pack"])
+    if graph.semantics.domain != selected_domain:
+        raise ValueError(
+            "claim graph domain does not match configured policy pack: "
+            f"{graph.semantics.domain} != {selected_domain}"
+        )
     if manifest.final_claim_id not in graph.claims:
         raise ValueError("manifest final_claim_id is absent from the claim graph")
     schema_paths: list[Path] = []
@@ -125,6 +138,7 @@ def validate_project(
     return {
         "valid": True,
         "project_id": manifest.project_id,
+        "domain": graph.semantics.domain,
         "final_claim_id": manifest.final_claim_id,
         "workspace_root": str(config.workspace_root),
         "output_protocol": 2,

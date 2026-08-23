@@ -25,6 +25,32 @@ concurrency, budgets, each role route, and mechanical routing. Schema v9 added
 the corresponding CLI flags are absent, `amr run` uses these project values;
 explicit `--hours` and `--epoch-hours` remain highest priority.
 
+## Research policy pack
+
+This configuration excerpt selects exactly one bundled domain contract:
+
+```json
+{
+  "policy": {
+    "pack": "math-research"
+  }
+}
+```
+
+Allowed values are `math-research`, `certified-computational-research`, and
+`empirical-research`. The built-in profile and `amr init` default to
+`math-research`, preserving existing math projects. `amr init --domain PACK`
+sets the same field and creates a domain-appropriate initial ClaimGraph.
+Unknown or unbundled names fail validation; a user profile cannot provide a
+custom pack directory.
+
+At run creation, AMR strictly validates the selected packaged descriptor and
+pins its descriptor, skill, role prompts, references, domain contract, audit
+requirements, and mechanical resources with SHA-256 snapshots. Resume uses
+those verified snapshots and reports installed-source drift; missing, modified,
+or rebound policy state fails closed. See
+[Research domains and policy packs](research-domains.md).
+
 Startup canonical refresh has no configuration switch and cannot be disabled by
 a project or user profile. `amr run` pins manifest-declared canonical inputs,
 their SHA-256 values, available Git revision, the authoritative ClaimGraph,

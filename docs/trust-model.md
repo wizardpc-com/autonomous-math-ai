@@ -19,9 +19,18 @@ separates generation, evidence, audit, and trust.
 Evidence levels communicate what was actually checked. They do not silently
 upgrade when a related or narrower subclaim receives stronger evidence.
 
-Canonical `ClaimGraph` proof obligations remain open until the required audit
-and canonical gates close them. Finite computation can attach scoped evidence,
-but it neither closes a universal obligation nor proves a general statement.
+Canonical `ClaimGraph` obligations remain open until the selected domain's
+required audit and canonical gates close them. The math pack uses proof
+obligations; non-math packs use certificate or empirical-protocol frontiers and
+never synthesize proof obligations. Finite computation can attach scoped
+evidence, but it neither closes a universal obligation nor proves a general
+statement.
+
+The pinned domain contract owns the allowed statuses and evidence transitions.
+In particular, empirical `CONFIRMED` and `REPLICATED` are not mathematical
+`PROVED` states. A model cannot add a status, relax the pack's minimum audit, or
+rebind a graph to another domain. See
+[Research domains and policy packs](research-domains.md).
 
 ## Reasoning health is not correctness
 

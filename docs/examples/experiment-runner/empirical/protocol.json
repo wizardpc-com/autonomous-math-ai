@@ -1,0 +1,8 @@
+{
+  "comparison": "greater_than_or_equal",
+  "metric": "arithmetic_mean",
+  "missing_values": "reject",
+  "protocol_id": "toy-decimal-mean-v1",
+  "schema_version": 1,
+  "threshold": "2.50"
+}

@@ -30,7 +30,7 @@ class DynamicScheduler:
         novelty = 1.0 / (1.0 + route_counts.get(task.route_family, 0))
         return (
             _GAIN.get(task.expected_information_gain, 2.0)
-            * _IMPACT[task.mathematical_impact]
+            * _IMPACT[task.research_impact]
             * novelty
             / _COST[task.estimated_cost_tier]
         )

@@ -151,7 +151,7 @@ class _ArtifactCollector:
             })
             return None
         portable = _portable_path(resolved, self.project_root)
-        if _is_sensitive_path(resolved):
+        if _is_sensitive_path(resolved.relative_to(self.project_root)):
             self._skipped.append({
                 "reference": portable, "relation": relation,
                 "reason": "sensitive path excluded",
@@ -416,14 +416,19 @@ def build_semantic_index(
             continue
 
         if kind == "TRUST_STATE_CHANGED":
-            trust_changes.append({
+            row = {
                 "claim_id": payload.get("claim_id"),
-                "math_status": payload.get("math_status"),
                 "trust_status": payload.get("trust_status"),
                 "evidence_level": payload.get("evidence_level"),
                 "sequence": sequence,
                 "timestamp": timestamp,
-            })
+            }
+            if payload.get("research_status") is not None:
+                row["domain"] = payload.get("domain")
+                row["research_status"] = payload.get("research_status")
+            else:
+                row["math_status"] = payload.get("math_status")
+            trust_changes.append(row)
             continue
 
         if kind.startswith(MECHANICAL_EVENT_PREFIX):

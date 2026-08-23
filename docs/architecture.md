@@ -1,7 +1,7 @@
 # Architecture
 
-Autonomous Math AI is a conjecture-neutral orchestration layer. A target owns
-its mathematical statement, prompts, claim graph, canonical inputs, and local
+Autonomous Math AI is a research-topic-neutral orchestration layer. A target owns
+its research statement, prompts, claim graph, canonical inputs, and local
 runtime. The installed distribution owns protocols, policy enforcement,
 lifecycle, scheduling, audit leases, and durable storage semantics.
 
@@ -22,7 +22,12 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 - `provider_config.py` normalizes capability, effort, tier, usage, cost, and
   credential-reference declarations before any model turn.
 - `cli/` owns the `amr` command surface.
-- `resources/` contains immutable wire schemas and the bundled policy pack.
+- `domain_semantics.py` owns the fixed status, transition, dependency, and audit
+  adapters for bundled research domains; `policy.py` owns pack discovery and
+  run-local pinning.
+- `experiment.py` owns deterministic non-LLM batch execution and raw evidence;
+  `amr experiment validate|run` exposes the same boundary through the CLI.
+- `resources/` contains immutable wire schemas and the bundled policy packs.
 - `canonical_state.py` freezes manifest-declared startup inputs and builds the
   provenance supplied to derived planning views.
 - `canonical_transition.py` owns digest-bound, crash-replayable ClaimGraph and
@@ -30,6 +35,17 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 
 `storage_layer` is a compatibility import wrapper, not a second storage
 implementation.
+
+## Policy-pack boundary
+
+The stable controller discovers and strictly validates the three bundled packs,
+then pins the selected descriptor, domain contract, audit requirements, skill,
+role prompts/references, and mechanical resources into each new run. Model
+roles receive only the verified run-local policy view. Resume re-verifies every
+snapshot and uses the pinned bytes; missing, modified, or cross-pack bindings
+fail closed. Pack selection changes domain semantics, not lifecycle, storage,
+audit-lease, or canonical-gate ownership. See
+[Research domains and policy packs](research-domains.md).
 
 ## Startup canonical-state refresh
 
@@ -203,14 +219,17 @@ The rebuilt snapshot records its attempt, generation, event watermark, and
 canonical/planning hashes. The original absolute epoch deadline remains
 authoritative, so restarting a controller cannot extend an epoch.
 
-### Canonical proof frontier
+### Canonical domain frontier
 
-Proof obligations live inside each canonical `ClaimGraph` claim (schema v3).
-They have stable content-derived ids, status, dependencies, and evidence paths.
-`proof_frontier` derives `remaining_obligation_ids` and `next_obligation_id`
-from that graph; there is no parallel `proof_state`. Legacy v1/v2 graphs gain a
-deterministic root/gap obligation on load. Only an audited canonical transition
-can discharge or refute an obligation.
+For `math-research`, proof obligations live inside each canonical `ClaimGraph`
+claim (schema v3). They have stable content-derived ids, status, dependencies,
+and evidence paths. `proof_frontier` derives `remaining_obligation_ids` and
+`next_obligation_id` from that graph; there is no parallel `proof_state`.
+Legacy v1/v2 math graphs gain a deterministic root/gap obligation on load.
+
+Non-math graphs use `research_frontier` with the pack's `certificate` or
+`empirical_protocol` obligation kind and do not synthesize proof obligations.
+Only an audited canonical transition can change either kind of frontier.
 
 ClaimGraph schema v3 is also the single machine-readable claim-status source.
 The trusted-state file stores audit provenance and binds to the exact graph
@@ -221,10 +240,10 @@ for every target and otherwise fails closed. The retained snapshots make the
 transition reviewable and replayable without promoting a model result directly.
 Canonical Markdown is never rewritten by the controller.
 
-Status domains are intentionally separate: `MathStatus` describes the claim
-(`REFUTED` is the code name for the legacy wire value `FAILED`), `TrustStatus`
-describes review state, `EvidenceLevel` describes what was checked, and
-`ExecutionStatus` describes process/transport completion.
+Status domains are intentionally separate: the pinned domain contract describes
+claim status (`MathStatus` remains the compatibility API for the math wire
+format), `TrustStatus` describes review state, `EvidenceLevel` describes what
+was checked, and `ExecutionStatus` describes process/transport completion.
 
 ## Failure taxonomy
 

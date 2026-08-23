@@ -267,7 +267,7 @@ class AppServerBackend:
 
     def set_economy_mode(self, enabled: bool) -> None:
         # Budget pressure may reduce concurrency or stop exploratory dispatch,
-        # but top-level mathematical roles remain on their pinned strong routes.
+        # but top-level research roles remain on their pinned strong routes.
         # Mechanical Spark/Luna routing is owned exclusively by the broker.
         del enabled
 
@@ -307,11 +307,13 @@ class AppServerBackend:
             )
         model, effort = self._model_for(task.role)
         developer = (
-            "You are one bounded autonomous math-research role. Do not spawn research, strategy, "
+            "You are one bounded autonomous research role governed by the pinned domain policy. "
+            "Do not spawn research, strategy, "
             "or recursive subagents. The sole delegation exception is the controller-installed "
             "delegate_mechanical_task command in the job workspace; never invoke codex exec or "
             "another worker directly. "
-            "Do not use fast or priority service tier. Do not modify canonical claims, proofs, state, artifacts, "
+            "Do not use fast or priority service tier. Do not modify canonical claims, proofs, "
+            "certificates, protocols, state, artifacts, "
             "or historical experiments. Write only inside the supplied job workspace."
         )
         thread_id: str | None = None

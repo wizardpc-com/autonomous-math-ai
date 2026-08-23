@@ -21,7 +21,7 @@ from .canonical_state import (
     capture_canonical_state, director_canonical_view, director_overlay_text,
     load_canonical_state, planning_context_fingerprint,
     updated_markdown_state_views,
-    validate_canonical_mathematical_state, validate_canonical_state,
+    validate_canonical_research_state, validate_canonical_state,
     verify_live_startup_sources,
 )
 from .canonical_transition import (
@@ -46,6 +46,7 @@ from .director_context import (
     enforce_director_prompt_limit,
     load_full_context_archive,
 )
+from .domain_semantics import domain_semantics_from_contract
 from .engine import DynamicScheduler
 from .lifecycle import (
     AuditLeaseBook, AuditLeaseStatus, MonotoneLifecycle, RouteLedger,
@@ -68,7 +69,7 @@ from .mechanical import (
 )
 from .models import (
     AuditResult, CandidateEvent, DirectorPlan, EvidenceLevel, Impact, JobOutcome,
-    LifecyclePhase, MathStatus, ResearchTask, Role, TokenUsage, TrustStatus,
+    LifecyclePhase, ResearchTask, Role, TokenUsage, TrustStatus,
     derived_claim_id, evidence_rank,
     stable_hash, utc_now,
 )
@@ -80,7 +81,10 @@ from .prompts import (
     worker_prompt,
 )
 from .provenance import capture_runtime_provenance
-from .policy import pin_policy_manifest, policy_view_for_role
+from .policy import (
+    domain_contract_for_run, domain_contract_from_manifest,
+    pin_policy_manifest, policy_view_for_role,
+)
 from .provider_backend import ProviderRouterBackend
 from .provider_config import mapped_reasoning_effort, validate_service_tier
 from .reporting import write_report
@@ -581,6 +585,11 @@ class AutonomousController:
         self.run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         self.run_dir = self.layout.run_dir(self.run_id)
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.policy_manifest_path = self.run_dir / "policy" / "MANIFEST.json"
+        self.domain_contract = domain_contract_for_run(
+            config, self.policy_manifest_path, resume=resume,
+        )
+        self.domain_semantics = domain_semantics_from_contract(self.domain_contract)
         self.store = EventStore(self.run_dir / "EVENTS.jsonl", self.run_id)
         self.campaign_id = campaign_id or self.run_id
         self.epoch_id = self.run_id
@@ -619,7 +628,9 @@ class AutonomousController:
             project_root=config.project_root,
             runtime_root=self.layout.autonomous_root,
         )
-        self.graph = ClaimGraph.load(self.layout.claim_graph_path)
+        self.graph = ClaimGraph.load(
+            self.layout.claim_graph_path, semantics=self.domain_semantics,
+        )
         self.graph.validate()
         legacy_representation = RepresentationContract.legacy()
         legacy_representation_id = legacy_representation.representation_id
@@ -672,7 +683,9 @@ class AutonomousController:
         if mock:
             mock_graph_path = self.run_dir / "state" / "claim_graph.json"
             if resume and mock_graph_path.is_file():
-                self.graph = ClaimGraph.load(mock_graph_path)
+                self.graph = ClaimGraph.load(
+                    mock_graph_path, semantics=self.domain_semantics,
+                )
                 self.graph.validate()
             else:
                 self.graph.path = mock_graph_path
@@ -691,6 +704,7 @@ class AutonomousController:
         self.audit_gate = AuditGate(
             high_threshold=config.raw["audit"].get("immediate_threshold", "HIGH"),
             critical_double_audit=bool(config.raw["audit"].get("critical_double_audit", True)),
+            semantics=self.domain_semantics,
         )
         if max_research_workers is not None and max_research is not None:
             raise ValueError("use max_research_workers or legacy max_research, not both")
@@ -797,6 +811,7 @@ class AutonomousController:
         engine_config = config.raw["engine"]
         self.research_turn_policy = ResearchTurnPolicy(
             max_turns=dict(engine_config["research_max_turns"]),
+            domain=self.domain_semantics.domain,
         )
         self.reasoning_health = ReasoningHealthMonitor(
             short_reasoning_tokens=int(engine_config["reasoning_health_short_tokens"]),
@@ -867,12 +882,13 @@ class AutonomousController:
         self.scheduler_stop_reason: str | None = None
         self._provider_transport_lost: dict[str, Any] | None = None
         self.lifecycle = MonotoneLifecycle()
+        self.final_claim_resolved = False
+        self.final_claim_outcome: str | None = None
         self.final_conjecture_proved = False
         self.final_conjecture_refuted = False
         self._finalization_started = False
         self._scheduler_event_keys: set[str] = set()
         self.capability_snapshot: dict[str, Any] | None = None
-        self.policy_manifest_path = self.run_dir / "policy" / "MANIFEST.json"
         self.policy_manifest: dict[str, Any] | None = None
         self.policy_status: dict[str, Any] | None = None
         self._run_manifest: dict[str, Any] = {}
@@ -1192,7 +1208,7 @@ class AutonomousController:
                 "requeued_task_id": requeued_task_id,
                 "claim_id": task.target_claim,
                 "mode": requeue_mode,
-                "mathematical_failure": False,
+                **self._research_failure_payload(),
                 "stagnation_effect": "none",
             })
         if self.lifecycle.phase is LifecyclePhase.RUNNING:
@@ -1207,7 +1223,11 @@ class AutonomousController:
             "provider_reset_at": reset_at,
             "action": (
                 "pause campaign, preserve frontier, and wait for the provider reset; "
-                "do not count as mathematical failure or stagnation"
+                + (
+                    "do not count as mathematical failure or stagnation"
+                    if self.domain_semantics.domain == "math-research"
+                    else "do not count as research failure or stagnation"
+                )
             ),
             "internal_failure": False,
         })
@@ -1241,7 +1261,7 @@ class AutonomousController:
             "model": execution.model,
             "reasoning_effort": execution.reasoning_effort,
             "provider_reset_at": reset_at,
-            "mathematical_failure": False,
+                **self._research_failure_payload(),
             "stagnation_effect": "none",
             "action": (
                 "do not retry or cache the route as unavailable; drain the epoch, "
@@ -1257,7 +1277,7 @@ class AutonomousController:
         task: ResearchTask | None = None,
         checkpoint_job_record: dict[str, Any] | None = None,
     ) -> None:
-        """End the epoch without turning shared transport loss into math failure."""
+        """End the epoch without turning shared transport loss into research failure."""
         provider = outcome.provider or (
             self.config.raw["models"].get(outcome.role, {}).get("provider")
         )
@@ -1289,7 +1309,7 @@ class AutonomousController:
                 "requeued_task_id": requeued_task_id,
                 "claim_id": task.target_claim,
                 "mode": requeue_mode,
-                "mathematical_failure": False,
+                **self._research_failure_payload(),
                 "stagnation_effect": "none",
             })
         if self.lifecycle.phase is LifecyclePhase.RUNNING:
@@ -1382,9 +1402,34 @@ class AutonomousController:
             return None
         return self.graph.claims.get(self.final_conjecture_claim_id)
 
+    @property
+    def _claim_status_field(self) -> str:
+        return (
+            "math_status"
+            if self.domain_semantics.domain == "math-research"
+            else "research_status"
+        )
+
+    def _claim_status_payload(self, claim: Any) -> dict[str, Any]:
+        payload = {self._claim_status_field: claim.research_status}
+        if self.domain_semantics.domain != "math-research":
+            payload["domain"] = self.domain_semantics.domain
+        return payload
+
+    def _research_failure_payload(self, failed: bool = False) -> dict[str, bool]:
+        field = (
+            "mathematical_failure"
+            if self.domain_semantics.domain == "math-research"
+            else "research_failure"
+        )
+        return {field: failed}
+
     def _begin_finalization_if_resolved(self, source: str) -> bool:
         claim = self._final_claim()
-        if claim is None or claim.math_status not in {MathStatus.PROVED, MathStatus.REFUTED}:
+        if claim is None:
+            return False
+        outcome = self.domain_semantics.final_outcome(claim.research_status)
+        if outcome is None:
             return False
         if claim.trust_status not in {
             TrustStatus.AUDITED_NIGHTLY,
@@ -1392,12 +1437,20 @@ class AutonomousController:
             TrustStatus.CANONICAL_TRUSTED,
         }:
             return False
-        self.final_conjecture_proved = claim.math_status == MathStatus.PROVED
-        self.final_conjecture_refuted = claim.math_status == MathStatus.REFUTED
+        self.final_claim_resolved = True
+        self.final_claim_outcome = outcome
+        if self.domain_semantics.domain == "math-research":
+            self.final_conjecture_proved = outcome == "positive"
+            self.final_conjecture_refuted = outcome == "negative"
         if self._internal_failure:
-            self.store.append("FINAL_CONJECTURE_RESOLVED_AFTER_INTERNAL_FAILURE", {
+            event_kind = (
+                "FINAL_CONJECTURE_RESOLVED_AFTER_INTERNAL_FAILURE"
+                if self.domain_semantics.domain == "math-research"
+                else "FINAL_CLAIM_RESOLVED_AFTER_INTERNAL_FAILURE"
+            )
+            self.store.append(event_kind, {
                 "claim_id": self.final_conjecture_claim_id,
-                "math_status": claim.math_status,
+                **self._claim_status_payload(claim),
                 "trust_status": claim.trust_status,
                 "preserved_failure_reason": self.scheduler_stop_reason,
                 "action": "preserve audited state but do not relabel the failed run as completed",
@@ -1408,24 +1461,36 @@ class AutonomousController:
         self._finalization_started = True
         self.lifecycle.transition(LifecyclePhase.FINALIZING, reason=source)
         self.director_needed = False
-        resolution = "proved" if self.final_conjecture_proved else "refuted"
-        self.scheduler_stop_reason = (
-            f"final conjecture {resolution} and independently audited: "
-            f"{self.final_conjecture_claim_id}"
-        )
+        if self.domain_semantics.domain == "math-research":
+            resolution = "proved" if self.final_conjecture_proved else "refuted"
+            self.scheduler_stop_reason = (
+                f"final conjecture {resolution} and independently audited: "
+                f"{self.final_conjecture_claim_id}"
+            )
+        else:
+            self.scheduler_stop_reason = (
+                f"final claim reached audited {claim.research_status}: "
+                f"{self.final_conjecture_claim_id}"
+            )
         payload = {
             "claim_id": self.final_conjecture_claim_id,
             "statement": claim.statement,
-            "math_status": claim.math_status,
+            **self._claim_status_payload(claim),
             "trust_status": claim.trust_status,
             "evidence_level": claim.evidence_level,
             "source": source,
         }
-        self.store.append(
-            "FINAL_CONJECTURE_PROVED" if self.final_conjecture_proved
-            else "FINAL_CONJECTURE_REFUTED",
-            payload,
-        )
+        if self.domain_semantics.domain == "math-research":
+            self.store.append(
+                "FINAL_CONJECTURE_PROVED" if self.final_conjecture_proved
+                else "FINAL_CONJECTURE_REFUTED",
+                payload,
+            )
+        else:
+            self.store.append("FINAL_CLAIM_RESOLVED", {
+                **payload,
+                "outcome_polarity": outcome,
+            })
         self.store.append("FINALIZATION_STARTED", {
             **payload,
             "in_flight_jobs": len(self.active),
@@ -1440,6 +1505,8 @@ class AutonomousController:
                 "最终猜想的证明已通过独立审计；停止派发新任务，等待在途 Agent 自然完成。"
                 if self.final_conjecture_proved else
                 "最终猜想的反例已通过独立审计；停止派发新任务，等待在途 Agent 自然完成。"
+                if self.domain_semantics.domain == "math-research" else
+                "最终研究主张已达到该领域的审计终态；停止派发新任务，等待在途 Agent 自然完成。"
             ),
         })
         return True
@@ -1523,7 +1590,7 @@ class AutonomousController:
             "claim_id": task.target_claim,
             "reason": reason,
             "task": task.to_dict(),
-            "mathematical_failure": False,
+                **self._research_failure_payload(),
             "stagnation_effect": "none",
         })
 
@@ -1930,8 +1997,10 @@ class AutonomousController:
                 self._accept_authorized_canonical_targets(
                     self.canonical_transitions.target_paths(transition_id)
                 )
-        validate_canonical_mathematical_state(self.config.manifest)
-        graph = ClaimGraph.load(self.layout.claim_graph_path)
+        validate_canonical_research_state(self.config.manifest)
+        graph = ClaimGraph.load(
+            self.layout.claim_graph_path, semantics=self.domain_semantics,
+        )
         graph.validate()
         if self.mock:
             graph.path = self.run_dir / "state" / "claim_graph.json"
@@ -2056,7 +2125,7 @@ class AutonomousController:
                     raise ValueError(
                         f"canonical {key} changed outside an audited transition"
                     )
-        validate_canonical_mathematical_state(self.config.manifest)
+        validate_canonical_research_state(self.config.manifest)
         changed = verify_live_startup_sources(
             self._canonical_state,
             project_root=self.config.project_root,
@@ -2073,6 +2142,10 @@ class AutonomousController:
         self.policy_manifest, self.policy_status = pin_policy_manifest(
             self.config, self.policy_manifest_path, resume=self.resume
         )
+        if domain_contract_from_manifest(self.policy_manifest) != self.domain_contract:
+            raise ValueError(
+                "pinned policy domain contract changed after controller initialization"
+            )
         configure_mechanical = getattr(
             self.mechanical_runner, "configure_pinned_policy", None
         )
@@ -2902,7 +2975,9 @@ class AutonomousController:
             raise ValueError(
                 f"source run {source_run_id} has no rejected or unfinished candidates to recover"
             )
-        probe = ClaimGraph(deepcopy(self.graph.claims))
+        probe = ClaimGraph(
+            deepcopy(self.graph.claims), semantics=self.domain_semantics,
+        )
         for event in recovered:
             probe.mark_candidate(event)
         return recovered
@@ -2973,13 +3048,18 @@ class AutonomousController:
         claim = self.graph.claims.get(claim_id)
         if claim is None:
             return "missing"
+        frontier_field = (
+            "proof_frontier"
+            if self.domain_semantics.domain == "math-research"
+            else "research_frontier"
+        )
         return stable_hash({
-            "math_status": claim.math_status,
+            self._claim_status_field: claim.research_status,
             "trust_status": claim.trust_status,
             "evidence_level": claim.evidence_level,
             "evidence_paths": sorted(claim.evidence_paths),
             "known_counterexamples": sorted(claim.known_counterexamples),
-            "proof_frontier": self.graph.proof_frontier(claim_id),
+            frontier_field: self.graph.research_frontier(claim_id),
         })
 
     def _task_has_accepted_candidate(self, task_id: str) -> bool:
@@ -3096,6 +3176,8 @@ class AutonomousController:
             "blocker_controller_verified": blocker_verified,
             "blocker_verification_scope": (
                 "execution scheduling only; no mathematical or trust effect"
+                if self.domain_semantics.domain == "math-research"
+                else "execution scheduling only; no claim-status or trust effect"
             ),
             "reasoning_health": health.to_dict(),
             "controller_directive": (
@@ -4455,7 +4537,9 @@ class AutonomousController:
         if self.mock:
             previous_graph = previous_run / "state" / "claim_graph.json"
             if previous_graph.is_file():
-                imported_graph = ClaimGraph.load(previous_graph)
+                imported_graph = ClaimGraph.load(
+                    previous_graph, semantics=self.domain_semantics,
+                )
                 imported_graph.validate()
                 imported_graph.path = self.graph.path
                 self.graph = imported_graph
@@ -5392,29 +5476,51 @@ class AutonomousController:
                 "canonical_transition_id"
             ]
         snapshot["canonical_state"] = canonical_view
+        claim_state_payloads: dict[str, dict[str, Any]] = {}
+        for claim_id, claim in sorted(self.graph.claims.items()):
+            claim_payload = claim.to_dict()
+            if self.domain_semantics.domain != "math-research":
+                claim_payload["research_status"] = claim_payload.pop("math_status")
+            claim_state_payloads[claim_id] = claim_payload
         snapshot["claim_state_provenance"] = {
             "authority": "controller_claim_graph",
-            "sha256": stable_hash({
-                claim_id: claim.to_dict()
-                for claim_id, claim in sorted(self.graph.claims.items())
-            }),
+            "sha256": stable_hash(claim_state_payloads),
             "startup_path": self._canonical_state["claim_graph"]["path"],
             "startup_sha256": self._canonical_state["claim_graph"]["sha256"],
             "status_rule": (
                 "ClaimGraph is the sole mathematical-status and proof-frontier "
                 "authority. Canonical Markdown is context-only unless it contains a "
                 "strict generated state block. Every status upgrade is audit-gated."
+                if self.domain_semantics.domain == "math-research" else
+                "ClaimGraph is the sole domain-status and research-frontier authority. "
+                "Canonical Markdown is context-only unless it contains a strict generated "
+                "state block. Every status transition is audit-gated."
             ),
         }
         snapshot["mechanical_token_governor"] = self.mechanical_governor.snapshot()
-        snapshot["research_target"] = {
-            "project_name": self.config.project_name,
-            "final_conjecture_claim_id": self.final_conjecture_claim_id,
-            "finalization_rule": (
-                "stop new dispatch only after the exact final claim is PROVED and trusted "
-                "by the controller audit gate"
-            ),
-        }
+        if self.domain_semantics.domain == "math-research":
+            snapshot["research_target"] = {
+                "project_name": self.config.project_name,
+                "final_conjecture_claim_id": self.final_conjecture_claim_id,
+                "finalization_rule": (
+                    "stop new dispatch only after the exact final claim is PROVED and trusted "
+                    "by the controller audit gate"
+                ),
+            }
+        else:
+            snapshot["research_target"] = {
+                "project_name": self.config.project_name,
+                "domain": self.domain_semantics.domain,
+                "final_claim_id": self.final_conjecture_claim_id,
+                "terminal_statuses": sorted(
+                    self.domain_semantics.terminal_positive
+                    | self.domain_semantics.terminal_negative
+                ),
+                "finalization_rule": (
+                    "stop new dispatch only after the exact final claim reaches a "
+                    "domain terminal status through the controller audit gate"
+                ),
+            }
         snapshot["controller_watermark"] = {
             "state_version": self._state_version,
             "director_requested_version": self._director_requested_version,
@@ -5754,7 +5860,7 @@ class AutonomousController:
             task_id=f"director-{uuid4().hex[:12]}", role=Role.DIRECTOR,
             target_claim="FRONTIER", exact_objective="Select the next highest-value research portfolio.",
             why_now="initial planning or audited state change", dependencies=[],
-            expected_information_gain="portfolio decision", mathematical_impact="HIGH",
+            expected_information_gain="portfolio decision", research_impact="HIGH",
             estimated_cost_tier="MEDIUM",
             required_files=[str(snapshot), str(full_context)],
             stop_conditions=["return one schema-valid plan"], output_contract="director_plan.schema.json",
@@ -6939,12 +7045,24 @@ class AutonomousController:
             and event.impact != Impact.CRITICAL
         ):
             raise ValueError(
-                "final conjecture candidates must use CRITICAL impact and two independent audits"
+                "final claim candidates must use CRITICAL impact and two independent audits"
             )
 
-    @staticmethod
-    def _validate_candidate_evidence(event: CandidateEvent) -> None:
+    def _validate_candidate_evidence(self, event: CandidateEvent) -> None:
         level = event.proposed_evidence_level
+        self.domain_semantics.validate_event_type(event.type)
+        transition = self.domain_semantics.event_transitions[event.type]
+        minimum = str(transition["min_evidence"])
+        independently_upgradable = (
+            level == EvidenceLevel.E2_EXACT_TESTED
+            and minimum == EvidenceLevel.E3_REDUNDANT_EXACT
+            and self.domain_semantics.requires_frozen_protocol(event.type)
+        )
+        if evidence_rank(level) < evidence_rank(minimum) and not independently_upgradable:
+            raise ValueError(
+                f"{event.type} requires at least {minimum} evidence for "
+                f"{self.domain_semantics.domain}"
+            )
         if level == EvidenceLevel.E0_SPECULATIVE:
             return
         if not event.artifact_paths:
@@ -6955,9 +7073,24 @@ class AutonomousController:
             if not event.reproduction_commands:
                 raise ValueError("E2_EXACT_TESTED requires an exact reproduction command")
             return
+        if level == EvidenceLevel.E4_CERTIFIED:
+            if (
+                self.domain_semantics.domain != "certified-computational-research"
+                or event.type != "CERTIFICATE"
+                or not self.domain_semantics.requires_deterministic_checker(event.type)
+            ):
+                raise ValueError(
+                    "E4_CERTIFIED is reserved for the certified-computational "
+                    "CERTIFICATE gate"
+                )
+            if not event.reproduction_commands:
+                raise ValueError(
+                    "E4_CERTIFIED requires a deterministic checker reproduction command"
+                )
+            return
         raise ValueError(
             f"{level} cannot be self-certified by an autonomous worker in this MVP; "
-            "E3 requires an independent evaluator and E4/E5 require dedicated certificate/kernel gates"
+            "E3 requires an independent evaluator and E5 requires a dedicated kernel gate"
         )
 
     def _bind_candidate_artifacts(self, event: CandidateEvent) -> dict[str, str]:
@@ -7115,7 +7248,7 @@ class AutonomousController:
             exact_objective=event.exact_statement,
             why_now=f"{event.impact} candidate requires immediate independent audit",
             dependencies=[], expected_information_gain="trust-state decision",
-            mathematical_impact=event.impact, estimated_cost_tier="HIGH",
+            research_impact=event.impact, estimated_cost_tier="HIGH",
             required_files=list(event.artifact_paths), stop_conditions=["PASS, REJECT, or UNRESOLVED"],
             output_contract="audit_result.schema.json",
             metadata={
@@ -7145,7 +7278,7 @@ class AutonomousController:
             -self.audit_leases.by_id(
                 str(task.metadata["audit_lease_id"])
             ).priority,
-            -impact_rank.get(task.mathematical_impact, 0),
+            -impact_rank.get(task.research_impact, 0),
             self.audit_leases.by_id(
                 str(task.metadata["audit_lease_id"])
             ).updated_at,
@@ -7923,7 +8056,7 @@ class AutonomousController:
             "source": source,
             "checkpoint_uri": checkpoint_uri,
             "task": task.to_dict(),
-            "mathematical_failure": False,
+                **self._research_failure_payload(),
             "canonical_progress": False,
             "action": (
                 "do not dispatch until the durable route retry condition is satisfied; "
@@ -8331,14 +8464,10 @@ class AutonomousController:
             self.graph.apply_audit_pass(
                 event, self.audit_gate.pass_count(fingerprint), state.required, verified_level
             )
+            bridge: tuple[str, str] | None = None
             if event.type == "REPRESENTATION_BRIDGE":
                 bridge = tuple(sorted(event.bridge_representation_ids))
                 self.audited_representation_bridges.add(bridge)
-                self.store.append("REPRESENTATION_BRIDGE_TRUSTED", {
-                    "candidate_fingerprint": fingerprint,
-                    "representation_ids": list(bridge),
-                    "audited": True,
-                })
             else:
                 self.claim_representations[event.claim_id] = event.representation_id
             self.representation_contracts[event.representation_id] = (
@@ -8360,17 +8489,31 @@ class AutonomousController:
                     "verified_evidence_level": verified_level,
                 },
             )
-            self.store.append("TRUST_STATE_CHANGED", {
-                "claim_id": event.claim_id, "trust_status": trust,
-                "math_status": self.graph.claims[event.claim_id].math_status,
-                "evidence_level": verified_level,
-                "representation_id": event.representation_id,
-                "canonical_transition_id": transition_id,
-            })
-            self._record_recent_change({
-                "kind": "TRUST_STATE_CHANGED", "claim_id": event.claim_id,
-                "trust_status": trust, "evidence_level": verified_level,
-            })
+            if bridge is not None:
+                self.store.append("REPRESENTATION_BRIDGE_TRUSTED", {
+                    "candidate_fingerprint": fingerprint,
+                    "representation_ids": list(bridge),
+                    "audited": True,
+                    "canonical_transition_id": transition_id,
+                })
+                self._record_recent_change({
+                    "kind": "REPRESENTATION_BRIDGE_TRUSTED",
+                    "claim_id": event.claim_id,
+                    "representation_ids": list(bridge),
+                })
+            else:
+                changed_claim = self.graph.claims[event.claim_id]
+                self.store.append("TRUST_STATE_CHANGED", {
+                    "claim_id": event.claim_id, "trust_status": trust,
+                    **self._claim_status_payload(changed_claim),
+                    "evidence_level": verified_level,
+                    "representation_id": event.representation_id,
+                    "canonical_transition_id": transition_id,
+                })
+                self._record_recent_change({
+                    "kind": "TRUST_STATE_CHANGED", "claim_id": event.claim_id,
+                    "trust_status": trust, "evidence_level": verified_level,
+                })
             self._apply_dependency_pruning()
             if not self._begin_finalization_if_resolved("independent audit gate"):
                 self._request_director(
@@ -8398,13 +8541,22 @@ class AutonomousController:
         }
         if not trusted:
             return None
-        candidate_refutes = event.type in {"COUNTEREXAMPLE", "KEY_REFUTATION"}
-        candidate_proves = event.type in {"THEOREM_CANDIDATE", "KEY_LEMMA", "EQUIVALENCE"}
-        if claim.math_status == MathStatus.PROVED and candidate_refutes:
-            return "audited counterexample conflicts with an already trusted proof"
-        if claim.math_status == MathStatus.REFUTED and candidate_proves:
+        transition = self.domain_semantics.event_transitions[event.type]
+        next_status = transition["status"]
+        if next_status is None:
+            return None
+        current_outcome = self.domain_semantics.final_outcome(claim.research_status)
+        candidate_outcome = self.domain_semantics.final_outcome(str(next_status))
+        if current_outcome is None or candidate_outcome in {None, current_outcome}:
+            return None
+        if self.domain_semantics.domain == "math-research":
+            if current_outcome == "positive":
+                return "audited counterexample conflicts with an already trusted proof"
             return "audited proof conflicts with an already trusted refutation"
-        return None
+        return (
+            f"audited {event.type} conflicts with trusted "
+            f"{claim.research_status} status"
+        )
 
     def _apply_dependency_pruning(self) -> None:
         blocked = self.graph.prune_failed_dependencies()
@@ -8486,9 +8638,14 @@ class AutonomousController:
             ])),
         })
         continuation = ResearchTask.from_dict(continuation_raw)
-        proof_frontier = (
-            self.graph.proof_frontier(task.target_claim)
+        research_frontier = (
+            self.graph.research_frontier(task.target_claim)
             if task.target_claim in self.graph.claims else None
+        )
+        frontier_field = (
+            "proof_frontier"
+            if self.domain_semantics.domain == "math-research"
+            else "research_frontier"
         )
         checkpoint = {
             "schema_version": 1,
@@ -8507,10 +8664,10 @@ class AutonomousController:
             "route_family": task.route_family,
             "turn_count": turn_count,
             "logical_stop_reason": outcome.logical_stop_reason,
-            "proof_frontier": proof_frontier,
+            frontier_field: research_frontier,
             "current_obligation": (
-                proof_frontier.get("next_obligation_id")
-                if proof_frontier is not None else None
+                research_frontier.get("next_obligation_id")
+                if research_frontier is not None else None
             ),
             "completed_evidence": {
                 "candidate_accepted": bool(outcome.candidate_accepted),
@@ -8520,8 +8677,8 @@ class AutonomousController:
             "next_obligation": str(
                 outcome.result.get("next_suggested_question") or ""
             ).strip() or (
-                proof_frontier.get("next_obligation_id")
-                if proof_frontier is not None else None
+                research_frontier.get("next_obligation_id")
+                if research_frontier is not None else None
             ),
             "last_result": outcome.result,
             "turn_history": outcome.turn_history,
@@ -8530,7 +8687,11 @@ class AutonomousController:
             "created_at": utc_now(),
             "boundary": (
                 "Prior model output and artifacts are research evidence only; this "
-                "checkpoint cannot change mathematical, trust, or evidence status."
+                + (
+                    "checkpoint cannot change mathematical, trust, or evidence status."
+                    if self.domain_semantics.domain == "math-research"
+                    else "checkpoint cannot change claim, trust, or evidence status."
+                )
             ),
         }
         atomic_write_json(checkpoint_path, checkpoint)
@@ -8728,7 +8889,7 @@ class AutonomousController:
                 "next_obligation": _bounded_value(
                     outcome.result.get("next_suggested_question")
                 ),
-                "mathematical_failure": False,
+                **self._research_failure_payload(),
                 "stagnation_effect": "none",
                 "retry_condition": f"new_evidence:{task.target_claim}",
             })
@@ -8998,7 +9159,7 @@ class AutonomousController:
         preliminary_completed = bool(
             not self._internal_failure
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
-            and (self.final_conjecture_proved or self.final_conjecture_refuted)
+            and self.final_claim_resolved
         )
         execution = self._run_manifest.get("execution") or {}
         limits = execution.get("limits") or {}
@@ -9063,7 +9224,7 @@ class AutonomousController:
         campaign_completed = bool(
             not self._internal_failure
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
-            and (self.final_conjecture_proved or self.final_conjecture_refuted)
+            and self.final_claim_resolved
         )
         outcome_dir = self.layout.outcomes_root / self.run_id
         outcome_path = outcome_dir / "OUTCOME.md"
@@ -9114,6 +9275,9 @@ class AutonomousController:
                 "epoch_id": self.epoch_id,
                 "previous_epoch_id": self.previous_epoch_id,
                 "campaign_status": campaign_status,
+                "domain": self.domain_semantics.domain,
+                "final_claim_resolved": self.final_claim_resolved,
+                "final_claim_outcome": self.final_claim_outcome,
                 "final_conjecture_proved": self.final_conjecture_proved,
                 "final_conjecture_refuted": self.final_conjecture_refuted,
                 "events": len(summary_events),
@@ -9208,6 +9372,9 @@ class AutonomousController:
                 final_claim=self._final_claim(),
                 final_conjecture_proved=self.final_conjecture_proved,
                 final_conjecture_refuted=self.final_conjecture_refuted,
+                domain=self.domain_semantics.domain,
+                final_claim_resolved=self.final_claim_resolved,
+                final_claim_outcome=self.final_claim_outcome,
                 campaign_id=self.campaign_id,
                 epoch_id=self.epoch_id,
                 campaign_status=campaign_status,
@@ -9363,19 +9530,60 @@ def build_mock_full_cycle_backend(
     statement: str = "AMR_PLACEHOLDER: replace with the exact final claim statement.",
     assumptions: list[str] | None = None,
     dependencies: list[str] | None = None,
+    domain: str = "math-research",
+    evidence_path: str | None = None,
 ) -> MockCodexBackend:
     assumptions = list(assumptions or [])
     dependencies = list(dependencies or [])
+    if domain not in {
+        "math-research",
+        "certified-computational-research",
+        "empirical-research",
+    }:
+        raise ValueError(f"unsupported mock lifecycle domain: {domain}")
+    if domain != "math-research" and not evidence_path:
+        raise ValueError("non-mathematical mock lifecycle requires deterministic evidence")
+    if domain == "certified-computational-research":
+        candidate_type = "CERTIFICATE"
+        proposed_evidence = EvidenceLevel.E4_CERTIFIED
+        verified_evidence = EvidenceLevel.E4_CERTIFIED
+        worker_result_type = "CERTIFICATE"
+        worker_finding = "deterministic mock certificate"
+    elif domain == "empirical-research":
+        candidate_type = "CONFIRMATION"
+        proposed_evidence = EvidenceLevel.E2_EXACT_TESTED
+        verified_evidence = EvidenceLevel.E3_REDUNDANT_EXACT
+        worker_result_type = "EXPERIMENT_RESULT"
+        worker_finding = "deterministic mock experiment under a frozen protocol"
+    else:
+        candidate_type = "THEOREM_CANDIDATE"
+        proposed_evidence = EvidenceLevel.E0_SPECULATIVE
+        verified_evidence = EvidenceLevel.E0_SPECULATIVE
+        worker_result_type = "PROOF"
+        worker_finding = "deterministic mock proof"
+    is_math = domain == "math-research"
     director_plan = {
-        "assessment": "Toy lifecycle should test concurrent proof and falsification.",
+        "assessment": (
+            "Toy lifecycle should test concurrent proof and falsification."
+            if is_math else
+            "Toy lifecycle should test domain evidence and an adversarial lane."
+        ),
         "spawn": [
             {
                 "task_id": "mock-prover", "role": "prover", "target_claim": claim_id,
-                "exact_objective": f"Produce a proof candidate for the assigned statement: {statement}",
+                "exact_objective": (
+                    f"Produce a proof candidate for the assigned statement: {statement}"
+                    if is_math else
+                    f"Produce domain evidence for the assigned claim: {statement}"
+                ),
                 "why_now": "exercise candidate and audit lifecycle", "dependencies": [],
-                "expected_information_gain": "HIGH", "mathematical_impact": "HIGH",
+                "expected_information_gain": "HIGH", "research_impact": "HIGH",
                 "estimated_cost_tier": "LOW", "required_files": [],
-                "stop_conditions": ["produce a proof candidate or exact flaw"],
+                "stop_conditions": [
+                    "produce a proof candidate or exact flaw"
+                    if is_math else
+                    "produce auditable domain evidence or an exact flaw"
+                ],
                 "priority": 0.9,
                 "route_family": "main", "modifies_code": False,
                 "metadata": {"allow_derived_claims": False},
@@ -9383,9 +9591,13 @@ def build_mock_full_cycle_backend(
             },
             {
                 "task_id": "mock-falsifier", "role": "falsifier", "target_claim": claim_id,
-                "exact_objective": f"Seek a bounded counterexample to the assigned statement: {statement}",
+                "exact_objective": (
+                    f"Seek a bounded counterexample to the assigned statement: {statement}"
+                    if is_math else
+                    f"Adversarially test the assigned claim under the frozen protocol: {statement}"
+                ),
                 "why_now": "independent adversarial lane", "dependencies": [],
-                "expected_information_gain": "HIGH", "mathematical_impact": "MEDIUM",
+                "expected_information_gain": "HIGH", "research_impact": "MEDIUM",
                 "estimated_cost_tier": "LOW", "required_files": [],
                 "stop_conditions": ["check n=0 through 20 exactly"],
                 "priority": 0.8,
@@ -9400,21 +9612,26 @@ def build_mock_full_cycle_backend(
     candidate = {
         "event_id": f"mock-{uuid4().hex[:12]}", "producer_thread_id": None,
         "producer_task_id": "mock-prover", "claim_id": claim_id,
-        "type": "THEOREM_CANDIDATE", "impact": "CRITICAL",
-        "concise_summary": "Deterministic mock proof candidate.",
+        "type": candidate_type, "impact": "CRITICAL",
+        "concise_summary": f"Deterministic {domain} mock candidate.",
         "exact_statement": statement,
-        "artifact_paths": [], "reproduction_commands": [],
+        "artifact_paths": ([str(evidence_path)] if evidence_path else []),
+        "reproduction_commands": (
+            [f'python -c "import json; json.load(open(r\'{evidence_path}\'))"']
+            if evidence_path else []
+        ),
         "dependency_impact": ["mock lifecycle"], "assumptions": assumptions,
         "dependencies": dependencies,
         "parent_claim_id": None,
         "representation": {"branch":"LEGACY_UNSPECIFIED","localization":"LEGACY_UNSPECIFIED","saturation":"LEGACY_UNSPECIFIED","normalization":"LEGACY_UNSPECIFIED","content":"LEGACY_UNSPECIFIED","exceptional_factors":[],"combination_scope":"LEGACY_UNSPECIFIED"},
         "bridge_representation_ids": [],
-        "proposed_evidence_level": "E0_SPECULATIVE", "timestamp": utc_now(),
+        "proposed_evidence_level": proposed_evidence, "timestamp": utc_now(),
     }
     worker_result = {
-        "result_type": "PROOF", "main_finding": "deterministic mock proof",
+        "result_type": worker_result_type, "main_finding": worker_finding,
         "status": "COMPLETED", "artifact_paths": [],
-        "next_suggested_question": "independent audit", "evidence_level": "E0_SPECULATIVE",
+        "next_suggested_question": "independent audit",
+        "evidence_level": proposed_evidence,
     }
     falsifier_result = {
         "result_type": "NO_PROGRESS",
@@ -9422,7 +9639,7 @@ def build_mock_full_cycle_backend(
         "artifact_paths": [], "next_suggested_question": "audit proof",
         "evidence_level": "E0_SPECULATIVE",
     }
-    return MockCodexBackend({
+    scripts: dict[str, list[dict[str, Any]]] = {
         "director": [{"result": director_plan, "tokens": 120}, {"result": {
             "assessment": "Toy claim audit is in progress.", "spawn": [],
             "audit_priorities": [],
@@ -9434,4 +9651,21 @@ def build_mock_full_cycle_backend(
         }, "tokens": 80}],
         "prover": [{"candidate": candidate, "post_candidate_delay": 0.2, "result": worker_result, "tokens": 200}],
         "falsifier": [{"delay": 0.3, "result": falsifier_result, "tokens": 120}],
-    })
+    }
+    if domain != "math-research":
+        audit_result = {
+            "verdict": "PASS",
+            "checks": [{
+                "name": "mock deterministic domain reconstruction",
+                "passed": True,
+                "detail": "sealed fixture and exact command independently checked",
+            }],
+            "gaps": [],
+            "notes": ["deterministic mock lifecycle only"],
+            "verified_evidence_level": verified_evidence,
+        }
+        scripts["evaluator_auditor"] = [
+            {"result": audit_result, "tokens": 100},
+            {"result": audit_result, "tokens": 100},
+        ]
+    return MockCodexBackend(scripts)

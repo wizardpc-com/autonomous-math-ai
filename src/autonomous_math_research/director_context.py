@@ -211,9 +211,16 @@ def build_compact_snapshot(
         "canonical_state": _canonical_summary(full_snapshot.get("canonical_state")),
         "section_manifest": {},
     }
+    domain = full_snapshot.get("domain")
+    negative_key = (
+        "strictly_negative" if domain and domain != "math-research"
+        else "strictly_refuted"
+    )
+    if domain and domain != "math-research":
+        compact["domain"] = str(domain)
     for key in (
         "strictly_trusted",
-        "strictly_refuted",
+        negative_key,
         "open_frontier",
         "active_tasks",
         "recent_changes",
@@ -222,7 +229,6 @@ def build_compact_snapshot(
         "mechanical_token_governor",
         "research_target",
         "controller_watermark",
-        "snapshot_provenance",
         "mechanical_subworkers",
         "research_policy",
         "director_constraints",
@@ -230,6 +236,9 @@ def build_compact_snapshot(
         compact[key] = _bounded_json(full_snapshot.get(key))
     compact["representation_compatibility"] = _exact_or_bounded(
         full_snapshot.get("representation_compatibility")
+    )
+    compact["snapshot_provenance"] = _exact_or_bounded(
+        full_snapshot.get("snapshot_provenance")
     )
     compact["route_state"] = _exact_or_bounded(full_snapshot.get("route_state"))
     overlay = full_snapshot.get("director_overlay")
@@ -249,7 +258,7 @@ def build_compact_snapshot(
         key: len(full_snapshot.get(key) or [])
         for key in (
             "strictly_trusted",
-            "strictly_refuted",
+            negative_key,
             "open_frontier",
             "active_tasks",
             "recent_changes",
@@ -284,7 +293,7 @@ def build_compact_snapshot(
                 key: len(full_snapshot.get(key) or [])
                 for key in (
                     "strictly_trusted",
-                    "strictly_refuted",
+                    negative_key,
                     "open_frontier",
                     "active_tasks",
                     "recent_changes",
@@ -303,6 +312,8 @@ def build_compact_snapshot(
                 for key in sorted(_CHECKPOINT_SECTIONS)
             },
         }
+        if domain and domain != "math-research":
+            compact["domain"] = str(domain)
         payload = _json_bytes(compact)
     if len(payload) >= COMPACT_SNAPSHOT_HARD_LIMIT_BYTES:
         raise ValueError(
@@ -352,10 +363,31 @@ def load_full_context_archive(
         section = manifest.get(key) if isinstance(manifest, dict) else None
         if isinstance(section, dict) and section.get("complete") is True:
             full[key] = value.get(key)
+    compact_provenance = value.get("snapshot_provenance")
+    if not isinstance(compact_provenance, dict):
+        raise ValueError("compact snapshot canonical provenance is invalid")
+    full["snapshot_provenance"] = compact_provenance
     compact_canonical = value.get("canonical_state")
     full_canonical = full.get("canonical_state")
-    if isinstance(compact_canonical, dict) and isinstance(full_canonical, dict):
-        for key in ("canonical_state_sha256", "planning_context_sha256"):
-            if compact_canonical.get(key) != full_canonical.get(key):
-                raise ValueError("compact snapshot canonical provenance changed")
+    if not isinstance(compact_canonical, dict) or not isinstance(
+        full_canonical, dict
+    ):
+        raise ValueError("compact snapshot canonical state is invalid")
+    if compact_canonical.get("canonical_state_sha256") != full_canonical.get(
+        "canonical_state_sha256"
+    ):
+        raise ValueError("compact snapshot canonical provenance changed")
+    # These fields describe the checkpoint that the compact snapshot actually
+    # exposes. Preserve that exact binding for deterministic transition and
+    # legacy-v1 validation instead of silently replacing it with archive data.
+    for key in (
+        "planning_context_sha256",
+        "claim_graph_sha256",
+        "trusted_state_sha256",
+        "canonical_transition_id",
+    ):
+        if key in compact_canonical:
+            full_canonical[key] = compact_canonical[key]
+        else:
+            full_canonical.pop(key, None)
     return full

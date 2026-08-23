@@ -448,7 +448,7 @@ def format_event(event: dict[str, Any]) -> str:
     else:
         for key in (
             "role", "task_id", "claim_id", "event_id", "verdict", "trust_status",
-            "math_status", "reason", "error", "action",
+            "research_status", "math_status", "reason", "error", "action",
         ):
             if payload.get(key) is not None:
                 fields.append((key.removesuffix("_id"), payload[key]))
@@ -664,8 +664,14 @@ def _describe_command(command: Any) -> str:
     lowered = text.lower()
     if "compact_snapshot" in lowered:
         return "读取精简研究状态"
-    if "math-research" in lowered or "skill.md" in lowered or "verification-levels" in lowered:
-        return "读取数学研究规范"
+    if (
+        "math-research" in lowered
+        or "certified-computational-research" in lowered
+        or "empirical-research" in lowered
+        or "skill.md" in lowered
+        or "verification-levels" in lowered
+    ):
+        return "读取领域研究规范"
     if "task_packet" in lowered or "audit_packet" in lowered:
         return "读取当前任务说明"
     if "get-content" in lowered or "read_text" in lowered:
@@ -673,7 +679,7 @@ def _describe_command(command: Any) -> str:
     if "rg " in lowered or "select-string" in lowered or "findstr" in lowered:
         return "检索研究文件"
     if "emit_event" in lowered or "candidate_event" in lowered:
-        return "提交候选数学结果"
+        return "提交候选研究结果"
     if "lean" in lowered or "lake " in lowered:
         return "运行形式化证明检查"
     if "sage" in lowered or "singular" in lowered or "gap " in lowered:
@@ -681,7 +687,7 @@ def _describe_command(command: Any) -> str:
     if "unittest" in lowered or "pytest" in lowered or "test_" in lowered:
         return "运行可复现验证"
     if "python" in lowered:
-        return "运行本地数学计算"
+        return "运行本地研究计算"
     if "git diff" in lowered or "git status" in lowered:
         return "检查研究工作区"
     return "运行本地研究工具"
@@ -990,6 +996,16 @@ def format_chat_lifecycle_event(event: dict[str, Any]) -> str | None:
         return (
             f"{prefix('最终猜想')} {_compact(payload.get('claim_id'), 50)} 的反例已通过独立审计，"
             "开始收尾本次自动证明"
+        )
+    if kind == "FINAL_CLAIM_RESOLVED":
+        return (
+            f"{prefix('最终研究主张')} {_compact(payload.get('claim_id'), 50)} 已达到审计领域终态 "
+            f"{_compact(payload.get('research_status'), 40)}，开始有序收尾"
+        )
+    if kind == "FINAL_CLAIM_RESOLVED_AFTER_INTERNAL_FAILURE":
+        return (
+            f"{prefix('最终研究主张')} {_compact(payload.get('claim_id'), 50)} 在内部失败后达到审计领域终态 "
+            f"{_compact(payload.get('research_status'), 40)}；保留该状态，但本次运行仍按失败处理"
         )
     if kind == "AUDIT_RESULT_DOWNGRADED":
         return (

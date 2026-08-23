@@ -4,7 +4,7 @@
   "additionalProperties": false,
   "required": ["result_type", "main_finding", "status", "artifact_paths", "next_suggested_question", "evidence_level"],
   "properties": {
-    "result_type": {"type": "string", "enum": ["PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION", "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE", "COMPUTATIONAL_PATTERN", "NO_PROGRESS", "BLOCKED", "TOOL_ERROR"]},
+    "result_type": {"type": "string", "enum": ["PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION", "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE", "COMPUTATIONAL_PATTERN", "CHECKER_RESULT", "CERTIFICATE", "EXPERIMENT_RESULT", "EMPIRICAL_FINDING", "NO_PROGRESS", "BLOCKED", "TOOL_ERROR"]},
     "main_finding": {"type": "string"},
     "status": {"type": "string"},
     "artifact_paths": {"type": "array", "items": {"type": "string"}},

@@ -309,7 +309,7 @@ async def run_real_smoke(
                 exact_objective=f"Complete the bounded {role} smoke task.",
                 why_now="provider and schema smoke",
                 dependencies=[], expected_information_gain="LOW",
-                mathematical_impact="LOW", estimated_cost_tier="LOW",
+                research_impact="LOW", estimated_cost_tier="LOW",
                 required_files=[], stop_conditions=["return one schema-valid result"],
                 output_contract=(
                     "audit_result.schema.json" if role == "auditor"

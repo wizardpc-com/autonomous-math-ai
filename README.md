@@ -6,10 +6,11 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Autonomous Math AI is a conjecture-neutral Python harness for long-running,
-model-assisted mathematical research. It coordinates research, adversarial
-falsification, independent audit, durable evidence, recovery, and controlled
-mechanical delegation without treating model output as mathematical truth.
+Autonomous Math AI is a research-topic-neutral Python harness for long-running,
+model-assisted mathematical, certified-computational, and empirical research.
+It coordinates research, adversarial falsification, independent audit, durable
+evidence, recovery, and controlled mechanical delegation without treating model
+output as trusted truth.
 
 > Autonomous Math AI is not a proof oracle. A model response, a successful
 > computation, or a failed counterexample search does not automatically become
@@ -46,8 +47,12 @@ mechanical delegation without treating model output as mathematical truth.
   repair turn; turn/token boundaries checkpoint the task for the next epoch.
   Provider quota exhaustion pauses and preserves work without counting as
   mathematical failure or stagnation.
-- **Canonical proof frontier:** stable proof obligations live in `ClaimGraph`,
-  and only audited canonical progress can close them or reset stagnation.
+- **Canonical research frontier:** math proof obligations and non-math domain
+  frontiers live in `ClaimGraph`; only audited canonical progress can close a
+  frontier or reset stagnation.
+- **Pinned domain semantics:** a run selects one strictly validated bundled
+  policy pack, snapshots its role policy and domain contract, and fails closed
+  on missing, modified, or cross-domain state.
 
 ## Installation
 
@@ -69,7 +74,7 @@ The distribution name is `autonomous-math-ai`, the import namespace remains
 ## Repository separation
 
 This repository contains only the generic harness, neutral templates, policy
-resources, and tests. Mathematical statements, project prompts, claim/task
+resources, and tests. Research statements, project prompts, claim/task
 graphs, experiments, audits, runs, outcomes, and artifacts belong in a separate
 research repository selected with `--project`.
 
@@ -89,7 +94,19 @@ amr config explain --project ./research-target
 amr run --project ./research-target --dry-run
 ```
 
-Initialization deliberately leaves marked mathematical placeholders. Replace
+`math-research` is the compatible default. New projects may instead select one
+of the two Phase 1 non-math packs:
+
+```console
+amr init ./checker-target --domain certified-computational-research
+amr init ./study-target --domain empirical-research
+```
+
+See [research domains and policy packs](docs/research-domains.md) for the exact
+statuses and audit gates. Empirical `CONFIRMED` or `REPLICATED` state is never a
+mathematical `PROVED` state.
+
+Initialization deliberately leaves marked research placeholders. Replace
 them and complete the checklist before `amr validate --strict` can pass. These
 validation/config commands never start a provider.
 
@@ -122,7 +139,7 @@ monitor window pinned to that exact run. Keep credentials out of project files.
 
 ## Project contract
 
-Each research target owns a declarative `autonomous/project.json`, mathematical
+Each research target owns a declarative `autonomous/project.json`, research
 prompts, a claim graph, trusted-state metadata, and protected canonical inputs.
 The installed package owns wire schemas, lifecycle rules, scheduling, storage,
 recovery, audit leases, and policy enforcement.
@@ -130,7 +147,7 @@ recovery, audit leases, and policy enforcement.
 Before every new run, AMR freezes the manifest-declared canonical inputs with
 path, SHA-256, and available Git revision, then rebuilds the run-local Director
 snapshot, `CORE_CAPSULE`, and `RESEARCH_MAP`. The live `ClaimGraph` is the sole
-mathematical-status and proof-frontier authority; frozen Markdown is contextual
+domain-status and research-frontier authority; frozen Markdown is contextual
 input and cannot override it. Optional machine-readable Markdown state blocks
 must match the graph byte-for-byte or startup fails closed. Unsafe drift stops
 before a model turn; startup refresh never rewrites canonical project files.
@@ -225,6 +242,8 @@ usage as a lower bound when any mechanical attempt lacks complete telemetry.
 - [Provider adapters](docs/providers.md)
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
+- [Research domains and policy packs](docs/research-domains.md)
+- [Deterministic Experiment Runner](docs/experiment-runner.md)
 - [Project manifest](docs/project-manifest.md)
 - [Validation guide](docs/release-validation.md)
 - [Contributing](CONTRIBUTING.md)

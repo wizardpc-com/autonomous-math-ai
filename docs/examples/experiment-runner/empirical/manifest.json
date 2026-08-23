@@ -1,0 +1,51 @@
+{
+  "adapter": {
+    "config": {},
+    "kind": "subprocess"
+  },
+  "cases": [
+    {
+      "argv": [
+        "python",
+        "empirical/run_protocol.py",
+        "empirical/protocol.json",
+        "empirical/observations.csv"
+      ],
+      "case_id": "run-frozen-toy-protocol",
+      "cwd": "."
+    }
+  ],
+  "config": {
+    "case_order": "declared",
+    "numeric_type": "decimal"
+  },
+  "cost_metadata": {
+    "billing": "none",
+    "llm_budget": 0
+  },
+  "experiment_id": "toy-empirical-protocol",
+  "inputs": [
+    {
+      "path": "empirical/run_protocol.py",
+      "sha256": "56a756e3a203a964c9c0055ed335c27290b0aca4728eb583cde3c28d45a2ca14"
+    },
+    {
+      "path": "empirical/protocol.json",
+      "sha256": "a20244bf94160a11ffa5f7a5ae7fa2768e1baf01a855c7cc864e45697e2a0308"
+    },
+    {
+      "path": "empirical/observations.csv",
+      "sha256": "be12d0b09c8344df9dd2aecb6d3dd1ec5d468dee1fb5912a60eb03176ea3b7ea"
+    }
+  ],
+  "protocol_version": "toy-decimal-mean-v1",
+  "resource_metadata": {
+    "worker_slots": 1
+  },
+  "schema_version": 1,
+  "timeout_seconds": 10,
+  "versions": {
+    "example": "1",
+    "python": "3.11-or-later"
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "name": "certified-computational-research",
+  "skill": "POLICY.md",
+  "roles": {
+    "director": {
+      "prompt": "prompts/director.md",
+      "references": ["references/domain-policy.md", "references/audit-policy.md"]
+    },
+    "prover": {
+      "prompt": "prompts/worker.md",
+      "references": ["references/domain-policy.md"]
+    },
+    "falsifier": {
+      "prompt": "prompts/worker.md",
+      "references": ["references/domain-policy.md"]
+    },
+    "explorer": {
+      "prompt": "prompts/worker.md",
+      "references": ["references/domain-policy.md"]
+    },
+    "auditor": {
+      "prompt": "prompts/auditor.md",
+      "references": ["references/audit-policy.md", "references/domain-policy.md"]
+    },
+    "evaluator_auditor": {
+      "prompt": "prompts/auditor.md",
+      "references": ["references/audit-policy.md", "references/domain-policy.md"]
+    },
+    "smoke": {
+      "prompt": "prompts/smoke.md",
+      "references": ["references/domain-policy.md"]
+    }
+  },
+  "domain_contract": {
+    "domain": "certified-computational-research",
+    "semantics_version": 1,
+    "claim_statuses": ["OPEN", "SUPPORTED", "REFUTED", "INCONCLUSIVE", "CERTIFIED"],
+    "initial_status": "OPEN",
+    "candidate_status": "SUPPORTED",
+    "frontier_statuses": ["OPEN", "SUPPORTED", "INCONCLUSIVE"],
+    "terminal_positive": ["CERTIFIED"],
+    "terminal_negative": ["REFUTED"],
+    "dependency_satisfying": ["CERTIFIED"],
+    "dependency_refuting": ["REFUTED"],
+    "obligation_kind": "certificate",
+    "event_transitions": {
+      "CHECKER_SUPPORT": {
+        "status": "SUPPORTED",
+        "trust_change": true,
+        "min_evidence": "E2_EXACT_TESTED"
+      },
+      "CHECKER_REFUTATION": {
+        "status": "REFUTED",
+        "trust_change": true,
+        "min_evidence": "E2_EXACT_TESTED"
+      },
+      "CERTIFICATE": {
+        "status": "CERTIFIED",
+        "trust_change": true,
+        "min_evidence": "E4_CERTIFIED"
+      },
+      "INCONCLUSIVE": {
+        "status": "INCONCLUSIVE",
+        "trust_change": true,
+        "min_evidence": "E2_EXACT_TESTED"
+      },
+      "REPRESENTATION_BRIDGE": {
+        "status": null,
+        "trust_change": false,
+        "min_evidence": "E0_SPECULATIVE"
+      }
+    },
+    "audit_requirements": {
+      "impact_minimums": {"LOW": 1, "MEDIUM": 1, "HIGH": 1, "CRITICAL": 1},
+      "critical_double_audit": true,
+      "deterministic_checker_events": [
+        "CHECKER_SUPPORT",
+        "CHECKER_REFUTATION",
+        "CERTIFICATE",
+        "INCONCLUSIVE"
+      ],
+      "frozen_protocol_events": []
+    }
+  },
+  "mechanical_resources": {
+    "runner": "resources/policy_packs/math-research/scripts/run_worker.py",
+    "task_schema": "resources/policy_packs/math-research/references/worker-task.schema.json",
+    "result_schema": "resources/policy_packs/math-research/references/worker-result.schema.json",
+    "broker_client": "delegate_mechanical_task.py",
+    "schema_validator": "schema.py",
+    "contract_definitions": "contracts.py"
+  }
+}

@@ -391,7 +391,13 @@
       "type": "object", "additionalProperties": false,
       "required": ["pack", "stable_core", "one_shot_compute_worker"],
       "properties": {
-        "pack": {"const": "math-research"},
+        "pack": {
+          "enum": [
+            "math-research",
+            "certified-computational-research",
+            "empirical-research"
+          ]
+        },
         "stable_core": {"const": "persistent_filesystem_controller"},
         "one_shot_compute_worker": {"$ref": "#/$defs/mechanicalPolicy"}
       }

@@ -24,6 +24,11 @@ from .schema import load_schema, validate
 DEFAULT_PROTECTED = [
     "claims", "proofs", "state", "artifacts", "experiments",
 ]
+SUPPORTED_POLICY_PACKS = {
+    "math-research",
+    "certified-computational-research",
+    "empirical-research",
+}
 
 
 def default_max_audit(max_research_workers: int) -> int:
@@ -476,8 +481,8 @@ def _validate_config(raw: dict[str, Any]) -> None:
     if policy.get("stable_core") != "persistent_filesystem_controller":
         raise ValueError("policy stable_core must be persistent_filesystem_controller")
     if schema_version >= 7:
-        if policy.get("pack") != "math-research":
-            raise ValueError("schema v7 requires the bundled math-research policy pack")
+        if policy.get("pack") not in SUPPORTED_POLICY_PACKS:
+            raise ValueError("policy.pack must select a bundled research policy pack")
         forbidden_policy_paths = {
             "skill_path", "role_references", "runner_path", "task_schema_path",
             "result_schema_path", "broker_client_path", "schema_validator_path",

@@ -2,9 +2,9 @@
 
 **Autonomous Math AI — 可审计的数学研究 AI 编排工具**
 
-Autonomous Math AI 是一个与具体猜想解耦的 Python harness，用于组织长期运行的
-AI 辅助数学研究。它负责研究任务、反证搜索、独立审计、持久化证据、崩溃恢复和
-受控机械子工，但不会把模型输出自动当作数学事实。
+Autonomous Math AI 是一个与具体研究主题解耦的 Python harness，用于组织长期运行的
+AI 辅助数学、可认证计算和经验研究。它负责研究任务、反证搜索、独立审计、持久化
+证据、崩溃恢复和受控机械子工，但不会把模型输出自动当作可信事实。
 
 > Autonomous Math AI 不是“证明预言机”。模型回答、成功的计算结果或未找到反例，
 > 都不会自动成为证明。只有确定性检查、fresh independent audit 和 canonical gate
@@ -31,8 +31,10 @@ AI 辅助数学研究。它负责研究任务、反证搜索、独立审计、�
   turn 结束或模型自报 `PROOF` 不等于逻辑任务结束；首次 `BLOCKED` 必须先修复一次，
   turn/token 边界会把任务检查点续接到下一 epoch；provider quota 耗尽只暂停并保留任务，
   不计入数学失败或 stagnation。
-- **Canonical proof frontier**：稳定 proof obligation 直接保存在 `ClaimGraph` 中，
-  只有通过审计的 canonical 进展才能闭合 obligation 或重置 stagnation。
+- **Canonical research frontier**：数学 proof obligation 与非数学域 frontier 都保存在
+  `ClaimGraph` 中；只有通过审计的 canonical 进展才能闭合 frontier 或重置 stagnation。
+- **固定域语义**：每次 run 选择一个严格校验的内置 policy pack，并冻结其角色策略与
+  domain contract；缺失、被修改或跨域冲突时 fail closed。
 
 ## 安装
 
@@ -65,7 +67,18 @@ amr run --project ./research-target --mock --hours 0.01
 amr detect-tools --project-root ./research-target
 ```
 
-这些命令不会启动真实模型。初始化骨架故意保留数学占位标记；补全命题和检查清单后，
+`math-research` 保持默认和向后兼容。新项目也可选择另外两个 Phase 1 pack：
+
+```console
+amr init ./checker-target --domain certified-computational-research
+amr init ./study-target --domain empirical-research
+```
+
+三种 pack 的状态、审计门槛和冻结规则见
+[研究域与 policy pack](docs/research-domains.md)。经验域中的 `CONFIRMED`、
+`REPLICATED` 永远不等于数学 `PROVED`。
+
+这些命令不会启动真实模型。初始化骨架故意保留研究占位标记；补全陈述和检查清单后，
 再运行 `amr validate --strict`。Codex App Server 是开箱即用的默认 provider，复用
 operator 的 Codex 登录；API 只是显式可选入口，不配置 API 就不会要求 API key。
 
@@ -106,8 +119,9 @@ CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超
 
 项目目前处于 alpha 阶段。真实 campaign 前请阅读[快速开始](docs/quickstart.zh-CN.md)、
 [配置文档](docs/configuration.zh-CN.md)、[Provider 文档](docs/providers.zh-CN.md)、
-[架构](docs/architecture.md)、[可信模型](docs/trust-model.md)和
-[安全策略](SECURITY.md)。
+[架构](docs/architecture.md)、[可信模型](docs/trust-model.md)、
+[研究域与 policy pack](docs/research-domains.md)、
+[确定性 Experiment Runner](docs/experiment-runner.md)以及[安全策略](SECURITY.md)。
 
 ### Windows 单文件启动器
 
@@ -124,7 +138,7 @@ dry-run、mock 或 real 启动时还会同步打开精确绑定本次 run 的独
 
 每次新 run 会在首轮 Director 前按 `autonomous/project.json` 冻结 canonical inputs 的
 路径、SHA-256 与可用 Git revision，并重建 run-local snapshot、`CORE_CAPSULE` 和
-`RESEARCH_MAP`。实时 `ClaimGraph` 是数学状态与 proof frontier 的唯一权威；冻结的
+`RESEARCH_MAP`。实时 `ClaimGraph` 是 domain status 与 research frontier 的唯一权威；冻结的
 Markdown 仅作为上下文，不能覆盖 ClaimGraph。显式机器状态块若与 ClaimGraph 不一致，
 会在模型 turn 前 fail closed。通过 audit gate 的状态更新会原子提交 ClaimGraph 与摘要
 绑定的 trusted metadata，并保存 append-only 授权记录及前后快照；不会自动改写
@@ -132,7 +146,7 @@ Markdown 仅作为上下文，不能覆盖 ClaimGraph。显式机器状态块若
 
 `amr run --auto-epochs` 会在普通 epoch 时间边界后自动创建全新 epoch，逐 epoch 重做
 canonical refresh 和 planning rebuild，直到 campaign 总时长耗尽。quota pause、无法安全
-处理的 drift、内部失败、人工停止或数学完成都会停止自动续跑；原有
+处理的 drift、内部失败、人工停止或域终态都会停止自动续跑；原有
 `amr campaign continue` 仍可用于手动继续。
 
 本项目采用 [MIT License](LICENSE)。
