@@ -202,7 +202,9 @@ def validate_service_tier(value: Any, capabilities: dict[str, Any], label: str) 
 def allowed_observed_service_tiers(requested: Any) -> frozenset[str]:
     """Return the exact observation set for a pinned tier request."""
     if requested in {None, ""}:
-        return frozenset({"none", "unobservable"})
+        # Codex App Server may label ordinary non-Fast delivery as default even
+        # when the request correctly omitted a service tier.
+        return frozenset({"none", "default", "unobservable"})
     normalized = str(requested).casefold()
     if normalized == "fast":
         # OpenAI reports Fast-mode delivery as priority even when the request

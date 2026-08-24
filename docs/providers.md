@@ -45,6 +45,8 @@ endpoint, API style/capabilities if needed, then point individual roles at it.
 Safe `default` or `flex` tiers can be declared for compatible APIs. Fast is
 available only through the global explicit `execution.fast_mode` opt-in and a
 provider that declares Fast support; AMR requests `fast`, never `priority`.
+When no tier is requested, an observed `default` is accepted as ordinary
+non-Fast delivery.
 An observed `priority` is accepted only as the Fast response alias. Direct
 priority, auto, and ultrafast requests remain forbidden. See the profile example in
 [`examples/per-role-api-profile.json`](examples/per-role-api-profile.json).

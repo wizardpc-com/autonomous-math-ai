@@ -231,6 +231,9 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attest_no_service_tier({}, "test"), "unobservable")
         self.assertEqual(attest_no_service_tier({"serviceTier": None}, "test"), "none")
         self.assertEqual(attest_no_service_tier({"serviceTier": ""}, "test"), "none")
+        self.assertEqual(
+            attest_no_service_tier({"serviceTier": "default"}, "test"), "default"
+        )
         with self.assertRaises(ServiceTierPolicyError):
             attest_no_service_tier({"serviceTier": "priority"}, "test")
         self.assertEqual(
@@ -252,6 +255,23 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
             attest_model_route(
                 {"model": "gpt-5.6-terra"}, "test", "gpt-5.6-sol"
             )
+
+    async def test_default_observation_is_accepted_when_fast_is_disabled(self) -> None:
+        client = _TierClient(thread_tier="default")
+        self.backend.client = client  # type: ignore[assignment]
+
+        outcome = await self.backend.run_job(
+            job_id="job-tier-default", task=_task(), prompt="unused",
+            output_schema=_worker_schema(), workspace=self.workspace,
+            writable_roots=[self.workspace], timeout=1, token_budget=100,
+            candidate_sink=_candidate_sink,
+        )
+
+        self.assertTrue(outcome.succeeded, outcome.error)
+        self.assertIsNone(outcome.requested_service_tier)
+        self.assertEqual(outcome.observed_service_tier, "default")
+        self.assertIsNone(client.start_thread_kwargs["service_tier"])
+        self.assertIsNone(client.start_turn_kwargs[0]["service_tier"])
 
     async def test_thread_tier_violation_stops_before_goal_and_turn(self) -> None:
         client = _TierClient(thread_tier="priority")
