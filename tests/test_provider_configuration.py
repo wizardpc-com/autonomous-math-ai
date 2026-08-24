@@ -526,6 +526,51 @@ class ProviderConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "final_claim_id|Claim IDs|claim IDs"):
             validate_project(self.project, strict=True)
 
+    def test_strict_init_accepts_rich_markdown_without_mirroring_dynamic_ids(self) -> None:
+        graph_path = self.project / "autonomous" / "state" / "claim_graph.json"
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        graph["claims"][0]["statement"] = "Every object has property P."
+        graph["claims"][0]["current_gaps"] = ["A proof remains open."]
+        dynamic = dict(graph["claims"][0])
+        dynamic.update({
+            "claim_id": "C_DYNAMIC",
+            "statement": "A controller-derived research claim.",
+            "current_gaps": ["Independent audit remains open."],
+        })
+        graph["claims"].append(dynamic)
+        graph_path.write_text(
+            json.dumps(graph, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        (self.project / "claims" / "CLAIMS.md").write_text(
+            "# Claims\n\n"
+            "| Claim | Status | Evidence |\n"
+            "|---|---|---|\n"
+            "| C_FINAL | `OPEN` | `E0_SPECULATIVE` |\n\n"
+            "Inline notation such as `D_T` is contextual, not a claim declaration.\n",
+            encoding="utf-8",
+        )
+
+        result = validate_project(self.project, strict=True)
+
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["strict"])
+
+    def test_strict_init_rejects_final_id_only_mentioned_in_prose(self) -> None:
+        graph_path = self.project / "autonomous" / "state" / "claim_graph.json"
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        graph["claims"][0]["statement"] = "Every object has property P."
+        graph["claims"][0]["current_gaps"] = ["A proof remains open."]
+        graph_path.write_text(
+            json.dumps(graph, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        (self.project / "claims" / "CLAIMS.md").write_text(
+            "# Claims\n\nThe final target C_FINAL is discussed here but not declared.\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "explicitly declared"):
+            validate_project(self.project, strict=True)
+
     def test_project_or_profile_cannot_remove_core_protected_paths(self) -> None:
         profile = {
             "profile_schema_version": 1,

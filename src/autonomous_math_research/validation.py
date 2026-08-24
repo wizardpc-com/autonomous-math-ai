@@ -23,6 +23,18 @@ _PLACEHOLDER_MARKERS = (
 )
 
 
+def _markdown_declares_claim_id(text: str, claim_id: str) -> bool:
+    escaped = re.escape(claim_id)
+    token = rf"(?:`{escaped}`|{escaped})"
+    patterns = (
+        rf"(?m)^\s*[-*]\s+{token}\s*:",
+        rf"(?m)^\s*\|\s*{token}\s*(?:\||:)",
+        rf"(?m)^\s*#{{1,6}}\s+{token}(?:\s|:|—|-|$)",
+        rf"(?m)^\s*<!--\s*AMR-CLAIM-ID:\s*{escaped}\s*-->\s*$",
+    )
+    return any(re.search(pattern, text) is not None for pattern in patterns)
+
+
 def _strict_project_checks(
     root: Path,
     manifest: ProjectManifest,
@@ -49,14 +61,9 @@ def _strict_project_checks(
         if not paths:
             raise ValueError(f"canonical_inputs.{role} must not be empty in strict mode")
     claims_text = (root / "claims" / "CLAIMS.md").read_text(encoding="utf-8")
-    declared_ids = set(re.findall(r"`([A-Za-z][A-Za-z0-9_.:-]{0,99})`", claims_text))
-    graph_ids = set(graph.claims)
-    if manifest.final_claim_id not in declared_ids:
-        raise ValueError("final_claim_id is not declared in claims/CLAIMS.md")
-    if declared_ids != graph_ids:
+    if not _markdown_declares_claim_id(claims_text, manifest.final_claim_id):
         raise ValueError(
-            "claim IDs differ between claims/CLAIMS.md and the claim graph: "
-            f"markdown={sorted(declared_ids)}, graph={sorted(graph_ids)}"
+            "final_claim_id is not explicitly declared in claims/CLAIMS.md"
         )
     placeholder_files: list[str] = []
     inspected = {

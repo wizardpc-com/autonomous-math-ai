@@ -88,7 +88,9 @@ does not change `autonomous/project.json` or any canonical research file.
 
 `amr init <directory> [--project-id ID] [--final-claim-id ID] [--domain PACK]`
 creates a neutral complete skeleton. `amr validate --strict` additionally
-requires every scaffold directory and checklist, exact claim-ID agreement,
-nonempty canonical inputs, consistent protected paths, and removal of research
-placeholders. It also validates provider/model configuration and secret
-references without starting a model turn.
+requires every scaffold directory and checklist, an explicit declaration of the
+manifest final claim ID in `claims/CLAIMS.md`, nonempty canonical inputs,
+consistent protected paths, and removal of research placeholders. Contextual
+Markdown is not required to mirror controller-derived ClaimGraph IDs. It also
+validates provider/model configuration and secret references without starting a
+model turn.
