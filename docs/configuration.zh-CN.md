@@ -46,6 +46,10 @@ run-local policy 目录。resume 使用这些已验证快照并报告已安装�
 被修改或跨 pack 重绑定时 fail closed。详见
 [研究域与 policy pack](research-domains.md)。
 
+`amr smoke` 同样服从该 selector：数学域走 proof 路径，certified computational 在模型
+解释前绑定一次 deterministic checker receipt，empirical 在独立 evaluator 前绑定两次
+不同的 frozen-protocol receipt。仅做 schema 的 smoke 不执行实验。
+
 ## Fast 模式
 
 Fast 是默认关闭的单一显式开关，可写在项目配置或 profile：

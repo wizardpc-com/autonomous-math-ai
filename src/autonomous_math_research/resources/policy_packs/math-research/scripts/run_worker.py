@@ -1399,10 +1399,16 @@ def isolated_worker_environment(
             if blocked_directory is not None and normalized == blocked_directory:
                 continue
             entry_path = Path(raw_entry.strip().strip('"'))
-            if any(
-                (entry_path / name).is_file()
-                for name in ("codex", "codex.exe", "codex.cmd", "codex.bat")
-            ):
+            try:
+                contains_codex = any(
+                    (entry_path / name).is_file()
+                    for name in ("codex", "codex.exe", "codex.cmd", "codex.bat")
+                )
+            except OSError:
+                # Do not retain an unreadable entry that could hide a
+                # recursive Codex executable.
+                continue
+            if contains_codex:
                 continue
             retained.append(raw_entry)
         environment[path_key] = os.pathsep.join(retained)

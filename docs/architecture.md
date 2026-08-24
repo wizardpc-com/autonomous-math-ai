@@ -67,30 +67,28 @@ image viewing are disabled separately. Configured standalone MCP ids are
 enumerated and disabled before launch, and initialization fails closed if the
 live inventory still exposes an MCP tool, resource, template, or server.
 
-Each process receives a controller-owned permission profile. The project tree,
-Python runtime, and minimal platform paths needed by common tools are readable;
-only the exact runtime workspace roots are writable, network is disabled, and
-every thread attests the selected profile. The Codex executable itself is
-explicitly denied even when it shares a directory with an allowed runtime.
-Login-shell requests are rejected. The role shell receives an allowlisted
-non-login environment without `CODEX_HOME`, `USERPROFILE`, or auth-like
-variables. Codex-only entrypoint directories are
-removed from `PATH`; the executable-level deny also covers runtimes installed
-beside Codex. A prompt contract further limits usage to the run-local packet,
-canonical snapshot, pinned policy references, and explicitly listed project
-files; that last list is a usage rule, while the mechanical filesystem boundary
-is project-wide read-only. The developer contract also identifies optional
-commands as untrusted until detected and supplies Windows PowerShell rules for
-UTF-8 JSON, statement pipelines, and executable invocation.
+Each process receives a controller-owned permission profile. The project root is
+not a static readable root. Before dispatch, the controller copies the exact
+canonical inputs, active ClaimGraph, pinned skill, and explicitly requested
+files into the job workspace with SHA-256 verification; that workspace plus the
+pinned AMR runtime are the readable roots. Credential-shaped requested paths
+such as `.env`, auth/credential JSON, private keys, and certificate-key files
+are rejected before materialization. Only the exact job workspace is writable,
+network is disabled, and every thread attests the selected profile. The Codex
+executable and common `CODEX_HOME` credential/config filenames receive explicit
+deny entries. Login-shell requests are rejected. The role shell receives an
+allowlisted non-login environment without `CODEX_HOME`, `USERPROFILE`, or
+auth-like variables. Codex-only entrypoint directories are removed from
+`PATH`; unreadable entries are omitted fail-closed. Mechanical workers retain
+their separate brokered filesystem policy. The developer contract also supplies
+Windows PowerShell rules for UTF-8 JSON, statement pipelines, and executable
+invocation.
 
-Current Windows Codex runtimes treat the App Server's own `CODEX_HOME` as a
-special readable location: a sandbox probe can read `config.toml` by absolute
-path even though the role environment omits its location and the permission
-profile denies other project-external siblings. Therefore this boundary
-isolates ambient tools, MCP, environment, writes, and network, but is not a
-credential-filesystem isolation boundary. Core trust transitions never depend
-on keeping operator configuration hidden, and roles are explicitly forbidden
-from inspecting it.
+Current Windows Codex runtimes have treated the App Server's own `CODEX_HOME` as
+a special readable location in some releases. AMR now requests exact denies for
+the common files, but does not treat that request as proof of an operating-system
+credential sandbox. Core trust transitions never depend on keeping operator
+configuration hidden, and roles are explicitly forbidden from inspecting it.
 
 The live monitor treats a nonzero `commandExecution` exit as a recoverable
 local-command failure within the current Agent turn. A failed MCP or dynamic
@@ -153,6 +151,9 @@ research job
     │ emits an untrusted candidate
     ▼
 identity + representation + schema checks
+    │
+    ▼
+v2 evidence-attempt identity + deterministic receipt verification
     │
     ▼
 content-addressed immutable evidence bundle
@@ -289,7 +290,9 @@ files, append a `PREPARED` record, atomically install the staged bytes, then
 append `COMMITTED`. Recovery accepts only the recorded before or after digest
 for every target and otherwise fails closed. The retained snapshots make the
 transition reviewable and replayable without promoting a model result directly.
-Canonical Markdown is never rewritten by the controller.
+If a canonical Markdown input contains the explicit machine-state markers, its
+generated block is another target in the same transaction; prose outside the
+block and all unmarked Markdown remain unchanged.
 
 Status domains are intentionally separate: the pinned domain contract describes
 claim status (`MathStatus` remains the compatibility API for the math wire

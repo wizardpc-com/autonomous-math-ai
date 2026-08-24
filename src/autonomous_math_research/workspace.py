@@ -55,6 +55,41 @@ class WorkspaceManager:
         atomic_write_json(target, packet)
         return target
 
+    def materialize_input(self, workspace: Path, source: Path) -> Path:
+        """Copy one controller-selected input into a job-local readable root."""
+        root = workspace.resolve()
+        resolved = source.resolve()
+        if not resolved.is_file():
+            raise ValueError(f"job input is unavailable: {source}")
+        digest = file_digest(resolved)
+        target = root / "inputs" / digest / (resolved.name or "input")
+        if not target.resolve().is_relative_to(root):
+            raise ValueError("job input target escapes its workspace")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if not target.is_file() or file_digest(target) != digest:
+                raise ValueError("job input copy has an invalid digest")
+        else:
+            shutil.copy2(resolved, target)
+        if file_digest(target) != digest:
+            raise ValueError("job input copy failed digest verification")
+        return target
+
+    def materialize_required_file_access(
+        self,
+        workspace: Path,
+        access: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        materialized: list[dict[str, str]] = []
+        for item in access:
+            copied = self.materialize_input(workspace, Path(item["path"]))
+            materialized.append({
+                "reference": item["reference"],
+                "path": str(copied),
+                "sha256": file_digest(copied),
+            })
+        return materialized
+
     def mechanical_broker_control_dir(self, workspace: Path) -> Path:
         """Return a controller-owned sibling area not writable by the parent job."""
         resolved = workspace.resolve()

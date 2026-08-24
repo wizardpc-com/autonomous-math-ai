@@ -39,8 +39,10 @@ adapters. Inputs and working directories use normalized project-relative POSIX
 paths. Inputs must be regular, non-symbolic files inside the project and match
 their declared SHA-256 before execution. `subprocess` requires an empty adapter
 configuration. `versions`, `resource_metadata`, and `cost_metadata` are
-caller-declared provenance; the Phase 1 runner records them but does not discover
-an environment, reserve resources, or enforce billing from those fields.
+caller-declared provenance; the runner records them but does not reserve
+resources or enforce billing from those fields. Run-contract schema v2 also
+records the resolved executable path, executable SHA-256 and size, platform,
+and deterministic environment contract used for each subprocess case.
 
 [`examples/experiment-runner/manifest.schema.json`](examples/experiment-runner/manifest.schema.json)
 is a documentation companion for editor validation. The runtime does not load
@@ -72,9 +74,10 @@ print(summary.run_id, summary.root)
 ```
 
 The deterministic experiment fingerprint covers the normalized manifest,
-config hash, declared versions, protocol version, and verified input
-provenance. Output is written below the project's manifest-selected runtime
-root, or `autonomous/experiments/` when no project manifest exists:
+config hash, declared versions, protocol version, verified input provenance,
+resolved executable hashes, platform, and environment contract. Output is
+written below the project's manifest-selected runtime root, or
+`autonomous/experiments/` when no project manifest exists:
 
 ```text
 autonomous/experiments/run-<experiment-fingerprint>/
@@ -94,6 +97,21 @@ uninterpreted bytes with recorded size and SHA-256. `RESULT.json` always carries
 `research_result: {"status": "UNINTERPRETED"}`. A nonzero process exit is raw
 execution output, while launch errors, timeouts, adapter failures, and input
 mutation are recorded separately as infrastructure failures.
+
+For the built-in subprocess adapter, every case runs in a fresh temporary tree
+containing only the manifest-declared inputs at their project-relative paths.
+The command working directory and temporary-directory variables point inside
+that tree. The environment is allowlisted, auth-like ambient variables are not
+inherited, and deterministic Python, locale, and time-zone settings are pinned.
+Mutating a materialized input records `INPUT_MUTATED` and stops the batch, while
+the original project input remains unchanged. Exact absolute project-local
+arguments must name declared inputs.
+
+This subprocess adapter is a reproducibility boundary for trusted local
+commands, not an operating-system security sandbox: it does not disable network
+syscalls or prevent a program from embedding an undeclared absolute path inside
+its own code. Use an injected Docker adapter with a pinned image and explicit
+network/filesystem policy for untrusted executables or hard network isolation.
 
 Case directories and result/artifact files are created exclusively. The JSONL
 ledger is append-only, ordered by declared case order, flushed after every
@@ -120,6 +138,16 @@ result exists but only the ledger tail was lost, resume verifies it and appends
 the missing ledger entry. A missing or stale checkpoint is rebuilt from the
 verified ledger. Modified raw evidence, a partial ledger record, an unexpected
 case directory, or changed frozen input fails closed.
+
+`ExperimentRunner.verify_receipt(manifest, run_id=...)` is read-only: it never
+executes, resumes, or repairs a run. It verifies the frozen run manifest,
+complete ledger, exact case set, every result/stdout/stderr digest, and current
+input hashes, then returns a receipt fingerprint and project-relative artifact
+list. Certified-computational candidates must bind an accepted checker receipt.
+Empirical E3 candidates must bind two distinct completed experiment runs. The
+controller re-verifies those receipts before audit dispatch and canonical
+transition; an infrastructure failure is never interpreted as a research
+result.
 
 ## Docker seam
 

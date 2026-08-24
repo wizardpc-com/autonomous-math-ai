@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 import shutil
+import sys
 import unittest
 from uuid import uuid4
 
@@ -13,9 +14,10 @@ from autonomous_math_research.controller import (
     build_mock_full_cycle_backend,
 )
 from autonomous_math_research.initializer import initialize_project
+from autonomous_math_research.experiment import ExperimentRunner
 from autonomous_math_research.monitor import format_chat_lifecycle_event
 from autonomous_math_research.outcomes import IMPORTANT_EVENT_KINDS
-from autonomous_math_research.storage import ProjectLayout
+from autonomous_math_research.storage import ProjectLayout, file_digest
 from autonomous_math_research.validation import validate_project
 
 
@@ -90,6 +92,7 @@ class ThreeDomainLifecycleTests(unittest.TestCase):
         project = self.root / domain
         initialize_project(project, domain=domain)
         evidence_path: Path | None = None
+        evidence_receipts: list[dict[str, str]] = []
         if domain != "math-research":
             evidence_path = project / "sources" / "deterministic-smoke.json"
             evidence_path.write_text(
@@ -103,6 +106,45 @@ class ThreeDomainLifecycleTests(unittest.TestCase):
                 encoding="utf-8",
                 newline="\n",
             )
+            runner = ExperimentRunner(project)
+            for replica in range(
+                1, 3 if domain == "empirical-research" else 2,
+            ):
+                manifest_path = project / "sources" / f"experiment-{replica}.json"
+                manifest_path.write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "experiment_id": f"domain-lifecycle-{replica}",
+                        "protocol_version": f"frozen-v{replica}",
+                        "adapter": {"kind": "subprocess", "config": {}},
+                        "timeout_seconds": 5,
+                        "inputs": [{
+                            "path": evidence_path.relative_to(project).as_posix(),
+                            "sha256": file_digest(evidence_path),
+                        }],
+                        "config": {"domain": domain, "replica": replica},
+                        "versions": {"python": sys.version.split()[0]},
+                        "resource_metadata": {"worker_slots": 1},
+                        "cost_metadata": {"billing": "none", "llm_budget": 0},
+                        "cases": [{
+                            "case_id": "verify",
+                            "argv": [sys.executable, "-c", "print('verified')"],
+                            "cwd": ".",
+                        }],
+                    }, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                summary = runner.run(manifest_path)
+                evidence_receipts.append({
+                    "kind": (
+                        "deterministic_checker_run"
+                        if domain == "certified-computational-research"
+                        else "experiment_run"
+                    ),
+                    "manifest_path": manifest_path.relative_to(project).as_posix(),
+                    "run_id": summary.run_id,
+                })
         config = load_config(project)
         graph_payload = json.loads(
             ProjectLayout(project).claim_graph_path.read_text(encoding="utf-8")
@@ -117,6 +159,7 @@ class ThreeDomainLifecycleTests(unittest.TestCase):
                 dependencies=list(final_claim.get("dependencies") or []),
                 domain=domain,
                 evidence_path=str(evidence_path) if evidence_path else None,
+                evidence_receipts=evidence_receipts,
             ),
             mock=True,
         )

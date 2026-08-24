@@ -55,10 +55,12 @@ generated JSON block. Unmarked Markdown is prose context, not a second state
 store. A malformed or conflicting marked view fails before any model turn.
 
 Startup refresh never edits the graph, trusted metadata, `CLAIMS.md`, or
-`PROGRESS.md`. Audit-gated controller transitions atomically update only the
-graph and trusted metadata, with append-only authorization and before/after
-snapshots under `runtime_root/state/canonical_transitions`. AMR never promotes
-candidate output on its own and never rewrites canonical Markdown.
+`PROGRESS.md`. Audit-gated controller transitions atomically update the graph,
+trusted metadata, and any explicitly marked machine-state projection, with
+append-only authorization and before/after snapshots under
+`runtime_root/state/canonical_transitions`. Only the bytes between the AMR
+markers may change; surrounding prose is preserved, and unmarked Markdown is
+never rewritten. AMR never promotes candidate output on its own.
 
 `prompt_root/director.md` is optional. When present it is a stable
 project-specific constraints overlay only. Generic falsification, representation,

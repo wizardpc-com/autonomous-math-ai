@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import sys
 import time
 from typing import Any
 from uuid import uuid4
@@ -25,9 +26,11 @@ from .contracts import (
     render_contract_keys,
 )
 from .models import (
-    AuditResult, CandidateEvent, Claim, EvidenceLevel, MathStatus, ResearchTask, TokenUsage,
+    AuditResult, CandidateEvent, Claim, EvidenceLevel, ResearchTask, TokenUsage,
     TrustStatus, utc_now,
 )
+from .domain_semantics import builtin_domain_contract, domain_semantics_from_contract
+from .experiment import ExperimentRunner
 from .policy import pin_policy_manifest, policy_view_for_role
 from .provider_backend import ProviderRouterBackend
 from .reporting import write_report
@@ -137,37 +140,97 @@ def _failure_kind(exc: Exception) -> tuple[str, bool]:
     return "smoke_internal", False
 
 
-def _toy_graph(path: Path) -> ClaimGraph:
-    graph = ClaimGraph({
-        "TOY-SUM-ODD": Claim(
-            claim_id="TOY-SUM-ODD",
-            statement=(
+def _smoke_domain_spec(domain: str) -> dict[str, Any]:
+    specs = {
+        "math-research": {
+            "claim_id": "TOY-SUM-ODD",
+            "statement": (
                 "For every integer n >= 0, the sum of the first n positive odd "
                 "integers equals n^2."
             ),
-            assumptions=["n is an integer", "n >= 0"],
-            math_status=MathStatus.OPEN,
+            "assumptions": ["n is an integer", "n >= 0"],
+            "event_type": "THEOREM_CANDIDATE",
+            "evidence_level": EvidenceLevel.E0_SPECULATIVE,
+            "producer_result_type": "PROOF",
+            "audit_kind": "proof",
+            "terminal_status": "PROVED",
+            "experiment_runs": 0,
+        },
+        "certified-computational-research": {
+            "claim_id": "TOY-CERTIFICATE",
+            "statement": (
+                "For the frozen toy input 7, the deterministic checker accepts "
+                "the certificate that its square is 49."
+            ),
+            "assumptions": ["the checker and input protocol are frozen"],
+            "event_type": "CERTIFICATE",
+            "evidence_level": EvidenceLevel.E4_CERTIFIED,
+            "producer_result_type": "CERTIFICATE",
+            "audit_kind": "independent_evaluator",
+            "terminal_status": "CERTIFIED",
+            "experiment_runs": 1,
+        },
+        "empirical-research": {
+            "claim_id": "TOY-EMPIRICAL-MEAN",
+            "statement": (
+                "Under the frozen toy protocol, each of two deterministic "
+                "replications measures mean 2.5 for observations [1, 2, 3, 4]."
+            ),
+            "assumptions": ["the frozen protocol and observations are unchanged"],
+            "event_type": "CONFIRMATION",
+            "evidence_level": EvidenceLevel.E3_REDUNDANT_EXACT,
+            "producer_result_type": "EMPIRICAL_FINDING",
+            "audit_kind": "independent_evaluator",
+            "terminal_status": "CONFIRMED",
+            "experiment_runs": 2,
+        },
+    }
+    try:
+        return dict(specs[domain])
+    except KeyError as exc:
+        raise ValueError(f"unsupported smoke research domain: {domain}") from exc
+
+
+def _toy_graph(
+    path: Path,
+    *,
+    domain_contract: dict[str, Any],
+    spec: dict[str, Any],
+) -> ClaimGraph:
+    semantics = domain_semantics_from_contract(domain_contract)
+    graph = ClaimGraph({
+        spec["claim_id"]: Claim(
+            claim_id=spec["claim_id"],
+            statement=spec["statement"],
+            assumptions=list(spec["assumptions"]),
+            math_status=semantics.initial_status,
             trust_status=TrustStatus.UNTRUSTED_CANDIDATE,
             dependencies=[], downstream_dependents=[], evidence_paths=[],
-            known_counterexamples=[], current_gaps=["toy smoke proof and audit"],
+            known_counterexamples=[],
+            current_gaps=[f"toy {semantics.obligation_kind} and independent audit"],
             active_tasks=[], last_meaningful_progress=None,
             priority={"score": 1.0}, source_status="SMOKE_ONLY",
         )
-    }, path)
+    }, path, semantics=semantics)
     graph.save()
     return graph
 
 
 def _toy_candidate(
-    graph: ClaimGraph, prover: dict[str, Any], prover_record: dict[str, Any],
+    graph: ClaimGraph,
+    producer: dict[str, Any],
+    producer_record: dict[str, Any],
+    *,
+    spec: dict[str, Any],
+    evidence_receipts: list[dict[str, str]],
 ) -> CandidateEvent:
-    claim = graph.claims["TOY-SUM-ODD"]
+    claim = graph.claims[str(spec["claim_id"])]
     return CandidateEvent.from_dict({
         "event_id": f"smoke-event-{uuid4().hex[:10]}",
-        "producer_thread_id": prover_record["thread_id"],
-        "producer_task_id": "smoke-prover", "claim_id": claim.claim_id,
-        "type": "THEOREM_CANDIDATE", "impact": "HIGH",
-        "concise_summary": prover["main_finding"],
+        "producer_thread_id": producer_record["thread_id"],
+        "producer_task_id": "smoke-producer", "claim_id": claim.claim_id,
+        "type": spec["event_type"], "impact": "HIGH",
+        "concise_summary": producer["main_finding"],
         "exact_statement": claim.statement,
         "artifact_paths": [], "reproduction_commands": [],
         "dependency_impact": ["smoke lifecycle only"],
@@ -177,8 +240,102 @@ def _toy_candidate(
         # Existing-claim candidates must preserve identity-defining fields.
         "assumptions": list(claim.assumptions),
         "dependencies": list(claim.dependencies),
-        "proposed_evidence_level": "E0_SPECULATIVE", "timestamp": utc_now(),
+        "proposed_evidence_level": spec["evidence_level"],
+        "evidence_receipts": evidence_receipts,
+        "timestamp": utc_now(),
     })
+
+
+def _prepare_domain_smoke_evidence(
+    project_root: Path,
+    run_dir: Path,
+    *,
+    domain: str,
+    spec: dict[str, Any],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    count = int(spec["experiment_runs"])
+    if count == 0:
+        return [], []
+    root = run_dir / "deterministic_evidence"
+    runner = ExperimentRunner(project_root)
+    references: list[dict[str, str]] = []
+    verified: list[dict[str, Any]] = []
+    for replica in range(1, count + 1):
+        protocol_path = root / f"protocol-{replica}.json"
+        protocol = (
+            {
+                "schema_version": 1,
+                "kind": "deterministic-certificate",
+                "value": 7,
+                "expected_square": 49,
+            }
+            if domain == "certified-computational-research"
+            else {
+                "schema_version": 1,
+                "kind": "frozen-empirical-protocol",
+                "observations": [1, 2, 3, 4],
+                "expected_mean": 2.5,
+                "replica": replica,
+            }
+        )
+        atomic_write_json(protocol_path, protocol)
+        relative_protocol = protocol_path.relative_to(project_root).as_posix()
+        checker = (
+            "import json,sys; p=json.load(open(sys.argv[1], encoding='utf-8')); "
+            "ok=p['value']*p['value']==p['expected_square']; "
+            "print(json.dumps({'accepted':ok}, sort_keys=True)); sys.exit(0 if ok else 1)"
+            if domain == "certified-computational-research"
+            else
+            "import json,sys; p=json.load(open(sys.argv[1], encoding='utf-8')); "
+            "m=sum(p['observations'])/len(p['observations']); "
+            "ok=m==p['expected_mean']; "
+            "print(json.dumps({'mean':m,'matches':ok}, sort_keys=True)); "
+            "sys.exit(0 if ok else 1)"
+        )
+        manifest_path = root / f"manifest-{replica}.json"
+        atomic_write_json(manifest_path, {
+            "schema_version": 1,
+            "experiment_id": f"smoke-{domain}-{replica}",
+            "protocol_version": f"toy-frozen-v{replica}",
+            "adapter": {"kind": "subprocess", "config": {}},
+            "timeout_seconds": 15,
+            "inputs": [{
+                "path": relative_protocol,
+                "sha256": file_digest(protocol_path),
+            }],
+            "config": {"domain": domain, "replica": replica},
+            "versions": {"python": sys.version.split()[0], "smoke_contract": "1"},
+            "resource_metadata": {"worker_slots": 1},
+            "cost_metadata": {"billing": "none", "llm_budget": 0},
+            "cases": [{
+                "case_id": "verify",
+                "argv": [sys.executable, "-c", checker, relative_protocol],
+                "cwd": ".",
+            }],
+        })
+        summary = runner.run(manifest_path)
+        reference = {
+            "kind": (
+                "deterministic_checker_run"
+                if domain == "certified-computational-research"
+                else "experiment_run"
+            ),
+            "manifest_path": manifest_path.relative_to(project_root).as_posix(),
+            "run_id": summary.run_id,
+        }
+        receipt = runner.verify_receipt(
+            manifest_path, run_id=summary.run_id,
+        )
+        if any(
+            case["termination"] != "EXITED"
+            or case["exit_code"] != 0
+            or case["infrastructure_failure"] is not None
+            for case in receipt["cases"]
+        ):
+            raise ValueError("domain smoke deterministic evidence did not verify")
+        references.append(reference)
+        verified.append({"kind": reference["kind"], **receipt})
+    return references, verified
 
 
 def _schema_role_prompt(role: str) -> str:
@@ -228,8 +385,17 @@ async def run_real_smoke(
     guard = CanonicalGuard(config.project_root, config.protected_paths)
     before = guard.snapshot()
     atomic_write_json(run_dir / "canonical_guard.before.json", before)
-    graph = _toy_graph(run_dir / "state" / "claim_graph.json")
+    domain = str(config.raw["policy"].get("pack") or "math-research")
+    domain_contract = builtin_domain_contract(domain)
+    smoke_spec = _smoke_domain_spec(domain)
+    graph = _toy_graph(
+        run_dir / "state" / "claim_graph.json",
+        domain_contract=domain_contract,
+        spec=smoke_spec,
+    )
     jobs: list[dict[str, Any]] = []
+    evidence_references: list[dict[str, str]] = []
+    verified_evidence: list[dict[str, Any]] = []
     policy_manifest: dict[str, Any] | None = None
     policy_status: dict[str, Any] | None = None
     capability: dict[str, Any] = {}
@@ -252,12 +418,14 @@ async def run_real_smoke(
     mode_label = "full-lifecycle" if schema_role is None else f"schema-role:{schema_role}"
     store.append("RUN_STARTED", {
         "mode": "smoke", "execution_mode": "smoke", "smoke_scope": mode_label,
+        "domain": domain,
         "global_token_budget": token_budget, "requested_service_tier": requested_tier,
         "provider": smoke_provider,
         "budget_semantics": SMOKE_BUDGET_SEMANTICS, "budget_hard_cap": False,
     })
     store.append("SMOKE_STARTED", {
         "provider": smoke_provider, "model": model, "effort": effort,
+        "domain": domain,
         "requested_service_tier": requested_tier, "token_budget": token_budget,
         "schema_role": schema_role, "budget_semantics": SMOKE_BUDGET_SEMANTICS,
         "budget_hard_cap": False,
@@ -293,7 +461,7 @@ async def run_real_smoke(
                 assert policy_manifest is not None
                 role_policy = policy_view_for_role(
                     policy_manifest, policy_path,
-                    "auditor" if role == "auditor" else "smoke",
+                    role if role in policy_manifest["roles"] else "smoke",
                 )
                 final_prompt = f"{prompt}\n\nPINNED RESEARCH POLICY: {role_policy}."
             store.append("JOB_STARTED", {
@@ -305,14 +473,15 @@ async def run_real_smoke(
             task = ResearchTask(
                 task_id=job_id,
                 role="smoke",
-                target_claim="TOY-SUM-ODD",
+                target_claim=str(smoke_spec["claim_id"]),
                 exact_objective=f"Complete the bounded {role} smoke task.",
                 why_now="provider and schema smoke",
                 dependencies=[], expected_information_gain="LOW",
                 research_impact="LOW", estimated_cost_tier="LOW",
                 required_files=[], stop_conditions=["return one schema-valid result"],
                 output_contract=(
-                    "audit_result.schema.json" if role == "auditor"
+                    "audit_result.schema.json"
+                    if role in {"auditor", "evaluator_auditor"}
                     else "director_plan.schema.json" if role == "director"
                     else "worker_result.schema.json"
                 ),
@@ -474,6 +643,8 @@ async def run_real_smoke(
 
     try:
         policy_manifest, policy_status = pin_policy_manifest(config, policy_path)
+        if policy_manifest["domain_contract"] != domain_contract:
+            raise ValueError("smoke policy domain contract changed during pinning")
         store.append("RUN_POLICY_PINNED", {
             "manifest": str(policy_path),
             "manifest_sha256": policy_manifest["manifest_sha256"],
@@ -507,6 +678,7 @@ async def run_real_smoke(
         }
         atomic_write_json(run_dir / "SMOKE_MANIFEST.json", {
             "run_id": run_id, "execution_mode": "smoke", "scope": mode_label,
+            "domain": domain,
             "provider": smoke_provider,
             "requested_service_tier": requested_tier,
             "model": model, "effort": effort,
@@ -518,11 +690,25 @@ async def run_real_smoke(
         store.append("SCHEMA_PREFLIGHT_PASSED", {
             "schemas": schema_manifest, "scope": mode_label,
         })
+        if schema_role is None:
+            evidence_references, verified_evidence = _prepare_domain_smoke_evidence(
+                config.project_root, run_dir, domain=domain, spec=smoke_spec,
+            )
+            if verified_evidence:
+                store.append("SMOKE_DETERMINISTIC_EVIDENCE_VERIFIED", {
+                    "domain": domain,
+                    "run_ids": [item["run_id"] for item in verified_evidence],
+                    "receipt_fingerprints": [
+                        item["receipt_fingerprint"] for item in verified_evidence
+                    ],
+                    "llm_calls": 0,
+                })
         if smoke_adapter == "codex_app_server":
             capability = inspect_generated_schema(work_root=run_dir / "schema-probe")
             client = client_factory(
                 notification_handler=trace,
                 project_root=config.project_root,
+                read_roots=(run_dir,),
             )
             await client.start()
             live = await client.probe_capabilities(config.project_root)
@@ -572,9 +758,15 @@ async def run_real_smoke(
                     )
 
             per_turn = max(800, token_budget // 4)
+            director_prompt = (
+                f"""You are a fresh toy Research Director. You cannot judge truth. Return JSON only, with exactly these top-level keys: {render_contract_keys(DIRECTOR_PLAN_KEYS)}. Use assessment and short_rationale strings, empty audit_priorities and route_updates, and exactly two spawn objects. Each spawn object must have exactly the schema fields, including metadata with only allow_derived_claims=false and a complete LEGACY_UNSPECIFIED representation with exceptional_factors empty. Create smoke-prover with role prover and smoke-falsifier with role falsifier for TOY-SUM-ODD. Use HIGH information gain and research impact, LOW cost, no dependencies or required files, one bounded stop condition, modifies_code false, and priority between 0 and 1. Set route_family main for the prover and independent for the falsifier. The claim is: for every integer n >= 0, 1+3+...+(2n-1)=n^2. Spawn no other tasks."""
+                if domain == "math-research"
+                else
+                f"""You are a fresh toy Research Director for {domain}. You cannot judge truth or execute benchmarks. Return JSON only, with exactly these top-level keys: {render_contract_keys(DIRECTOR_PLAN_KEYS)}. Use assessment and short_rationale strings, empty audit_priorities and route_updates, and exactly two spawn objects. Each spawn object must have exactly the schema fields, including metadata with only allow_derived_claims=false and a complete LEGACY_UNSPECIFIED representation with exceptional_factors empty. Create smoke-producer with role prover and smoke-challenger with role falsifier for {smoke_spec['claim_id']}. Use HIGH information gain and research impact, LOW cost, no dependencies or required files, one bounded stop condition, modifies_code false, and priority between 0 and 1. Set route_family main for the producer and independent for the challenger. The exact claim is: {smoke_spec['statement']} Deterministic evidence is controller-run; models only design, inspect, and interpret it. Spawn no other tasks."""
+            )
             director, _ = await turn(
                 "director",
-                f"""You are a fresh toy Research Director. You cannot judge truth. Return JSON only, with exactly these top-level keys: {render_contract_keys(DIRECTOR_PLAN_KEYS)}. Use assessment and short_rationale strings, empty audit_priorities and route_updates, and exactly two spawn objects. Each spawn object must have exactly the schema fields, including metadata with only allow_derived_claims=false and a complete LEGACY_UNSPECIFIED representation with exceptional_factors empty. Create smoke-prover with role prover and smoke-falsifier with role falsifier for TOY-SUM-ODD. Use HIGH information gain and mathematical impact, LOW cost, no dependencies or required files, one bounded stop condition, modifies_code false, and priority between 0 and 1. Set route_family main for the prover and independent for the falsifier. The claim is: for every integer n >= 0, 1+3+...+(2n-1)=n^2. Spawn no other tasks.""",
+                director_prompt,
                 schemas["director"], per_turn,
             )
             store.append("DIRECTOR_PLAN_ACCEPTED", {
@@ -586,18 +778,36 @@ async def run_real_smoke(
                 "Return JSON only with exactly these keys: "
                 f"{render_contract_keys(WORKER_RESULT_KEYS)}."
             )
-            prover_future = asyncio.create_task(turn(
+            receipt_summary = [{
+                "run_id": item["run_id"],
+                "protocol_version": item["protocol_version"],
+                "receipt_fingerprint": item["receipt_fingerprint"],
+                "cases": item["cases"],
+            } for item in verified_evidence]
+            producer_prompt = (
+                f"Act as the bounded Prover. Give a rigorous induction or telescoping proof of: for every integer n>=0, 1+3+...+(2n-1)=n^2. {worker_shape} Use result_type PROOF only if complete; evidence_level E0_SPECULATIVE because this is an informal proof; artifact_paths must be empty; claim identity, impact, and trust status are controller-owned and forbidden."
+                if domain == "math-research"
+                else
+                f"Act as the bounded evidence interpreter for {domain}. The controller already ran the deterministic, non-LLM backend and verified these receipts: {json.dumps(receipt_summary, ensure_ascii=False, sort_keys=True)}. Assess only this exact claim: {smoke_spec['statement']} {worker_shape} Use result_type {smoke_spec['producer_result_type']} only if every declared receipt supports the exact frozen claim; set evidence_level {smoke_spec['evidence_level']}; artifact_paths must be empty. Do not execute commands, call this a mathematical proof, or set controller-owned trust state."
+            )
+            challenger_prompt = (
+                f"Act as an adversarial Falsifier. Check n=0 through n=20 exactly and inspect the n=0 convention and quantifiers for: 1+3+...+(2n-1)=n^2. {worker_shape} Do not call a finite no-counterexample search a proof; use result_type NO_PROGRESS unless a genuine counterexample exists; evidence_level E0_SPECULATIVE because this smoke writes no durable exact artifact; artifact_paths must be empty; do not repeat controller-owned claim identity or impact."
+                if domain == "math-research"
+                else
+                f"Act as an adversarial evidence challenger for {domain}. Inspect the frozen claim and controller-verified receipt summary without running any benchmark: claim={smoke_spec['statement']}; receipts={json.dumps(receipt_summary, ensure_ascii=False, sort_keys=True)}. {worker_shape} Look for protocol mismatch, infrastructure failure, overgeneralization, or missing replication. Use result_type NO_PROGRESS when no concrete defect is found, evidence_level E0_SPECULATIVE, and empty artifact_paths. Do not label finite evidence PROVED."
+            )
+            producer_future = asyncio.create_task(turn(
                 "prover",
-                f"Act as the bounded Prover. Give a rigorous induction or telescoping proof of: for every integer n>=0, 1+3+...+(2n-1)=n^2. {worker_shape} Use result_type PROOF only if complete; evidence_level E0_SPECULATIVE because this is an informal proof; artifact_paths must be empty; claim identity, impact, and trust status are controller-owned and forbidden.",
+                producer_prompt,
                 schemas["worker"], per_turn,
             ))
-            falsifier_future = asyncio.create_task(turn(
+            challenger_future = asyncio.create_task(turn(
                 "falsifier",
-                f"Act as an adversarial Falsifier. Check n=0 through n=20 exactly and inspect the n=0 convention and quantifiers for: 1+3+...+(2n-1)=n^2. {worker_shape} Do not call a finite no-counterexample search a proof; use result_type NO_PROGRESS unless a genuine counterexample exists; evidence_level E0_SPECULATIVE because this smoke writes no durable exact artifact; artifact_paths must be empty; do not repeat controller-owned claim identity or impact.",
+                challenger_prompt,
                 schemas["worker"], per_turn,
             ))
             research_results = await asyncio.gather(
-                prover_future, falsifier_future, return_exceptions=True,
+                producer_future, challenger_future, return_exceptions=True,
             )
             first_error = next(
                 (item for item in research_results if isinstance(item, BaseException)),
@@ -605,15 +815,21 @@ async def run_real_smoke(
             )
             if first_error is not None:
                 raise first_error
-            (prover, prover_record), _ = research_results  # type: ignore[misc]
+            (producer, producer_record), _ = research_results  # type: ignore[misc]
             store.append("CONCURRENT_RESEARCH_CONFIRMED", {
                 "roles": ["prover", "falsifier"],
-                "prover_thread": prover_record["thread_id"],
+                "producer_thread": producer_record["thread_id"],
+                "domain": domain,
             })
             require_dispatch_budget("auditor")
-            if prover["result_type"] != "PROOF":
-                raise RuntimeError("smoke prover did not produce a proof candidate")
-            event = _toy_candidate(graph, prover, prover_record)
+            if producer["result_type"] != smoke_spec["producer_result_type"]:
+                raise RuntimeError(
+                    "smoke producer did not produce the domain candidate type"
+                )
+            event = _toy_candidate(
+                graph, producer, producer_record, spec=smoke_spec,
+                evidence_receipts=evidence_references,
+            )
             atomic_write_json(
                 run_dir / "candidates" / f"{event.fingerprint}.json", event.to_dict(),
             )
@@ -623,14 +839,24 @@ async def run_real_smoke(
                 "fingerprint": event.fingerprint, "claim_id": event.claim_id,
                 "impact": event.impact,
             })
+            audit_role = (
+                "auditor" if domain == "math-research" else "evaluator_auditor"
+            )
+            audit_prompt = (
+                f"You are a fresh independent proof Auditor. You do not have the producer transcript. Audit this toy candidate from the exact statement only: {event.exact_statement} Reconstruct the proof independently; check n=0, quantifiers, induction base and step. Return JSON only with exactly these keys: {render_contract_keys(AUDIT_RESULT_KEYS)}. Use verdict PASS only if complete, verified_evidence_level E0_SPECULATIVE, checks as an array of objects, gaps as blocking strings, and notes as non-blocking strings. Candidate identity and audit metadata are controller-owned and must not be repeated."
+                if domain == "math-research"
+                else
+                f"You are a fresh independent evaluator for {domain}; you do not have the producer transcript. Audit the exact frozen claim {event.exact_statement} against only these controller-verified deterministic receipts: {json.dumps(receipt_summary, ensure_ascii=False, sort_keys=True)}. Return JSON only with exactly these keys: {render_contract_keys(AUDIT_RESULT_KEYS)}. Use verdict PASS only if every run exited without infrastructure failure, the protocol matches the claim, and the required {'replications are distinct' if domain == 'empirical-research' else 'certificate checker accepted'}. Set verified_evidence_level {smoke_spec['evidence_level']}; checks must be objects, gaps blocking strings, and notes non-blocking strings. Never call empirical evidence PROVED and do not repeat controller-owned identity or trust metadata."
+            )
             audit, audit_record = await turn(
-                "auditor",
-                f"You are a fresh independent proof Auditor. You do not have the producer transcript. Audit this toy candidate from the exact statement only: {event.exact_statement} Reconstruct the proof independently; check n=0, quantifiers, induction base and step. Return JSON only with exactly these keys: {render_contract_keys(AUDIT_RESULT_KEYS)}. Use verdict PASS only if complete, verified_evidence_level E0_SPECULATIVE, checks as an array of objects, gaps as blocking strings, and notes as non-blocking strings. Candidate identity and audit metadata are controller-owned and must not be repeated.",
+                audit_role,
+                audit_prompt,
                 schemas["audit"], per_turn,
             )
             gate = AuditGate(
                 high_threshold=config.raw["audit"].get("immediate_threshold", "HIGH"),
                 critical_double_audit=bool(config.raw["audit"].get("critical_double_audit", True)),
+                semantics=graph.semantics,
             )
             state = gate.register(event)
             audit_result = AuditResult.from_wire_v2(
@@ -638,7 +864,7 @@ async def run_real_smoke(
                 audit_id=f"smoke-audit-{uuid4().hex[:10]}",
                 candidate_fingerprint=event.fingerprint,
                 auditor_thread_id=audit_record["thread_id"],
-                audit_kind="proof",
+                audit_kind=str(smoke_spec["audit_kind"]),
                 statement_checked=event.exact_statement,
                 report_path=None,
             )
@@ -651,9 +877,15 @@ async def run_real_smoke(
                     event, gate.pass_count(event.fingerprint), state.required,
                     gate.verified_evidence_level(event.fingerprint),
                 )
+                if graph.claims[event.claim_id].research_status != smoke_spec[
+                    "terminal_status"
+                ]:
+                    raise RuntimeError("smoke audit did not apply the domain transition")
                 store.append("TRUST_STATE_CHANGED", {
                     "claim_id": event.claim_id,
                     "trust_status": "AUDITED_NIGHTLY", "scope": "SMOKE_ONLY",
+                    "domain": domain,
+                    "research_status": graph.claims[event.claim_id].research_status,
                 })
             elif audit_result.verdict == "REJECT":
                 store.append("CANDIDATE_REJECTED", {
@@ -675,7 +907,7 @@ async def run_real_smoke(
         payload = {
             "failure_kind": kind, "retryable": retryable,
             "error": _redact_text(str(exc)), "server_error": _server_error(exc),
-            "schema_role": schema_role,
+            "schema_role": schema_role, "domain": domain,
         }
         if isinstance(exc, OutputSchemaCompatibilityError):
             store.append("SCHEMA_PREFLIGHT_FAILED", payload)
@@ -733,6 +965,7 @@ async def run_real_smoke(
     if failure is None:
         store.append("SMOKE_COMPLETED", {
             "canonical_changed": changed, "schema_role": schema_role,
+            "domain": domain,
         })
     store.append("RUN_STOPPED", {
         "reason": stopped_reason,
@@ -751,6 +984,10 @@ async def run_real_smoke(
     )
     atomic_write_json(report_path.parent / "SMOKE_SUMMARY.json", {
         "run_id": run_id, "report": str(report_path), "jobs": jobs,
+        "domain": domain,
+        "claim_id": smoke_spec["claim_id"],
+        "research_status": graph.claims[str(smoke_spec["claim_id"])].research_status,
+        "deterministic_evidence_receipts": evidence_references,
         "capabilities": str(run_dir / "app_server_capabilities.json"),
         "policy_manifest": str(policy_path),
         "policy_manifest_sha256": (

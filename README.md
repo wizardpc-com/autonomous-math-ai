@@ -159,8 +159,10 @@ before a model turn; startup refresh never rewrites canonical project files.
 
 Audit-gated claim changes atomically commit the ClaimGraph and its digest-bound
 trusted metadata. Each transition keeps append-only authorization plus before
-and after snapshots for audit and crash replay. It never rewrites `CLAIMS.md`
-or `PROGRESS.md` automatically.
+and after snapshots for audit and crash replay. When a canonical Markdown file
+contains the explicit AMR machine-state markers, the same authorized transition
+replaces only that generated block; bytes outside the markers are preserved.
+Unmarked `CLAIMS.md` and `PROGRESS.md` remain untouched.
 
 `amr init` generates a neutral example that can live in any directory. The
 engine does not require this source repository, a particular parent directory,

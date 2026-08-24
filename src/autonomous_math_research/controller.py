@@ -48,6 +48,7 @@ from .director_context import (
 )
 from .domain_semantics import domain_semantics_from_contract
 from .engine import DynamicScheduler
+from .experiment import ExperimentRunner
 from .lifecycle import (
     AuditLeaseBook, AuditLeaseStatus, MonotoneLifecycle, RouteLedger,
     write_core_capsule, write_research_map,
@@ -106,7 +107,9 @@ from .storage import (
     read_jsonl,
 )
 from .storage import ArtifactStore
-from .storage.artifacts import PORTABLE_SCHEMES, resolve_portable_uri
+from .storage.artifacts import (
+    PORTABLE_SCHEMES, portable_project_uri, resolve_portable_uri,
+)
 from .token_governor import TokenGovernor
 from .workspace import WorkspaceManager
 
@@ -916,6 +919,7 @@ class AutonomousController:
         self.stop_for_review: str | None = None
         self.conflicted_candidates: set[str] = set()
         self.candidate_artifact_hashes: dict[str, dict[str, str]] = {}
+        self.domain_evidence_receipts: dict[str, list[dict[str, Any]]] = {}
         self._schema_cache: dict[str, dict[str, Any]] = {}
         self._internal_failure = False
         self._dry_run = False
@@ -1968,20 +1972,15 @@ class AutonomousController:
             graph_payload=graph_payload,
             graph_digest=graph_digest,
         )
-        conflicting_views = [
-            path for path, payload in markdown_updates.items()
-            if path.read_bytes() != payload
-        ]
-        if conflicting_views:
-            raise ValueError(
-                "canonical transition would make a marked Markdown state view stale; "
-                "AMR will not rewrite canonical Markdown automatically"
-            )
         targets = {
             self.layout.claim_graph_path: graph_payload_bytes,
             self.layout.trusted_state_path: json_bytes(
                 self._trusted_state_payload(transition_kind=transition_kind)
             ),
+            **{
+                path: payload for path, payload in markdown_updates.items()
+                if path.read_bytes() != payload
+            },
         }
         transition_id = self.canonical_transitions.commit(
             targets=targets,
@@ -2076,6 +2075,10 @@ class AutonomousController:
             validate_canonical_state(state, run_dir=self.run_dir)
             changed = verify_live_startup_sources(
                 state, project_root=self.config.project_root, run_dir=self.run_dir,
+                authorized_sha256=(
+                    self.canonical_transitions.current_target_digests()
+                    if self.persist_shared_state else None
+                ),
             )
             if changed:
                 raise ValueError(
@@ -2125,27 +2128,28 @@ class AutonomousController:
             raise ValueError("startup canonical state has not been refreshed")
         if self.config.manifest is None:
             raise ValueError("project manifest is unavailable during state validation")
-        committed_transition = False
-        if self.persist_shared_state:
-            self.canonical_transitions.verify_current()
-            committed_transition = any(
-                record.get("kind") == "COMMITTED"
-                for record in self.canonical_transitions.records()
+        authorized_sha256 = (
+            self.canonical_transitions.current_target_digests()
+            if self.persist_shared_state else {}
+        )
+        for key, path in (
+            ("claim_graph", self.layout.claim_graph_path),
+            ("trusted_state", self.layout.trusted_state_path),
+        ):
+            reference = portable_project_uri(self.config.project_root, path)
+            expected = authorized_sha256.get(
+                reference, str(self._canonical_state[key]["sha256"])
             )
-        if not committed_transition:
-            for key, path in (
-                ("claim_graph", self.layout.claim_graph_path),
-                ("trusted_state", self.layout.trusted_state_path),
-            ):
-                if file_digest(path) != self._canonical_state[key]["sha256"]:
-                    raise ValueError(
-                        f"canonical {key} changed outside an audited transition"
-                    )
+            if file_digest(path) != expected:
+                raise ValueError(
+                    f"canonical {key} changed outside an audited transition"
+                )
         validate_canonical_research_state(self.config.manifest)
         changed = verify_live_startup_sources(
             self._canonical_state,
             project_root=self.config.project_root,
             run_dir=self.run_dir,
+            authorized_sha256=authorized_sha256,
         )
         if changed:
             raise ValueError(
@@ -3028,6 +3032,9 @@ class AutonomousController:
         self, source_run_id: str, candidates: list[CandidateEvent],
     ) -> None:
         for event in candidates:
+            verified_receipts = self._verify_domain_evidence_receipts(
+                event, extend_artifacts=False,
+            )
             artifact_hashes = self._bind_candidate_artifacts(event)
             self.graph.mark_candidate(event)
             self.inbox.persist(event)
@@ -3048,6 +3055,9 @@ class AutonomousController:
                 "proposed_evidence_level": event.proposed_evidence_level,
                 "source_run_id": source_run_id,
                 "artifact_hashes": artifact_hashes,
+                "domain_evidence_receipt_fingerprints": [
+                    item["receipt_fingerprint"] for item in verified_receipts
+                ],
             })
             self.satisfied_route_conditions.update({
                 event.fingerprint, f"new_evidence:{event.claim_id}",
@@ -3333,6 +3343,9 @@ class AutonomousController:
                 candidate_path = self.inbox.candidate_root / f"{fingerprint}.json"
                 if candidate_path.exists():
                     candidate = CandidateEvent.from_dict(json.loads(candidate_path.read_text(encoding="utf-8")))
+                    verified_receipts = self._verify_domain_evidence_receipts(
+                        candidate, extend_artifacts=False,
+                    )
                     self.inbox.persisted.add(fingerprint)
                     self.audit_gate.register(candidate)
                     recorded_hashes = event["payload"].get("artifact_hashes")
@@ -3343,6 +3356,15 @@ class AutonomousController:
                         self.candidate_artifact_hashes[fingerprint] = dict(recorded_hashes)
                     else:
                         self._bind_candidate_artifacts(candidate)
+                    recorded_receipts = event["payload"].get(
+                        "domain_evidence_receipt_fingerprints", []
+                    )
+                    if recorded_receipts != [
+                        item["receipt_fingerprint"] for item in verified_receipts
+                    ]:
+                        raise ValueError(
+                            "candidate domain evidence receipt binding changed during resume"
+                        )
                     self.inbox.mark_processed(candidate, self.run_id, accepted=True)
             elif event["kind"] == "JOB_COMPLETED":
                 payload = event["payload"]
@@ -4803,6 +4825,9 @@ class AutonomousController:
             if expected_fingerprint and event.fingerprint != expected_fingerprint:
                 raise ValueError("previous epoch candidate fingerprint changed")
             hashes = dict(raw.get("artifact_hashes") or {})
+            self._verify_domain_evidence_receipts(
+                event, extend_artifacts=False,
+            )
             artifacts_ok, observed = self.artifact_store.verify(hashes)
             if not artifacts_ok:
                 raise ValueError(
@@ -5911,11 +5936,17 @@ class AutonomousController:
         workspace, writable, metadata = self.workspace.create_job_workspace(
             task.task_id, job_id=job_id,
         )
+        snapshot_input = self.workspace.materialize_input(workspace, snapshot)
+        full_context_input = self.workspace.materialize_input(workspace, full_context)
+        history_input = self.workspace.materialize_input(
+            workspace, self.run_dir / "EVENTS.jsonl",
+        )
+        task.required_files = [str(snapshot_input), str(full_context_input)]
         packet = self.workspace.write_task_packet(workspace, {
             "task": task.to_dict(),
-            "compact_snapshot": str(snapshot),
-            "full_context_archive": str(full_context),
-            "history_archive": str(self.run_dir / "EVENTS.jsonl"),
+            "compact_snapshot": str(snapshot_input),
+            "full_context_archive": str(full_context_input),
+            "history_archive": str(history_input),
             "constraints": self.director_constraints,
             "output_protocol_version": OUTPUT_PROTOCOL_VERSION,
             "state_version": snapshot_version,
@@ -5924,11 +5955,11 @@ class AutonomousController:
         })
         try:
             prompt = director_prompt(
-                self.config.project_root, snapshot, self.director_constraints,
+                self.config.project_root, snapshot_input, self.director_constraints,
                 self._policy_view(Role.DIRECTOR),
                 project_overlay=self._director_overlay,
                 task_packet_path=packet,
-                full_context_path=full_context,
+                full_context_path=full_context_input,
             )
             prompt_bytes = enforce_director_prompt_limit(prompt)
             self._start_job(
@@ -6108,6 +6139,9 @@ class AutonomousController:
                 self.governor.release(job_id)
                 raise
         try:
+            skill_path = self.workspace.materialize_input(
+                workspace, Path(self._policy_view(task.role)["skill_snapshot"]),
+            )
             backend_kwargs: dict[str, Any] = {
                 "job_id": job_id,
                 "task": task,
@@ -6120,7 +6154,7 @@ class AutonomousController:
                 "candidate_sink": lambda event, assigned=task: self._candidate_sink(
                     event, assigned
                 ),
-                "skill_path": Path(self._policy_view(task.role)["skill_snapshot"]),
+                "skill_path": skill_path,
             }
             if same_thread_research:
                 backend_kwargs["turn_controller"] = (
@@ -7135,6 +7169,96 @@ class AutonomousController:
             "E3 requires an independent evaluator and E5 requires a dedicated kernel gate"
         )
 
+    def _verify_domain_evidence_receipts(
+        self,
+        event: CandidateEvent,
+        *,
+        extend_artifacts: bool,
+    ) -> list[dict[str, Any]]:
+        checker_required = self.domain_semantics.requires_deterministic_checker(
+            event.type
+        )
+        protocol_required = self.domain_semantics.requires_frozen_protocol(event.type)
+        if not checker_required and not protocol_required:
+            if event.evidence_receipts:
+                raise ValueError(
+                    f"{event.type} does not accept deterministic domain evidence receipts"
+                )
+            self.domain_evidence_receipts.pop(event.fingerprint, None)
+            return []
+        if not event.evidence_receipts:
+            required = (
+                "deterministic checker" if checker_required else "frozen experiment"
+            )
+            raise ValueError(f"{event.type} requires a verified {required} receipt")
+
+        expected_kind = (
+            "deterministic_checker_run" if checker_required else "experiment_run"
+        )
+        runner = ExperimentRunner(self.config.project_root)
+        verified: list[dict[str, Any]] = []
+        for reference in event.evidence_receipts:
+            if reference["kind"] != expected_kind:
+                raise ValueError(
+                    f"{event.type} requires {expected_kind} evidence receipts"
+                )
+            receipt = runner.verify_receipt(
+                Path(reference["manifest_path"]),
+                run_id=reference["run_id"],
+            )
+            cases = list(receipt["cases"])
+            if not cases:
+                raise ValueError("domain evidence receipt contains no experiment cases")
+            for case in cases:
+                if (
+                    case["termination"] != "EXITED"
+                    or case["infrastructure_failure"] is not None
+                ):
+                    raise ValueError(
+                        "infrastructure failure cannot support a domain claim transition"
+                    )
+                if checker_required and case["exit_code"] != 0:
+                    raise ValueError(
+                        "deterministic checker receipt contains a nonzero checker result"
+                    )
+            verified.append({
+                "kind": reference["kind"],
+                **receipt,
+            })
+
+        if len({item["run_id"] for item in verified}) != len(verified):
+            raise ValueError("domain evidence receipts must name distinct runs")
+        if extend_artifacts:
+            existing = set(event.artifact_paths)
+            for receipt in verified:
+                for relative in receipt["artifact_paths"]:
+                    path = (self.config.project_root / relative).resolve()
+                    uri = portable_project_uri(self.config.project_root, path)
+                    if uri not in existing:
+                        event.artifact_paths.append(uri)
+                        existing.add(uri)
+        self.domain_evidence_receipts[event.fingerprint] = verified
+        return verified
+
+    def _validate_domain_audit_evidence(
+        self,
+        event: CandidateEvent,
+        verified_evidence_level: str,
+    ) -> list[dict[str, Any]]:
+        receipts = self._verify_domain_evidence_receipts(
+            event, extend_artifacts=False,
+        )
+        if (
+            self.domain_semantics.requires_frozen_protocol(event.type)
+            and evidence_rank(verified_evidence_level)
+            >= evidence_rank(EvidenceLevel.E3_REDUNDANT_EXACT)
+            and len({item["run_id"] for item in receipts}) < 2
+        ):
+            raise ValueError(
+                "E3_REDUNDANT_EXACT empirical evidence requires two distinct verified runs"
+            )
+        return receipts
+
     def _bind_candidate_artifacts(self, event: CandidateEvent) -> dict[str, str]:
         hashes = self.artifact_store.seal_candidate(event)
         self.candidate_artifact_hashes[event.fingerprint] = hashes
@@ -7192,10 +7316,14 @@ class AutonomousController:
                 self._validate_candidate_provenance(event)
                 self._validate_final_target_candidate(event)
                 self._validate_candidate_evidence(event)
+                verified_receipts = self._verify_domain_evidence_receipts(
+                    event, extend_artifacts=True,
+                )
                 artifact_hashes = self._bind_candidate_artifacts(event)
                 self.graph.mark_candidate(event)
             except ValueError as exc:
                 self.candidate_artifact_hashes.pop(event.fingerprint, None)
+                self.domain_evidence_receipts.pop(event.fingerprint, None)
                 self.store.append("CANDIDATE_REJECTED", {
                     "event_id": event.event_id, "fingerprint": event.fingerprint,
                     "claim_id": event.claim_id, "reason": _sanitize_live_text(exc),
@@ -7219,6 +7347,9 @@ class AutonomousController:
                 "impact": event.impact,
                 "proposed_evidence_level": event.proposed_evidence_level,
                 "artifact_hashes": artifact_hashes,
+                "domain_evidence_receipt_fingerprints": [
+                    item["receipt_fingerprint"] for item in verified_receipts
+                ],
             })
             self._request_director(
                 f"candidate {event.fingerprint} entered the audit frontier",
@@ -7376,14 +7507,24 @@ class AutonomousController:
                     self.config.project_root / "claims" / "CLAIMS.md",
                 )
             )
+            canonical_inputs = tuple(
+                self.workspace.materialize_input(workspace, path)
+                for path in canonical_inputs
+            )
+            nightly_claim_graph = self.workspace.materialize_input(
+                workspace, self.active_graph_path,
+            )
             packet = self.workspace.write_task_packet(workspace, {
                 "candidate": event.to_dict(),
                 "candidate_artifact_hashes": expected_hashes,
+                "verified_domain_evidence_receipts": list(
+                    self.domain_evidence_receipts.get(event.fingerprint) or []
+                ),
                 "sealed_candidate_bundle_files": [
                     str(path) for path in sealed_bundle_files
                 ],
                 "canonical_inputs": [str(path) for path in canonical_inputs],
-                "nightly_claim_graph": str(self.active_graph_path),
+                "nightly_claim_graph": str(nightly_claim_graph),
                 "producer_transcript": None,
                 "research_policy": self._policy_view(task.role),
                 "workspace": metadata,
@@ -7547,6 +7688,12 @@ class AutonomousController:
             workspace, writable, metadata = self.workspace.create_job_workspace(
                 task.task_id, task.modifies_code, job_id=job_id,
             )
+            required_file_access = self.workspace.materialize_required_file_access(
+                workspace, required_file_access,
+            )
+            nightly_claim_graph = self.workspace.materialize_input(
+                workspace, self.active_graph_path,
+            )
             # The worker may submit a single validated event file, but cannot
             # write the controller-owned ledger, candidates, audits, or state.
             job_inbox = self._task_inbox(task.task_id)
@@ -7554,8 +7701,8 @@ class AutonomousController:
             writable = [*writable, job_inbox]
             packet = self.workspace.write_task_packet(workspace, {
                 "task": task.to_dict(), "workspace": metadata,
-                "canonical_project": str(self.config.project_root),
-                "nightly_claim_graph": str(self.active_graph_path),
+                "canonical_project": None,
+                "nightly_claim_graph": str(nightly_claim_graph),
                 "required_file_access": required_file_access,
                 "candidate_protocol": {
                     "assigned_claim_id": task.target_claim,
@@ -8181,21 +8328,37 @@ class AutonomousController:
         project = self.config.project_root.resolve()
         if raw.startswith(PORTABLE_SCHEMES):
             try:
-                return resolve_portable_uri(
+                resolved = resolve_portable_uri(
                     project, self.layout.autonomous_root, raw,
                 )
             except ValueError as exc:
                 raise ValueError(f"required file is unavailable: {raw}: {exc}") from exc
-        if "://" in raw:
-            raise ValueError(f"unsupported required file URI: {raw}")
-        path = Path(raw)
-        resolved = (
-            (project / path).resolve() if not path.is_absolute() else path.resolve()
-        )
+        else:
+            if "://" in raw:
+                raise ValueError(f"unsupported required file URI: {raw}")
+            path = Path(raw)
+            resolved = (
+                (project / path).resolve() if not path.is_absolute() else path.resolve()
+            )
         if not resolved.is_relative_to(project):
             raise ValueError(f"required file escapes project: {raw}")
         if not resolved.is_file():
             raise ValueError(f"required file is unavailable: {raw}")
+        relative_parts = [part.casefold() for part in resolved.relative_to(project).parts]
+        name = resolved.name.casefold()
+        if (
+            ".git" in relative_parts
+            or name == ".env"
+            or name.startswith(".env.")
+            or name in {
+                "auth.json", "credentials.json", "secrets.json",
+                "id_rsa", "id_ed25519",
+            }
+            or resolved.suffix.casefold() in {".key", ".pem", ".p12", ".pfx"}
+        ):
+            raise ValueError(
+                f"required file is blocked as potentially credential-bearing: {raw}"
+            )
         return resolved
 
     def _accept_audit_result(
@@ -8394,6 +8557,9 @@ class AutonomousController:
                         ),
                         "original_result": _bounded_value(original),
                     })
+            self._validate_domain_audit_evidence(
+                state.event, result.verified_evidence_level,
+            )
             trust = self.audit_gate.record(result)
             self.audit_leases.finish(audit_lease_id, result.verdict)
             self._clear_retry_counts(self.audit_retry_counts, fingerprint)
@@ -8528,6 +8694,10 @@ class AutonomousController:
                     "audit_pass_count": self.audit_gate.pass_count(fingerprint),
                     "audit_required": state.required,
                     "verified_evidence_level": verified_level,
+                    "domain_evidence_receipt_fingerprints": [
+                        item["receipt_fingerprint"]
+                        for item in self.domain_evidence_receipts.get(fingerprint, [])
+                    ],
                 },
             )
             if bridge is not None:
@@ -9573,6 +9743,7 @@ def build_mock_full_cycle_backend(
     dependencies: list[str] | None = None,
     domain: str = "math-research",
     evidence_path: str | None = None,
+    evidence_receipts: list[dict[str, str]] | None = None,
 ) -> MockCodexBackend:
     assumptions = list(assumptions or [])
     dependencies = list(dependencies or [])
@@ -9582,7 +9753,10 @@ def build_mock_full_cycle_backend(
         "empirical-research",
     }:
         raise ValueError(f"unsupported mock lifecycle domain: {domain}")
-    if domain != "math-research" and not evidence_path:
+    evidence_receipts = list(evidence_receipts or [])
+    if domain != "math-research" and (
+        not evidence_path or not evidence_receipts
+    ):
         raise ValueError("non-mathematical mock lifecycle requires deterministic evidence")
     if domain == "certified-computational-research":
         candidate_type = "CERTIFICATE"
@@ -9666,6 +9840,7 @@ def build_mock_full_cycle_backend(
         "parent_claim_id": None,
         "representation": {"branch":"LEGACY_UNSPECIFIED","localization":"LEGACY_UNSPECIFIED","saturation":"LEGACY_UNSPECIFIED","normalization":"LEGACY_UNSPECIFIED","content":"LEGACY_UNSPECIFIED","exceptional_factors":[],"combination_scope":"LEGACY_UNSPECIFIED"},
         "bridge_representation_ids": [],
+        "evidence_receipts": evidence_receipts,
         "proposed_evidence_level": proposed_evidence, "timestamp": utc_now(),
     }
     worker_result = {

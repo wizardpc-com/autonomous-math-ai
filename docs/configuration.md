@@ -51,6 +51,11 @@ those verified snapshots and reports installed-source drift; missing, modified,
 or rebound policy state fails closed. See
 [Research domains and policy packs](research-domains.md).
 
+`amr smoke` also uses this selector: math exercises the proof path, certified
+computation binds one deterministic checker receipt, and empirical research
+binds two distinct frozen-protocol receipts before independent evaluation.
+Schema-only smoke does not execute experiments.
+
 ## Fast mode
 
 Fast mode is one explicit project/profile switch and is off by default:

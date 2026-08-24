@@ -279,12 +279,14 @@ class AppServerBackend:
         trace_notification: Callable[[dict[str, Any]], Any] | None = None,
         *,
         provider_name: str = "codex",
+        read_roots: tuple[Path, ...] = (),
     ):
         self.config = config
         self.provider_name = provider_name
         self.client = AppServerClient(
             notification_handler=trace_notification,
             project_root=config.project_root,
+            read_roots=read_roots,
         )
         self.active: dict[str, tuple[str, str]] = {}
 

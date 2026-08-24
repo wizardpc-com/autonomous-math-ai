@@ -147,6 +147,29 @@ class CanonicalTransitionStore:
                     f"{target['path']}"
                 )
 
+    def current_target_digests(self) -> dict[str, str]:
+        """Return the exact live digests authorized by the latest transition."""
+        self.verify_current()
+        records = self.records()
+        committed = [item for item in records if item.get("kind") == "COMMITTED"]
+        if not committed:
+            return {}
+        transition_id = str(committed[-1]["transition_id"])
+        prepared = next(
+            (
+                item for item in reversed(records)
+                if item.get("kind") == "PREPARED"
+                and item.get("transition_id") == transition_id
+            ),
+            None,
+        )
+        if prepared is None:
+            raise ValueError("committed canonical transition lacks a prepared record")
+        return {
+            str(target["path"]): str(target["after_sha256"])
+            for target in prepared["targets"]
+        }
+
     def commit(
         self,
         *,

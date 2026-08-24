@@ -22,6 +22,14 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The monitor distinguishes a recoverable nonzero local-command exit from an
   actual App Server tool-call failure instead of reporting both as the same
   red tool error.
+- Role jobs now receive only controller-materialized, digest-verified inputs
+  instead of a static project-root read grant; credential-shaped requested
+  paths are rejected, and unreadable `PATH` entries fail closed.
+- App Server permission-profile and MCP-inventory pagination rejects repeated
+  cursors and excessive page counts instead of risking an unbounded startup.
+- Controller-authorized ClaimGraph transitions update an explicitly marked
+  Markdown machine-state block in the same crash-replayable transaction while
+  preserving surrounding prose.
 
 ### Added
 
@@ -32,6 +40,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   strict frozen-input manifests, content-addressed raw outputs, append-only
   per-case evidence, verified resume/checkpoint recovery, and an injected
   Docker adapter seam.
+- Read-only deterministic evidence receipts, v2 evidence-attempt candidate
+  identities, executable/environment provenance, scratch-tree subprocess
+  execution, and domain-aware real-provider smoke lifecycles.
 - Neutral certified-checker and frozen empirical-protocol fixtures and their
   documentation-only manifest schema.
 

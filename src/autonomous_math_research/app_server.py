@@ -148,14 +148,20 @@ def app_server_environment(
     for entry in existing.split(os.pathsep):
         if not entry:
             continue
-        entry_path = Path(entry.strip().strip('"')).expanduser()
-        normalized = os.path.normcase(str(entry_path.resolve()))
+        try:
+            entry_path = Path(entry.strip().strip('"')).expanduser()
+            normalized = os.path.normcase(str(entry_path.resolve()))
+            contains_codex = any(
+                (entry_path / name).is_file()
+                for name in ("codex", "codex.exe", "codex.cmd", "codex.bat")
+            )
+        except OSError:
+            # An unreadable PATH entry cannot be shown to be free of a
+            # recursive Codex entrypoint, so omit it fail-closed.
+            continue
         if blocked_directory is not None and normalized == blocked_directory:
             continue
-        if any(
-            (entry_path / name).is_file()
-            for name in ("codex", "codex.exe", "codex.cmd", "codex.bat")
-        ):
+        if contains_codex:
             continue
         entries.append(entry)
     if os.path.normcase(runtime_bin) not in {
@@ -242,6 +248,7 @@ def app_server_command(
     model_shell_path: str | None = None,
     runtime_read_roots: tuple[Path, ...] = (),
     blocked_executable: Path | None = None,
+    blocked_read_paths: tuple[Path, ...] = (),
 ) -> list[str]:
     root = (project_root or Path.cwd()).resolve()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", permission_profile):
@@ -255,11 +262,12 @@ def app_server_command(
         ":root": "deny",
         ":minimal": "read",
     }
-    filesystem_entries[str(root)] = "read"
     for path in runtime_read_roots:
         filesystem_entries[str(path.resolve())] = "read"
     if blocked_executable is not None:
         filesystem_entries[str(blocked_executable.resolve())] = "deny"
+    for path in blocked_read_paths:
+        filesystem_entries[str(path.resolve())] = "deny"
     filesystem = _toml_inline_string_map(filesystem_entries)
     filesystem = filesystem[:-2] + (
         ', ":workspace_roots" = { "." = "write" } }'
@@ -612,10 +620,12 @@ class AppServerClient:
         notification_handler: NotificationHandler | None = None,
         *,
         project_root: Path | None = None,
+        read_roots: tuple[Path, ...] = (),
     ):
         self.codex_executable = _resolve_codex(codex_executable)
         self.notification_handler = notification_handler
         self.project_root = project_root.resolve() if project_root is not None else None
+        self.read_roots = tuple(path.resolve() for path in read_roots)
         self.permission_profile = f"amr-role-{uuid4().hex[:16]}"
         self.process: subprocess.Popen[bytes] | None = None
         self._reader_thread: threading.Thread | None = None
@@ -789,6 +799,17 @@ class AppServerClient:
         path_key = next(
             (key for key in environment if key.upper() == "PATH"), "PATH",
         )
+        codex_home = environment.get("CODEX_HOME")
+        blocked_read_paths = (
+            tuple(
+                Path(str(codex_home)) / name
+                for name in (
+                    "auth.json", "config.toml", "credentials.json",
+                    ".credentials.json",
+                )
+            )
+            if codex_home else ()
+        )
         process = subprocess.Popen(
             app_server_command(
                 self.codex_executable,
@@ -796,8 +817,13 @@ class AppServerClient:
                 permission_profile=self.permission_profile,
                 mcp_server_names=mcp_server_names,
                 model_shell_path=str(environment.get(path_key) or ""),
-                runtime_read_roots=(Path(sys.executable).resolve().parent,),
+                runtime_read_roots=tuple(dict.fromkeys((
+                    Path(sys.executable).resolve().parent,
+                    Path(__file__).resolve().parent,
+                    *self.read_roots,
+                ))),
                 blocked_executable=Path(self.codex_executable),
+                blocked_read_paths=blocked_read_paths,
             ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -840,7 +866,14 @@ class AppServerClient:
 
     async def _attest_permission_profile_available(self) -> None:
         cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages = 0
         while True:
+            pages += 1
+            if pages > 1_000:
+                raise AppServerError(
+                    "App Server permission profile pagination exceeded 1000 pages"
+                )
             response = await self.request("permissionProfile/list", {
                 "cursor": cursor,
                 "limit": 100,
@@ -864,11 +897,21 @@ class AppServerClient:
                 )
             if not isinstance(next_cursor, str) or not next_cursor:
                 raise AppServerError("App Server permission profile cursor is invalid")
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise AppServerError("App Server permission profile cursor repeated")
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
 
     async def _attest_no_mcp_servers(self) -> None:
         cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages = 0
         while True:
+            pages += 1
+            if pages > 1_000:
+                raise AppServerError(
+                    "App Server MCP inventory pagination exceeded 1000 pages"
+                )
             response = await self.request("mcpServerStatus/list", {
                 "cursor": cursor,
                 "limit": 100,
@@ -909,6 +952,9 @@ class AppServerClient:
                 return
             if not isinstance(next_cursor, str) or not next_cursor:
                 raise AppServerError("App Server MCP inventory cursor is invalid")
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise AppServerError("App Server MCP inventory cursor repeated")
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
 
     async def close(self) -> None:

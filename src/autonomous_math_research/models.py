@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 import json
+from pathlib import PurePosixPath
+import re
 from typing import Any
 
 from .contracts import (
@@ -392,6 +394,9 @@ class CandidateEvent:
         default_factory=lambda: RepresentationContract.legacy().to_dict()
     )
     bridge_representation_ids: list[str] = field(default_factory=list)
+    evidence_receipts: list[dict[str, str]] = field(default_factory=list)
+    fingerprint_version: int = 1
+    evidence_attempt_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CandidateEvent":
@@ -407,6 +412,9 @@ class CandidateEvent:
             "proposed_evidence_level", "parent_claim_id", "source_run_id",
             "representation",
             "bridge_representation_ids",
+            "evidence_receipts",
+            "fingerprint_version",
+            "evidence_attempt_id",
         }
         missing = required - set(data)
         if missing:
@@ -424,6 +432,22 @@ class CandidateEvent:
         normalized.setdefault("proposed_evidence_level", EvidenceLevel.E0_SPECULATIVE)
         normalized.setdefault("representation", RepresentationContract.legacy().to_dict())
         normalized.setdefault("bridge_representation_ids", [])
+        normalized.setdefault("evidence_receipts", [])
+        normalized.setdefault("fingerprint_version", 1)
+        normalized.setdefault("evidence_attempt_id", None)
+        if type(normalized["fingerprint_version"]) is not int or normalized[
+            "fingerprint_version"
+        ] not in {1, 2}:
+            raise ValueError("fingerprint_version must be 1 or 2")
+        attempt_id = normalized["evidence_attempt_id"]
+        if normalized["fingerprint_version"] == 1:
+            if attempt_id is not None:
+                raise ValueError("legacy candidate fingerprint cannot set evidence_attempt_id")
+        elif (
+            not isinstance(attempt_id, str)
+            or not re.fullmatch(r"attempt-[0-9a-f]{64}", attempt_id)
+        ):
+            raise ValueError("candidate v2 requires a valid evidence_attempt_id")
         normalized["representation"] = RepresentationContract.from_dict(
             normalized["representation"]
         ).to_dict()
@@ -438,6 +462,56 @@ class CandidateEvent:
                 raise ValueError("REPRESENTATION_BRIDGE must bind exactly two representations")
         elif bridge_ids:
             raise ValueError("only REPRESENTATION_BRIDGE may set bridge_representation_ids")
+        receipts = normalized["evidence_receipts"]
+        if not isinstance(receipts, list):
+            raise ValueError("evidence_receipts must be an array")
+        normalized_receipts: list[dict[str, str]] = []
+        for index, receipt in enumerate(receipts):
+            if not isinstance(receipt, dict) or set(receipt) != {
+                "kind", "manifest_path", "run_id",
+            }:
+                raise ValueError(f"evidence_receipts[{index}] fields are invalid")
+            kind = receipt["kind"]
+            if kind not in {"deterministic_checker_run", "experiment_run"}:
+                raise ValueError(f"evidence_receipts[{index}].kind is invalid")
+            manifest_path = receipt["manifest_path"]
+            if (
+                not isinstance(manifest_path, str)
+                or not manifest_path
+                or "\\" in manifest_path
+            ):
+                raise ValueError(
+                    f"evidence_receipts[{index}].manifest_path must be project-relative"
+                )
+            normalized_path = PurePosixPath(manifest_path)
+            if (
+                normalized_path.is_absolute()
+                or ".." in normalized_path.parts
+                or normalized_path.as_posix() != manifest_path
+                or (normalized_path.parts and normalized_path.parts[0].endswith(":"))
+            ):
+                raise ValueError(
+                    f"evidence_receipts[{index}].manifest_path must be project-relative"
+                )
+            run_id = receipt["run_id"]
+            if (
+                not isinstance(run_id, str)
+                or not run_id.startswith("run-")
+                or len(run_id) != 68
+                or any(ch not in "0123456789abcdef" for ch in run_id[4:])
+            ):
+                raise ValueError(f"evidence_receipts[{index}].run_id is invalid")
+            normalized_receipts.append({
+                "kind": kind,
+                "manifest_path": manifest_path,
+                "run_id": run_id,
+            })
+        if len({
+            (item["kind"], item["manifest_path"], item["run_id"])
+            for item in normalized_receipts
+        }) != len(normalized_receipts):
+            raise ValueError("evidence_receipts contains duplicates")
+        normalized["evidence_receipts"] = normalized_receipts
         evidence_rank(str(normalized["proposed_evidence_level"]))
         obj = cls(**normalized)
         if obj.parent_claim_id and obj.claim_id == "AUTO_DERIVED":
@@ -449,7 +523,7 @@ class CandidateEvent:
 
     @property
     def fingerprint(self) -> str:
-        return stable_hash({
+        payload: dict[str, Any] = {
             "claim_id": self.claim_id,
             "parent_claim_id": self.parent_claim_id,
             "type": self.type,
@@ -458,7 +532,16 @@ class CandidateEvent:
             "dependencies": sorted(self.dependencies),
             "representation_id": self.representation_id,
             "bridge_representation_ids": sorted(self.bridge_representation_ids),
-        })
+        }
+        if self.evidence_receipts:
+            payload["evidence_receipts"] = sorted(
+                self.evidence_receipts,
+                key=lambda item: (item["kind"], item["manifest_path"], item["run_id"]),
+            )
+        if self.fingerprint_version == 2:
+            payload["fingerprint_version"] = 2
+            payload["evidence_attempt_id"] = self.evidence_attempt_id
+        return stable_hash(payload)
 
     @property
     def representation_contract(self) -> RepresentationContract:

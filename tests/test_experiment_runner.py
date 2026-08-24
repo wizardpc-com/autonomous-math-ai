@@ -4,9 +4,11 @@ from contextlib import redirect_stdout
 from hashlib import sha256
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from autonomous_math_research.experiment import (
     ExperimentExecution,
@@ -133,6 +135,15 @@ class ExperimentRunnerTests(TempProjectMixin, unittest.TestCase):
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
         self.assertEqual(run_manifest["provenance"]["config_sha256"], expected_config_hash)
+        execution_environment = run_manifest["provenance"]["execution_environment"]
+        self.assertEqual(
+            execution_environment["isolation"], "materialized-declared-inputs"
+        )
+        self.assertFalse(execution_environment["network_isolated"])
+        self.assertEqual(
+            execution_environment["executables"][0]["sha256"],
+            file_digest(Path(sys.executable)),
+        )
 
         ledger = self._ledger(summary.root / "RAW_RESULTS.jsonl")
         self.assertEqual([item["sequence"] for item in ledger], [1, 2])
@@ -156,6 +167,31 @@ class ExperimentRunnerTests(TempProjectMixin, unittest.TestCase):
         )
         self.assertEqual(stdout.read_bytes(), expected_stdout)
         self.assertIn(b"alpha-err", stderr.read_bytes())
+
+    def test_subprocess_uses_scrubbed_environment_and_scratch_working_tree(self) -> None:
+        marker = self.project / "runner-relative-output.txt"
+        path = self._write_manifest(self._manifest_data([
+            self._case(
+                "isolated",
+                "import os; from pathlib import Path; "
+                "Path('runner-relative-output.txt').write_text('scratch'); "
+                "print(os.getenv('AMR_EXPERIMENT_TEST_SECRET')); "
+                "print(os.getenv('PYTHONHASHSEED')); print(os.getenv('TZ'))",
+            ),
+        ]))
+
+        with patch.dict(
+            os.environ, {"AMR_EXPERIMENT_TEST_SECRET": "must-not-leak"},
+            clear=False,
+        ):
+            summary = ExperimentRunner(self.project).run(path)
+
+        self.assertFalse(marker.exists())
+        entry = self._ledger(summary.root / "RAW_RESULTS.jsonl")[0]
+        stdout = (summary.root / str(entry["stdout_path"])).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(stdout, ["None", "0", "UTC"])
 
     def test_resume_never_reruns_or_overwrites_completed_raw_cases(self) -> None:
         path = self._write_manifest(self._manifest_data([
@@ -184,6 +220,27 @@ class ExperimentRunnerTests(TempProjectMixin, unittest.TestCase):
         }, before)
         with self.assertRaises(FileExistsError):
             runner.run(path)
+
+    def test_completed_run_receipt_is_verified_without_execution(self) -> None:
+        path = self._write_manifest(self._manifest_data([
+            self._case("one", "print('one')"),
+        ]))
+        runner = ExperimentRunner(self.project)
+        summary = runner.run(path)
+
+        receipt = runner.verify_receipt(path, run_id=summary.run_id)
+
+        self.assertEqual(receipt["run_id"], summary.run_id)
+        self.assertEqual(receipt["experiment_fingerprint"], summary.experiment_fingerprint)
+        self.assertEqual([item["case_id"] for item in receipt["cases"]], ["one"])
+        self.assertEqual(receipt["cases"][0]["termination"], "EXITED")
+        self.assertIn("receipt_fingerprint", receipt)
+        self.assertIn(
+            "experiments/frozen-protocol.txt", receipt["artifact_paths"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "run_id"):
+            runner.verify_receipt(path, run_id="run-" + "0" * 64)
 
     def test_resume_recovers_a_durable_case_record_missing_only_ledger_tail(self) -> None:
         path = self._write_manifest(self._manifest_data([
@@ -311,6 +368,7 @@ class ExperimentRunnerTests(TempProjectMixin, unittest.TestCase):
         )
         self.assertEqual(record["execution"]["termination"], "INPUT_MUTATED")
         self.assertEqual(record["research_result"]["status"], "UNINTERPRETED")
+        self.assertEqual(self.protocol.read_text(encoding="utf-8"), "protocol-v1\n")
 
     def test_strict_manifest_rejects_unknown_fields_bad_hash_and_duplicate_json_key(self) -> None:
         data = self._manifest_data([self._case("one", "print('one')")])

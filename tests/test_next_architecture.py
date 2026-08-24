@@ -12,6 +12,8 @@ from uuid import uuid4
 from autonomous_math_research.claim_graph import ClaimGraph
 from autonomous_math_research.backend import MockCodexBackend
 from autonomous_math_research.canonical_state import (
+    MARKDOWN_STATE_BEGIN,
+    MARKDOWN_STATE_END,
     render_markdown_state_block,
     validate_canonical_mathematical_state,
 )
@@ -654,6 +656,73 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertIn("Markdown state conflicts", result.stopped_reason)
         self.assertEqual(backend.calls, [])
         self.assertEqual(claims.read_bytes(), before)
+
+    @patch(
+        "autonomous_math_research.provenance._codex_capability",
+        return_value={},
+    )
+    @patch(
+        "autonomous_math_research.provenance._codex_identity",
+        return_value={
+            "codex_cli_version": "test-codex",
+            "app_server_schema_sha256": "1" * 64,
+            "app_server_required_protocol_sha256": "2" * 64,
+        },
+    )
+    def test_authorized_transition_updates_only_marked_markdown_state_block(
+        self, _codex_identity_mock, _codex_capability_mock,
+    ) -> None:
+        manifest = ProjectManifest.load(self.project)
+        graph_path = manifest.resolve(manifest.claim_graph)
+        graph_payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        claims = self.project / "claims" / "CLAIMS.md"
+        prefix = claims.read_text(encoding="utf-8") + "\nHuman prose before.\n\n"
+        suffix = "\n\nHuman prose after.\n"
+        claims.write_text(
+            prefix + render_markdown_state_block(
+                graph_payload, file_digest(graph_path),
+            ) + suffix,
+            encoding="utf-8",
+        )
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="marked-state-transition", campaign_id="marked-state-transition",
+        )
+        controller._pin_run_inputs(0.01, False)
+        controller.graph.claims["C_ROOT"].priority["score"] = 0.875
+
+        transition_id = controller._commit_claim_state_transition(
+            transition_kind="CONTROLLER_PRIORITY_UPDATE",
+            authorization={
+                "claim_id": "C_ROOT",
+                "task_id": "marked-state-task",
+                "reason": "exercise controller-owned Markdown projection",
+                "trust_upgrade": False,
+            },
+        )
+
+        updated = claims.read_text(encoding="utf-8")
+        start = updated.index(MARKDOWN_STATE_BEGIN)
+        end = updated.index(MARKDOWN_STATE_END, start) + len(MARKDOWN_STATE_END)
+        self.assertEqual(updated[:start], prefix)
+        self.assertEqual(updated[end:], suffix)
+        live_graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            updated[start:end],
+            render_markdown_state_block(live_graph, file_digest(graph_path)),
+        )
+        self.assertIsNotNone(transition_id)
+        prepared = next(
+            item for item in controller.canonical_transitions.records()
+            if item["kind"] == "PREPARED"
+            and item["transition_id"] == transition_id
+        )
+        self.assertIn(
+            "project://claims/CLAIMS.md",
+            {item["path"] for item in prepared["targets"]},
+        )
+        validate_canonical_mathematical_state(manifest)
+        controller._assert_startup_canonical_sources()
 
     def test_canonical_transition_is_auditable_and_replayable(self) -> None:
         manifest = ProjectManifest.load(self.project)
@@ -2163,10 +2232,34 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(len(packet_paths), 1)
         packet = json.loads(packet_paths[0].read_text(encoding="utf-8"))
         self.assertEqual(packet["task"]["required_files"], ["project://claims/CLAIMS.md"])
-        self.assertEqual(packet["required_file_access"], [{
-            "reference": "project://claims/CLAIMS.md",
-            "path": str((self.project / "claims" / "CLAIMS.md").resolve()),
-        }])
+        self.assertEqual(len(packet["required_file_access"]), 1)
+        access = packet["required_file_access"][0]
+        self.assertEqual(access["reference"], "project://claims/CLAIMS.md")
+        materialized = Path(access["path"])
+        self.assertTrue(materialized.is_relative_to(packet_paths[0].parent))
+        self.assertNotEqual(
+            materialized, (self.project / "claims" / "CLAIMS.md").resolve(),
+        )
+        self.assertEqual(
+            materialized.read_bytes(),
+            (self.project / "claims" / "CLAIMS.md").read_bytes(),
+        )
+        self.assertEqual(access["sha256"], file_digest(materialized))
+
+    def test_research_required_file_rejects_credential_bearing_names(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="sensitive-required-file", campaign_id="campaign-1",
+        )
+        sensitive = self.project / ".env"
+        sensitive.write_text("PLACEHOLDER=not-a-credential\n", encoding="utf-8")
+        task = research_task("sensitive-file-task")
+        task.required_files = ["project://.env"]
+
+        reason = controller._validate_director_task(task)
+
+        self.assertIsNotNone(reason)
+        self.assertIn("credential-bearing", str(reason))
 
     def test_missing_required_file_at_dispatch_replans_without_starting_worker(self) -> None:
         controller = AutonomousController(
@@ -2386,6 +2479,71 @@ class NextArchitectureTests(unittest.TestCase):
             found = inbox.poll()
 
         self.assertEqual([item.event_id for item in found], [event.event_id])
+
+    def test_candidate_evidence_attempt_distinguishes_corrected_artifact_bytes(self) -> None:
+        inbox = CandidateInbox(
+            ProjectLayout(self.project),
+            inbox_root=self.runtime / "runs" / "attempts" / "events" / "inbox",
+            event_log=self.runtime / "runs" / "attempts" / "events" / "CANDIDATES.jsonl",
+            candidate_root=self.runtime / "runs" / "attempts" / "candidates",
+        )
+        evidence = self.project / "artifacts" / "attempt.txt"
+        evidence.write_text("first attempt\n", encoding="utf-8")
+
+        def make_event(event_id: str) -> CandidateEvent:
+            return CandidateEvent(
+                event_id=event_id, producer_thread_id=None,
+                producer_task_id="task", claim_id="C_ROOT", parent_claim_id=None,
+                type="KEY_LEMMA", impact="HIGH", concise_summary="candidate",
+                exact_statement="One exact candidate statement.",
+                artifact_paths=["artifacts/attempt.txt"],
+                reproduction_commands=["python checker.py"], dependency_impact=[],
+            )
+
+        first = make_event("attempt-one")
+        inbox.submit(first)
+        first_fingerprint = first.fingerprint
+        self.assertEqual(first.fingerprint_version, 2)
+        self.assertTrue(str(first.evidence_attempt_id).startswith("attempt-"))
+        inbox.mark_processed(first)
+
+        evidence.write_text("corrected attempt\n", encoding="utf-8")
+        second = make_event("attempt-two")
+        inbox.submit(second)
+
+        self.assertNotEqual(second.evidence_attempt_id, first.evidence_attempt_id)
+        self.assertNotEqual(second.fingerprint, first_fingerprint)
+
+    def test_candidate_v1_fingerprint_remains_valid_for_legacy_inbox_payload(self) -> None:
+        inbox = CandidateInbox(
+            ProjectLayout(self.project),
+            inbox_root=self.runtime / "runs" / "legacy-attempt" / "events" / "inbox",
+            event_log=self.runtime / "runs" / "legacy-attempt" / "events" / "CANDIDATES.jsonl",
+            candidate_root=self.runtime / "runs" / "legacy-attempt" / "candidates",
+        )
+        event = CandidateEvent(
+            event_id="legacy-v1", producer_thread_id=None,
+            producer_task_id="task", claim_id="C_ROOT", parent_claim_id=None,
+            type="KEY_LEMMA", impact="HIGH", concise_summary="candidate",
+            exact_statement="One legacy exact candidate statement.",
+            artifact_paths=[], reproduction_commands=[], dependency_impact=[],
+        )
+        legacy_fingerprint = event.fingerprint
+        payload = event.to_dict()
+        payload.pop("fingerprint", None)
+        payload.pop("fingerprint_version", None)
+        payload.pop("evidence_attempt_id", None)
+        inbox.inbox_root.mkdir(parents=True, exist_ok=True)
+        (inbox.inbox_root / "legacy-v1.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        found = inbox.poll()
+
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].fingerprint_version, 1)
+        self.assertEqual(found[0].fingerprint, legacy_fingerprint)
 
 
 if __name__ == "__main__":

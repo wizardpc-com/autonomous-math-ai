@@ -88,6 +88,12 @@ It does not let a model set canonical state. The normal candidate identity,
 artifact sealing, independent audit, evidence, representation, and canonical
 gates still apply.
 
+New candidate submissions use a v2 evidence-attempt identity. The exact claim
+identity remains stable, while artifact content hashes, reproduction commands,
+proposed evidence level, and deterministic run references distinguish a
+corrected evidence attempt from a duplicate. Persisted v1 candidates keep their
+original fingerprint for resume and audit compatibility.
+
 The math pack retains the existing configured high/critical audit policy rather
 than adding a blanket pack minimum to every low- or medium-impact event.
 
@@ -96,7 +102,8 @@ For certified computation:
 - `CHECKER_SUPPORT`, `CHECKER_REFUTATION`, and `INCONCLUSIVE` require at least
   `E2_EXACT_TESTED`;
 - `CERTIFICATE` requires `E4_CERTIFIED` and a deterministic checker reproduction
-  command; and
+  command plus a controller-verified checker run whose cases exited without
+  infrastructure failure and with status zero; and
 - every status-changing event has a pack minimum of one independent evaluator
   audit. A critical event requires two when critical double audit is enabled.
 
@@ -107,7 +114,8 @@ For empirical research:
 - `EXPERIMENT_SUPPORT`, `EXPERIMENT_NOT_SUPPORTED`, and `INCONCLUSIVE` require
   exact tested evidence under a frozen protocol;
 - `CONFIRMATION` and `REPLICATION` require redundant exact evidence, which may
-  be supplied by the independent evaluator replay; and
+  be supplied only by two distinct completed experiment run receipts under the
+  frozen protocol; and
 - every status-changing event has a pack minimum of one independent evaluator
   audit. A critical event requires two when critical double audit is enabled.
 
@@ -118,3 +126,9 @@ mathematical proof.
 The effective audit count is the stricter of the configured audit threshold and
 the pack minimum. `REPRESENTATION_BRIDGE` is a status/trust no-op in every pack;
 it only authorizes the separately audited compatibility relation.
+
+`amr smoke` follows the selected pack. Math retains the proof/auditor toy
+lifecycle. Certified computation runs one deterministic checker before model
+interpretation and evaluator audit. Empirical smoke runs two distinct frozen
+replications and never exposes a `PROVED` status. These are isolated smoke
+fixtures and cannot promote project canonical state.

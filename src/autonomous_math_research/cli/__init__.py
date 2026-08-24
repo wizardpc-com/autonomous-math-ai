@@ -525,6 +525,7 @@ async def _execute_epoch(args: argparse.Namespace):
         )
         domain = str(config.raw["policy"]["pack"])
         evidence_path: Path | None = None
+        evidence_receipts: list[dict[str, str]] = []
         if domain != "math-research":
             evidence_path = layout.run_dir(run_id) / "state" / "domain_mock_evidence.json"
             evidence = {
@@ -541,6 +542,62 @@ async def _execute_epoch(args: argparse.Namespace):
                     raise ValueError("pinned mock domain evidence changed")
             else:
                 atomic_write_json(evidence_path, evidence)
+            runner = ExperimentRunner(project)
+            replica_count = 2 if domain == "empirical-research" else 1
+            for replica in range(1, replica_count + 1):
+                manifest_path = (
+                    layout.run_dir(run_id) / "state"
+                    / f"domain_mock_experiment_{replica}.json"
+                )
+                manifest = {
+                    "schema_version": 1,
+                    "experiment_id": f"mock-{domain}-{replica}",
+                    "protocol_version": f"mock-{run_id}-{replica}",
+                    "adapter": {"kind": "subprocess", "config": {}},
+                    "timeout_seconds": 10,
+                    "inputs": [{
+                        "path": evidence_path.relative_to(project).as_posix(),
+                        "sha256": file_digest(evidence_path),
+                    }],
+                    "config": {
+                        "domain": domain,
+                        "claim_id": str(final_claim["claim_id"]),
+                        "replica": replica,
+                    },
+                    "versions": {"python": sys.version.split()[0]},
+                    "resource_metadata": {"worker_slots": 1},
+                    "cost_metadata": {"billing": "none", "llm_budget": 0},
+                    "cases": [{
+                        "case_id": "verify",
+                        "argv": [
+                            sys.executable, "-c",
+                            (
+                                "import json,sys;"
+                                f"json.load(open({str(evidence_path)!r},encoding='utf-8'));"
+                                "sys.exit(0)"
+                            ),
+                        ],
+                        "cwd": ".",
+                    }],
+                }
+                if manifest_path.is_file():
+                    if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+                        raise ValueError("pinned mock domain experiment changed")
+                else:
+                    atomic_write_json(manifest_path, manifest)
+                try:
+                    summary = runner.run(manifest_path)
+                except FileExistsError:
+                    summary = runner.run(manifest_path, resume=True)
+                evidence_receipts.append({
+                    "kind": (
+                        "deterministic_checker_run"
+                        if domain == "certified-computational-research"
+                        else "experiment_run"
+                    ),
+                    "manifest_path": manifest_path.relative_to(project).as_posix(),
+                    "run_id": summary.run_id,
+                })
         backend = build_mock_full_cycle_backend(
             claim_id=str(final_claim["claim_id"]),
             statement=str(final_claim["statement"]),
@@ -548,6 +605,7 @@ async def _execute_epoch(args: argparse.Namespace):
             dependencies=list(final_claim.get("dependencies") or []),
             domain=domain,
             evidence_path=str(evidence_path) if evidence_path else None,
+            evidence_receipts=evidence_receipts,
         )
     else:
         backend = None

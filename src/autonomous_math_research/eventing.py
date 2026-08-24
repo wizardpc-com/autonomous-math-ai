@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import CandidateEvent
+from .models import CandidateEvent, stable_hash
 from .schema import load_schema, validate
 from .resources import schema_resource
-from .storage import ProjectLayout, append_jsonl, atomic_write_json, read_jsonl
+from .storage import (
+    ProjectLayout, append_jsonl, atomic_write_json, file_digest, read_jsonl,
+)
 from .storage.artifacts import PORTABLE_SCHEMES, resolve_portable_uri
 
 
@@ -61,6 +63,7 @@ class CandidateInbox:
         shared autonomous state.  The controller later validates and persists
         the event in the append-only ledger.
         """
+        self._assign_current_evidence_attempt(event)
         payload = event.to_dict()
         payload.pop("fingerprint", None)
         schema = load_schema(schema_path) if schema_path else self.candidate_schema
@@ -83,6 +86,9 @@ class CandidateInbox:
 
     def persist(self, event: CandidateEvent) -> Path:
         """Controller-owned durable candidate and append-only ledger write."""
+        # Submission validates the producer-visible attempt. The controller may
+        # subsequently add verified receipt artifacts before sealing; those
+        # derived files are already bound by the receipt run ids in the attempt.
         payload = event.to_dict()
         payload.pop("fingerprint", None)
         durable = self.candidate_root / f"{event.fingerprint}.json"
@@ -108,6 +114,7 @@ class CandidateInbox:
                 validate(payload, self.candidate_schema)
                 event = CandidateEvent.from_dict(payload)
                 self._validate_paths(event)
+                self._validate_evidence_attempt(event)
             except Exception as exc:
                 relative = path.relative_to(self.inbox_root).as_posix().replace("/", "__")
                 target = self.quarantine_root / f"{relative}.invalid"
@@ -152,17 +159,46 @@ class CandidateInbox:
                 source.replace(target)
 
     def _validate_paths(self, event: CandidateEvent) -> None:
-        project = self.layout.project_root.resolve()
         for raw in event.artifact_paths:
-            if raw.startswith(PORTABLE_SCHEMES):
-                resolve_portable_uri(project, self.layout.autonomous_root, raw)
-                continue
-            path = Path(raw)
-            resolved = (project / path).resolve() if not path.is_absolute() else path.resolve()
-            if not resolved.is_relative_to(project):
-                raise ValueError(f"candidate artifact escapes project: {raw}")
-            if not resolved.exists():
-                raise ValueError(f"candidate artifact does not exist: {raw}")
+            self._artifact_path(raw)
+
+    def _artifact_path(self, raw: str) -> Path:
+        project = self.layout.project_root.resolve()
+        if raw.startswith(PORTABLE_SCHEMES):
+            return resolve_portable_uri(project, self.layout.autonomous_root, raw)
+        path = Path(raw)
+        resolved = (project / path).resolve() if not path.is_absolute() else path.resolve()
+        if not resolved.is_relative_to(project):
+            raise ValueError(f"candidate artifact escapes project: {raw}")
+        if not resolved.is_file() or resolved.is_symlink():
+            raise ValueError(f"candidate artifact does not exist or is symbolic: {raw}")
+        return resolved
+
+    def _evidence_attempt_id(self, event: CandidateEvent) -> str:
+        payload = {
+            "artifact_sha256": sorted(
+                file_digest(self._artifact_path(raw))
+                for raw in event.artifact_paths
+            ),
+            "evidence_receipts": sorted(
+                event.evidence_receipts,
+                key=lambda item: (item["kind"], item["manifest_path"], item["run_id"]),
+            ),
+            "proposed_evidence_level": event.proposed_evidence_level,
+            "reproduction_commands": list(event.reproduction_commands),
+        }
+        return "attempt-" + stable_hash(payload)
+
+    def _assign_current_evidence_attempt(self, event: CandidateEvent) -> None:
+        self._validate_paths(event)
+        event.fingerprint_version = 2
+        event.evidence_attempt_id = self._evidence_attempt_id(event)
+
+    def _validate_evidence_attempt(self, event: CandidateEvent) -> None:
+        if event.fingerprint_version == 1:
+            return
+        if event.evidence_attempt_id != self._evidence_attempt_id(event):
+            raise ValueError("candidate evidence_attempt_id does not match its evidence")
 
 
 def event_from_cli(data: dict[str, Any]) -> CandidateEvent:

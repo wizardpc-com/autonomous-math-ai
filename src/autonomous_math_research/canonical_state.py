@@ -369,8 +369,10 @@ def validate_canonical_state(state: dict[str, Any], *, run_dir: Path) -> None:
 
 def verify_live_startup_sources(
     state: dict[str, Any], *, project_root: Path, run_dir: Path,
+    authorized_sha256: dict[str, str] | None = None,
 ) -> list[str]:
     validate_canonical_state(state, run_dir=run_dir)
+    authorized = dict(authorized_sha256 or {})
     changed: list[str] = []
     guarded = [state["project_manifest"], *state["canonical_inputs"]]
     if state.get("director_overlay"):
@@ -383,7 +385,10 @@ def verify_live_startup_sources(
         if (
             not source.is_relative_to(project_root.resolve())
             or not source.is_file()
-            or file_digest(source) != str(entry["sha256"])
+            or file_digest(source) not in {
+                str(entry["sha256"]),
+                str(authorized.get(relative) or ""),
+            }
         ):
             changed.append(relative)
     return sorted(changed)

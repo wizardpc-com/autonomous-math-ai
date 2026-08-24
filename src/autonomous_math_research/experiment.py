@@ -5,9 +5,12 @@ from hashlib import sha256
 import json
 import math
 import os
+import platform
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from typing import Any, Protocol
 
@@ -16,7 +19,7 @@ from .storage import ProjectLayout, atomic_write_json, file_digest
 
 
 EXPERIMENT_MANIFEST_SCHEMA_VERSION = 1
-EXPERIMENT_RUN_SCHEMA_VERSION = 1
+EXPERIMENT_RUN_SCHEMA_VERSION = 2
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MANIFEST_KEYS = frozenset({
@@ -342,6 +345,7 @@ class ExperimentExecutionRequest:
     stdout_path: Path
     stderr_path: Path
     adapter_config: dict[str, Any]
+    environment: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +381,7 @@ class SubprocessExperimentAdapter:
                 process = subprocess.Popen(
                     list(request.argv),
                     cwd=request.cwd,
+                    env=request.environment,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout,
                     stderr=stderr,
@@ -557,6 +562,97 @@ class ExperimentRunner:
             infrastructure_failure_case_ids=failures,
         )
 
+    def verify_receipt(
+        self,
+        manifest: ExperimentManifest | Path,
+        *,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Verify one completed run without executing or repairing it."""
+        value = (
+            manifest
+            if isinstance(manifest, ExperimentManifest)
+            else ExperimentManifest.load(self.project_root, manifest)
+        )
+        if value.project_root != self.project_root:
+            raise ValueError("experiment manifest belongs to a different project")
+        run_manifest = self._build_run_manifest(value)
+        expected_run_id = str(run_manifest["run_id"])
+        if run_id != expected_run_id:
+            raise ValueError("experiment receipt run_id does not match the frozen manifest")
+        root = self.layout.experiments_root / expected_run_id
+        if not root.is_dir():
+            raise ValueError("experiment receipt run is unavailable")
+        snapshot_path = root / "RUN_MANIFEST.json"
+        if self._read_canonical_json(snapshot_path) != run_manifest:
+            raise ValueError("experiment receipt run manifest is invalid")
+        value.input_provenance()
+        ledger_path = root / "RAW_RESULTS.jsonl"
+        records = self._read_and_verify_ledger(
+            ledger_path, root, value, run_manifest,
+        )
+        if len(records) != len(value.cases):
+            raise ValueError("experiment receipt run is incomplete")
+        expected_case_roots = {
+            str(self._case_plan(case, str(run_manifest["experiment_fingerprint"]))["case_run_id"])
+            for case in value.cases
+        }
+        cases_root = root / "cases"
+        if not cases_root.is_dir() or {
+            path.name for path in cases_root.iterdir()
+        } != expected_case_roots:
+            raise ValueError("experiment receipt case directory set is inconsistent")
+
+        artifact_paths = [
+            value.path.relative_to(self.project_root).as_posix(),
+            *[item.path for item in value.inputs],
+            snapshot_path.relative_to(self.project_root).as_posix(),
+            ledger_path.relative_to(self.project_root).as_posix(),
+        ]
+        case_summaries: list[dict[str, Any]] = []
+        for record in records:
+            result_path = root / "cases" / str(record["case_run_id"]) / "RESULT.json"
+            artifact_paths.extend([
+                result_path.relative_to(self.project_root).as_posix(),
+                str(record["artifacts"]["stdout"]["path"]),
+                str(record["artifacts"]["stderr"]["path"]),
+            ])
+            case_summaries.append({
+                "case_id": record["case_id"],
+                "case_run_id": record["case_run_id"],
+                "case_fingerprint": record["case_fingerprint"],
+                "termination": record["execution"]["termination"],
+                "exit_code": record["execution"]["exit_code"],
+                "infrastructure_failure": record["execution"]["infrastructure_failure"],
+                "result_sha256": file_digest(result_path),
+                "stdout_sha256": record["artifacts"]["stdout"]["sha256"],
+                "stderr_sha256": record["artifacts"]["stderr"]["sha256"],
+            })
+        # stdout/stderr paths in a result are run-relative, unlike the other
+        # paths above. Normalize the complete set to project-relative paths.
+        normalized_artifacts: list[str] = []
+        for relative in artifact_paths:
+            candidate = Path(relative)
+            if candidate.parts and candidate.parts[0] == "cases":
+                candidate = root.relative_to(self.project_root) / candidate
+            normalized = candidate.as_posix()
+            if normalized not in normalized_artifacts:
+                normalized_artifacts.append(normalized)
+        receipt = {
+            "schema_version": 1,
+            "manifest_path": value.path.relative_to(self.project_root).as_posix(),
+            "manifest_sha256": file_digest(value.path),
+            "run_id": expected_run_id,
+            "experiment_fingerprint": run_manifest["experiment_fingerprint"],
+            "protocol_version": value.protocol_version,
+            "raw_ledger_sha256": file_digest(ledger_path),
+            "input_provenance": value.input_provenance(),
+            "cases": case_summaries,
+            "artifact_paths": normalized_artifacts,
+        }
+        receipt["receipt_fingerprint"] = _json_hash(receipt)
+        return receipt
+
     @staticmethod
     def _build_run_manifest(value: ExperimentManifest) -> dict[str, Any]:
         normalized = value.to_dict()
@@ -568,6 +664,9 @@ class ExperimentRunner:
             "protocol_version": value.protocol_version,
             "versions": value.versions,
             "inputs": value.input_provenance(),
+            "execution_environment": ExperimentRunner._execution_environment_provenance(
+                value
+            ),
         }
         fingerprint = _json_hash({
             "manifest": normalized,
@@ -581,6 +680,104 @@ class ExperimentRunner:
             "llm_execution_allowed": False,
             "manifest": normalized,
             "provenance": provenance,
+        }
+
+    @staticmethod
+    def _subprocess_environment(*, scratch_root: Path | None = None) -> dict[str, str]:
+        inherited: dict[str, str] = {}
+        for name in (
+            "COMSPEC", "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR",
+        ):
+            value = os.environ.get(name)
+            if value:
+                inherited[name] = value
+        inherited.update({
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+            "TZ": "UTC",
+        })
+        if scratch_root is not None:
+            temporary = scratch_root / "tmp"
+            temporary.mkdir(parents=True, exist_ok=True)
+            inherited["TEMP"] = str(temporary)
+            inherited["TMP"] = str(temporary)
+            inherited["TMPDIR"] = str(temporary)
+        return inherited
+
+    @staticmethod
+    def _resolve_case_executable(
+        manifest: ExperimentManifest,
+        case: ExperimentCase,
+        environment: dict[str, str],
+    ) -> Path | None:
+        requested = case.argv[0]
+        candidate = Path(requested)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        elif candidate.parent != Path("."):
+            working = manifest.resolve_project_path(case.cwd, directory=True)
+            resolved = (working / candidate).resolve()
+        else:
+            found = shutil.which(requested, path=environment.get("PATH"))
+            if found is None:
+                return None
+            resolved = Path(found).resolve()
+        return resolved if resolved.is_file() else None
+
+    @staticmethod
+    def _execution_environment_provenance(
+        manifest: ExperimentManifest,
+    ) -> dict[str, Any]:
+        if manifest.adapter_kind != "subprocess":
+            return {
+                "adapter": manifest.adapter_kind,
+                "adapter_config_sha256": _json_hash(manifest.adapter_config),
+                "isolation": "adapter-owned",
+            }
+        environment = ExperimentRunner._subprocess_environment()
+        executables: list[dict[str, Any]] = []
+        for case in manifest.cases:
+            resolved = ExperimentRunner._resolve_case_executable(
+                manifest, case, environment
+            )
+            executables.append({
+                "case_id": case.case_id,
+                "requested": case.argv[0],
+                "resolved_path": str(resolved) if resolved is not None else None,
+                "sha256": file_digest(resolved) if resolved is not None else None,
+                "size_bytes": resolved.stat().st_size if resolved is not None else None,
+            })
+        return {
+            "adapter": "subprocess",
+            "environment_contract_version": 1,
+            "environment_sha256": _json_hash(environment),
+            "inherited_environment_keys": sorted(
+                key for key in environment
+                if key not in {
+                    "LANG", "LC_ALL", "PYTHONHASHSEED", "PYTHONNOUSERSITE",
+                    "PYTHONUTF8", "TZ",
+                }
+            ),
+            "deterministic_environment": {
+                key: environment[key]
+                for key in (
+                    "LANG", "LC_ALL", "PYTHONHASHSEED", "PYTHONNOUSERSITE",
+                    "PYTHONUTF8", "TZ",
+                )
+            },
+            "platform": {
+                "implementation": platform.python_implementation(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "release": platform.release(),
+                "system": platform.system(),
+            },
+            "isolation": "materialized-declared-inputs",
+            "network_isolated": False,
+            "executables": executables,
         }
 
     @staticmethod
@@ -606,18 +803,46 @@ class ExperimentRunner:
     ) -> dict[str, Any]:
         stdout_path = case_root / "stdout.bin"
         stderr_path = case_root / "stderr.bin"
-        request = ExperimentExecutionRequest(
-            argv=case.argv,
-            cwd=manifest.resolve_project_path(case.cwd, directory=True),
-            timeout_seconds=manifest.timeout_seconds,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            adapter_config=manifest.adapter_config,
-        )
         started_at = utc_now()
+        materialized_input_error: ValueError | None = None
         try:
-            outcome = adapter.execute(request)
-            self._validate_execution(outcome)
+            if manifest.adapter_kind == "subprocess":
+                with tempfile.TemporaryDirectory(prefix="amr-experiment-") as temporary:
+                    scratch_root = Path(temporary).resolve()
+                    self._materialize_experiment_inputs(manifest, scratch_root)
+                    scratch_cwd = scratch_root / Path(
+                        *PurePosixPath(case.cwd).parts
+                    )
+                    scratch_cwd.mkdir(parents=True, exist_ok=True)
+                    request = ExperimentExecutionRequest(
+                        argv=self._materialized_argv(manifest, case, scratch_root),
+                        cwd=scratch_cwd,
+                        timeout_seconds=manifest.timeout_seconds,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        adapter_config=manifest.adapter_config,
+                        environment=self._subprocess_environment(
+                            scratch_root=scratch_root
+                        ),
+                    )
+                    outcome = adapter.execute(request)
+                    self._validate_execution(outcome)
+                    try:
+                        self._verify_materialized_inputs(manifest, scratch_root)
+                    except ValueError as exc:
+                        materialized_input_error = exc
+            else:
+                request = ExperimentExecutionRequest(
+                    argv=case.argv,
+                    cwd=manifest.resolve_project_path(case.cwd, directory=True),
+                    timeout_seconds=manifest.timeout_seconds,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    adapter_config=manifest.adapter_config,
+                    environment={},
+                )
+                outcome = adapter.execute(request)
+                self._validate_execution(outcome)
         except Exception as exc:
             outcome = ExperimentExecution(
                 termination="ADAPTER_FAILED",
@@ -631,6 +856,8 @@ class ExperimentRunner:
         self._ensure_raw_artifact(stdout_path)
         self._ensure_raw_artifact(stderr_path)
         try:
+            if materialized_input_error is not None:
+                raise materialized_input_error
             observed_inputs = manifest.input_provenance()
             if observed_inputs != run_manifest["provenance"]["inputs"]:
                 raise ValueError("experiment inputs changed")
@@ -692,6 +919,75 @@ class ExperimentRunner:
         return self._read_and_verify_result(
             result_path, root, manifest, case, run_manifest, case_plan
         )
+
+    @staticmethod
+    def _materialize_experiment_inputs(
+        manifest: ExperimentManifest,
+        scratch_root: Path,
+    ) -> None:
+        for item in manifest.inputs:
+            source = manifest.resolve_project_path(item.path)
+            target = scratch_root / Path(*PurePosixPath(item.path).parts)
+            resolved_target = target.resolve()
+            if not resolved_target.is_relative_to(scratch_root):
+                raise ValueError("materialized experiment input escapes scratch root")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source.open("rb") as reader, target.open("xb") as writer:
+                shutil.copyfileobj(reader, writer)
+                writer.flush()
+                os.fsync(writer.fileno())
+            if file_digest(target) != item.sha256:
+                raise ValueError(
+                    f"materialized experiment input digest mismatch: {item.path}"
+                )
+
+    @staticmethod
+    def _verify_materialized_inputs(
+        manifest: ExperimentManifest,
+        scratch_root: Path,
+    ) -> None:
+        for item in manifest.inputs:
+            target = scratch_root / Path(*PurePosixPath(item.path).parts)
+            if (
+                not target.is_file()
+                or target.is_symlink()
+                or file_digest(target) != item.sha256
+            ):
+                raise ValueError(
+                    f"materialized experiment input changed: {item.path}"
+                )
+
+    @staticmethod
+    def _materialized_argv(
+        manifest: ExperimentManifest,
+        case: ExperimentCase,
+        scratch_root: Path,
+    ) -> tuple[str, ...]:
+        declared = {item.path for item in manifest.inputs}
+        mapped: list[str] = []
+        for index, argument in enumerate(case.argv):
+            candidate = Path(argument)
+            if not candidate.is_absolute():
+                mapped.append(argument)
+                continue
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(manifest.project_root):
+                mapped.append(argument)
+                continue
+            relative = resolved.relative_to(manifest.project_root).as_posix()
+            if relative not in declared:
+                if index == 0 and not resolved.exists():
+                    mapped.append(argument)
+                    continue
+                if index == 0:
+                    raise ValueError(
+                        "project-local experiment executable must be a declared input"
+                    )
+                raise ValueError(
+                    "absolute project-local experiment argument must be a declared input"
+                )
+            mapped.append(str(scratch_root / Path(*PurePosixPath(relative).parts)))
+        return tuple(mapped)
 
     @staticmethod
     def _validate_execution(

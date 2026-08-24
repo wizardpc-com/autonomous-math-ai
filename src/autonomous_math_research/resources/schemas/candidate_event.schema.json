@@ -20,6 +20,24 @@
     "proposed_evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]},
     "assumptions": {"type": "array", "items": {"type": "string"}},
     "dependencies": {"type": "array", "items": {"type": "string"}},
+    "evidence_receipts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "manifest_path", "run_id"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["deterministic_checker_run", "experiment_run"]},
+          "manifest_path": {"type": "string", "minLength": 1},
+          "run_id": {"type": "string", "pattern": "^run-[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "fingerprint_version": {"type": "integer", "enum": [1, 2]},
+    "evidence_attempt_id": {
+      "type": ["string", "null"],
+      "pattern": "^attempt-[0-9a-f]{64}$"
+    },
     "bridge_representation_ids": {"type": "array", "items": {"type": "string"}},
     "timestamp": {"type": "string", "minLength": 1},
     "representation": {

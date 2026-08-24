@@ -744,6 +744,7 @@ class AppServerLaunchIsolationTests(unittest.TestCase):
             model_shell_path=str(Path("C:/runtime")),
             runtime_read_roots=(Path("C:/runtime"),),
             blocked_executable=Path("C:/runtime/codex.exe"),
+            blocked_read_paths=(Path("C:/codex-home/auth.json"),),
         )
 
         self.assertEqual(command[:3], ["codex", "app-server", "--strict-config"])
@@ -775,12 +776,20 @@ class AppServerLaunchIsolationTests(unittest.TestCase):
         )
         self.assertIn("\":root\" = \"deny\"", filesystem_override)
         self.assertIn("\":minimal\" = \"read\"", filesystem_override)
+        self.assertNotIn(
+            f"{json.dumps(str(project))} = \"read\"",
+            filesystem_override,
+        )
         self.assertIn(
             f"{json.dumps(str(Path('C:/runtime').resolve()))} = \"read\"",
             filesystem_override,
         )
         self.assertIn(
             f"{json.dumps(str(Path('C:/runtime/codex.exe').resolve()))} = \"deny\"",
+            filesystem_override,
+        )
+        self.assertIn(
+            f"{json.dumps(str(Path('C:/codex-home/auth.json').resolve()))} = \"deny\"",
             filesystem_override,
         )
         self.assertIn(
@@ -936,6 +945,44 @@ class AppServerThreadPermissionTests(unittest.IsolatedAsyncioTestCase):
         client.request = request  # type: ignore[method-assign]
         with self.assertRaisesRegex(AppServerError, "entry is invalid"):
             await client._attest_no_mcp_servers()
+
+    async def test_startup_rejects_repeated_mcp_inventory_cursor(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+        calls = 0
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            nonlocal calls
+            del method, params, timeout
+            calls += 1
+            return {"data": [], "nextCursor": "repeated"}
+
+        client.request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(AppServerError, "cursor repeated"):
+            await client._attest_no_mcp_servers()
+        self.assertEqual(calls, 2)
+
+    async def test_startup_rejects_repeated_permission_profile_cursor(self) -> None:
+        client = AppServerClient(
+            codex_executable="unused", project_root=Path.cwd(),
+        )
+        calls = 0
+
+        async def request(
+            method: str, params: dict[str, object], timeout: float = 60,
+        ) -> dict[str, object]:
+            nonlocal calls
+            del method, params, timeout
+            calls += 1
+            return {"data": [], "nextCursor": "repeated"}
+
+        client.request = request  # type: ignore[method-assign]
+        with self.assertRaisesRegex(AppServerError, "cursor repeated"):
+            await client._attest_permission_profile_available()
+        self.assertEqual(calls, 2)
 
     async def test_startup_rejects_disallowed_permission_profile(self) -> None:
         client = AppServerClient(

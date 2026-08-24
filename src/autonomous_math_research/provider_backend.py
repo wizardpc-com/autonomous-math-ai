@@ -391,6 +391,7 @@ class ProviderRouterBackend:
         *,
         adapter_overrides: dict[str, CodexBackend] | None = None,
         roles: set[str] | None = None,
+        app_server_read_roots: tuple[Path, ...] = (),
     ):
         self.config = config
         self.adapters: dict[str, CodexBackend] = dict(adapter_overrides or {})
@@ -410,6 +411,7 @@ class ProviderRouterBackend:
             if adapter == "codex_app_server":
                 self.adapters[provider_name] = AppServerBackend(
                     config, trace_notification, provider_name=provider_name,
+                    read_roots=app_server_read_roots,
                 )
             elif adapter == "openai_compatible":
                 self.adapters[provider_name] = OpenAICompatibleBackend(
