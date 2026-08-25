@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 from typing import Any
 
 from .claim_graph import ClaimGraph
+from .canonical_transition import CanonicalTransitionStore
 from .config import DEFAULT_PROTECTED, load_config
+from .models import TrustStatus
 from .policy import build_policy_manifest
 from .project import ProjectManifest
 from .resources import schema_resource
 from .schema import preflight_output_schema_files
+from .semantic_alignment import (
+    SEMANTICS_FILENAME, SemanticAlignment, SemanticTrustState,
+)
 from .storage import CanonicalGuard, ProjectLayout
 
 
@@ -116,6 +122,62 @@ def validate_project(
         )
     if manifest.final_claim_id not in graph.claims:
         raise ValueError("manifest final_claim_id is absent from the claim graph")
+    trusted_payload = json.loads(
+        layout.trusted_state_path.read_text(encoding="utf-8")
+    )
+    semantic_trust = SemanticTrustState.from_trusted_payload(trusted_payload)
+    if semantic_trust.opted_in:
+        transition_store = CanonicalTransitionStore(
+            project_root=root,
+            runtime_root=layout.autonomous_root,
+        )
+        semantic_trust.require_committed_journal([
+            dict(record.get("authorization") or {})
+            for record in transition_store.records()
+            if record.get("kind") == "COMMITTED"
+        ])
+    semantic_alignment = SemanticAlignment.load_optional(
+        root,
+        layout.autonomous_root / SEMANTICS_FILENAME,
+        required=semantic_trust.opted_in,
+    )
+    semantic_trust = semantic_alignment.reconcile_trust_state(semantic_trust)
+    if semantic_alignment.present:
+        semantic_path = semantic_alignment.path
+        missing_roles = [
+            role for role in ("director", "research", "audit")
+            if semantic_path not in manifest.canonical_for(role)
+        ]
+        if missing_roles:
+            raise ValueError(
+                "semantic alignment must be a canonical input for every role; "
+                f"missing={missing_roles}"
+            )
+    semantic_result = semantic_alignment.validate_project(
+        final_claim_id=manifest.final_claim_id,
+        final_claim_statement=graph.claims[manifest.final_claim_id].statement,
+        claim_ids=graph.claims,
+        trust_state=semantic_trust,
+        claim_statements={
+            claim_id: claim.statement for claim_id, claim in graph.claims.items()
+        },
+        claim_objects=graph.claims,
+    )
+    final_claim = graph.claims[manifest.final_claim_id]
+    if (
+        semantic_alignment.present
+        and graph.semantics.final_outcome(final_claim.research_status) is not None
+        and final_claim.trust_status in {
+            TrustStatus.AUDITED_NIGHTLY,
+            TrustStatus.FORMALLY_VERIFIED,
+            TrustStatus.CANONICAL_TRUSTED,
+        }
+    ):
+        semantic_alignment.require_final_claim_acceptance(
+            manifest.final_claim_id,
+            claims=graph.claims,
+            trust_state=semantic_trust,
+        )
     schema_paths: list[Path] = []
     contexts = []
     try:
@@ -160,5 +222,6 @@ def validate_project(
         "migrations_applied": list(config.migrations_applied),
         "protected_files": len(protected),
         "model_turns_started": 0,
+        "semantic_alignment": semantic_result,
         **strict_result,
     }

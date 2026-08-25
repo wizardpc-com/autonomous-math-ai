@@ -87,6 +87,18 @@ class CanonicalTransitionStore:
             record = latest[transition_id]
             if record.get("kind") != "PREPARED":
                 continue
+            preconditions = record.get("preconditions") or []
+            if not isinstance(preconditions, list):
+                raise ValueError("canonical transition preconditions are invalid")
+            for precondition in preconditions:
+                live = self._project_path(str(precondition["path"]))
+                if not live.is_file() or bytes_sha256(live.read_bytes()) != str(
+                    precondition["sha256"]
+                ):
+                    raise ValueError(
+                        "canonical transition precondition changed before commit: "
+                        f"{precondition['path']}"
+                    )
             targets = record.get("targets")
             if not isinstance(targets, list) or not targets:
                 raise ValueError("prepared canonical transition has no targets")
@@ -177,10 +189,22 @@ class CanonicalTransitionStore:
         authorization: dict[str, Any],
         trusted_state_path: Path,
         claim_graph_sha256: str,
+        preconditions: dict[Path, str] | None = None,
     ) -> str:
         if not targets:
             raise ValueError("canonical transition requires at least one target")
         self.recover()
+        checked_preconditions: dict[Path, str] = {}
+        for path, expected in (preconditions or {}).items():
+            resolved = path.resolve()
+            if not resolved.is_relative_to(self.project_root):
+                raise ValueError("canonical transition precondition escapes the project")
+            if not resolved.is_file() or bytes_sha256(resolved.read_bytes()) != expected:
+                raise ValueError(
+                    "canonical transition precondition changed before prepare: "
+                    f"{self._project_uri(resolved)}"
+                )
+            checked_preconditions[resolved] = expected
         trusted_state_path = trusted_state_path.resolve()
         if trusted_state_path not in {path.resolve() for path in targets}:
             raise ValueError("canonical transition lacks its trusted-state target")
@@ -199,6 +223,12 @@ class CanonicalTransitionStore:
                 if path.resolve() != trusted_state_path.resolve()
             },
             "claim_graph_sha256": claim_graph_sha256,
+            "preconditions": {
+                self._project_uri(path): digest
+                for path, digest in sorted(
+                    checked_preconditions.items(), key=lambda item: self._project_uri(item[0])
+                )
+            },
         }
         transition_id = f"transition-{stable_hash(seed)[:24]}"
 
@@ -253,6 +283,12 @@ class CanonicalTransitionStore:
             "transition_id": transition_id,
             "timestamp": utc_now(),
             "authorization": authorization,
+            "preconditions": [
+                {"path": self._project_uri(path), "sha256": digest}
+                for path, digest in sorted(
+                    checked_preconditions.items(), key=lambda item: self._project_uri(item[0])
+                )
+            ],
             "targets": target_records,
         })
         self.recover()

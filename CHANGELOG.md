@@ -8,6 +8,14 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Semantic alignment verification is now controller-owned and candidate-bound.
+  Persistent opt-in, append-only contract heads, evidence/audit/validator scope
+  receipts, dependency-closure final gates, and canonical commit preconditions
+  enforce **No unverified bridge into trusted final claims** across live,
+  startup, resume, recovery, import, direct transition, and finalization paths.
+  Structured `core_terms` checks no longer claim to discover arbitrary terms in
+  proof or free text.
+
 - Controller-owned App Server roles no longer inherit ambient `AGENTS.md`,
   goals, hooks, memories, plugins, apps, browser/computer tools, dynamic skill
   discovery, or multi-agent tools. Standalone MCP servers are disabled by id
@@ -39,6 +47,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Optional domain-independent semantic alignment contracts with versioned goal
+  hashes, canonical term/object registries, typed representation bridge graphs,
+  orthogonal semantic status, and legacy `UNREVIEWED` compatibility.
 - Selectable, strictly validated bundled policy packs for `math-research`,
   `certified-computational-research`, and `empirical-research`, with pinned
   domain contracts, role resources, audit requirements, and fail-closed resume.

@@ -53,6 +53,11 @@ output as trusted truth.
 - **Pinned domain semantics:** a run selects one strictly validated bundled
   policy pack, snapshots its role policy and domain contract, and fails closed
   on missing, modified, or cross-domain state.
+- **Semantic alignment:** an optional project contract freezes the final goal,
+  registers canonical terms and objects, and requires a controller-owned,
+  candidate-bound verification receipt for every bridge in a trusted final
+  claim's dependency closure. Never-opted-in projects remain runnable as
+  `UNREVIEWED`.
 
 ## Installation
 
@@ -208,6 +213,13 @@ admission, route bookkeeping is retained and the controller requests one bounded
 repair plan. A second plan with no runnable research or audit work pauses the
 campaign cleanly; route updates alone never keep an empty execution queue alive.
 
+Projects that opt into `autonomous/semantics.json` receive the additional
+domain-independent **No unverified bridge into trusted final claims** gate.
+Opt-in and bridge verification are persisted through the canonical trusted
+journal, and the same frozen declaration is materialized into Director,
+research, and audit workspaces. See
+[semantic alignment and Semantic Migration v1](docs/semantic-alignment.md).
+
 ## Controlled mechanical delegation
 
 Research and audit roles may request simple, finite, mechanically checkable
@@ -250,6 +262,7 @@ usage as a lower bound when any mechanical attempt lacks complete telemetry.
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
 - [Research domains and policy packs](docs/research-domains.md)
+- [Semantic alignment and representation bridges](docs/semantic-alignment.md)
 - [Deterministic Experiment Runner](docs/experiment-runner.md)
 - [Project manifest](docs/project-manifest.md)
 - [Validation guide](docs/release-validation.md)

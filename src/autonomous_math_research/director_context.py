@@ -237,6 +237,9 @@ def build_compact_snapshot(
     compact["representation_compatibility"] = _exact_or_bounded(
         full_snapshot.get("representation_compatibility")
     )
+    compact["semantic_alignment"] = _exact_or_bounded(
+        full_snapshot.get("semantic_alignment")
+    )
     compact["snapshot_provenance"] = _exact_or_bounded(
         full_snapshot.get("snapshot_provenance")
     )
@@ -289,6 +292,9 @@ def build_compact_snapshot(
                 full_snapshot.get("snapshot_provenance")
             ),
             "research_target": _bounded_json(full_snapshot.get("research_target")),
+            "semantic_alignment": _bounded_json(
+                full_snapshot.get("semantic_alignment")
+            ),
             "summary_counts": {
                 key: len(full_snapshot.get(key) or [])
                 for key in (

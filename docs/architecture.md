@@ -32,6 +32,9 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
   provenance supplied to derived planning views.
 - `canonical_transition.py` owns digest-bound, crash-replayable ClaimGraph and
   trusted-metadata transactions.
+- `semantic_alignment.py` owns the optional project-level research contract,
+  term/object registry, typed bridge graph, independent semantic status, and
+  terminal-positive promotion gate.
 
 `storage_layer` is a compatibility import wrapper, not a second storage
 implementation.
@@ -297,7 +300,27 @@ block and all unmarked Markdown remain unchanged.
 Status domains are intentionally separate: the pinned domain contract describes
 claim status (`MathStatus` remains the compatibility API for the math wire
 format), `TrustStatus` describes review state, `EvidenceLevel` describes what
-was checked, and `ExecutionStatus` describes process/transport completion.
+was checked, `SemanticStatus` describes alignment/bridge review, and
+`ExecutionStatus` describes process/transport completion. These axes are not
+combined into product labels.
+
+### Semantic alignment gate
+
+An optional runtime-root `semantics.json` declares the exact final goal,
+structured registry bindings, and typed representation/evidence/validator paths
+to claims. It cannot declare trusted status. The controller supplies the frozen
+declaration and receipt-derived per-claim semantic status to Director,
+research, and Auditor packets.
+
+For opted-in projects, the controller records contract heads and candidate-bound
+verification receipts in the existing canonical trusted journal. The unified
+authoritative mutation/finalization boundary checks the final claim's transitive
+dependency closure and enforces **No unverified bridge into trusted final
+claims** across live audit, direct graph transition, startup/resume,
+checkpoint/import, crash recovery, canonical commit, and finalization. Internal
+dynamic subclaims may close as `UNREVIEWED` until they support a trusted final
+claim. Never-opted-in projects remain legacy-compatible; persistent opt-in
+cannot be undone by deleting the declaration.
 
 ## Failure taxonomy
 

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "research_contract": {
+    "active_version": 1,
+    "versions": [
+      {
+        "version": 1,
+        "final_claim_id": "C_ROOT",
+        "canonical_text": "AMR_PLACEHOLDER: replace with the exact final claim statement.",
+        "sha256": "d7af379e6e0fd2c73bfd2e397d205c20159da077b49ec552d871804a0f5ac47b",
+        "supersedes_sha256": null
+      }
+    ]
+  },
+  "registry": {
+    "entries": [
+      {
+        "id": "object:root-target",
+        "kind": "OBJECT",
+        "canonical_name": "AMR_PLACEHOLDER root target",
+        "definition": "AMR_PLACEHOLDER: define the exact canonical object.",
+        "canonical_source": "claims/CLAIMS.md#C_ROOT",
+        "aliases": [],
+        "forbidden_confusions": [
+          "AMR_PLACEHOLDER: name a nearby non-equivalent object"
+        ],
+        "allowed_representations": [
+          "representation:root-encoding"
+        ]
+      }
+    ]
+  },
+  "bridges": [
+    {
+      "id": "bridge:object-to-representation",
+      "source": "object:root-target",
+      "target": "representation:root-encoding",
+      "justification": "AMR_PLACEHOLDER: justify that the encoding preserves the object.",
+      "evidence": ["audit/object-to-representation.md"]
+    },
+    {
+      "id": "bridge:representation-to-evidence",
+      "source": "representation:root-encoding",
+      "target": "evidence:root-result",
+      "justification": "AMR_PLACEHOLDER: bind the computation or certificate to the encoding.",
+      "evidence": ["experiments/or-certificates/result.json"]
+    },
+    {
+      "id": "bridge:evidence-to-validator",
+      "source": "evidence:root-result",
+      "target": "validator:root-checker",
+      "justification": "AMR_PLACEHOLDER: define the validator scope and assumptions.",
+      "evidence": ["audit/validator-reproduction.md"]
+    },
+    {
+      "id": "bridge:validator-to-claim",
+      "source": "validator:root-checker",
+      "target": "claim:C_ROOT",
+      "justification": "AMR_PLACEHOLDER: prove that validator PASS entails the exact claim.",
+      "evidence": ["audit/validator-entailment.md"]
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "C_ROOT",
+      "canonical_object": "object:root-target",
+      "representation_id": "rep:24a963260cf5a2cd0da3fd9f1487618f4533741f086bdc8edefee2c2d6916408",
+      "core_terms": ["AMR_PLACEHOLDER root target"],
+      "required_bridges": [
+        "bridge:object-to-representation",
+        "bridge:representation-to-evidence",
+        "bridge:evidence-to-validator",
+        "bridge:validator-to-claim"
+      ]
+    }
+  ]
+}

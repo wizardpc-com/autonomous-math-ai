@@ -39,6 +39,7 @@
       "pattern": "^attempt-[0-9a-f]{64}$"
     },
     "bridge_representation_ids": {"type": "array", "items": {"type": "string"}},
+    "semantic_bridge_ids": {"type": "array", "items": {"type": "string", "pattern": "^bridge:"}},
     "timestamp": {"type": "string", "minLength": 1},
     "representation": {
       "type": "object",

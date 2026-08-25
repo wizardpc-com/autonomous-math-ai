@@ -17,6 +17,14 @@
   worker isolation.
 - Model output is never proof by itself. Trusted state changes require the
   deterministic controller and audit/canonical gates.
+- When a project supplies `autonomous/semantics.json`, treat its research
+  contract and registry as declarative canonical inputs, never as trusted
+  verification state. Enforce `No unverified bridge into trusted final claims`
+  from controller-owned candidate/audit receipts; validator success or
+  agreement among agents cannot replace bridge evidence.
+- Projects without semantic metadata remain legacy-compatible and report the
+  independent semantic status `UNREVIEWED`; do not convert that status into a
+  claim, trust, evidence, or execution failure.
 - Do not read, print, persist, or request authentication secrets.
 - Fast is permitted only when `execution.fast_mode=true` is explicitly pinned
   for the run. Request only `fast`; accept `priority` solely as its observed

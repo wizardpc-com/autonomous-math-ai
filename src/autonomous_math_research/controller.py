@@ -101,6 +101,10 @@ from .schema import (
     OutputSchemaCompatibilityError, load_schema, preflight_output_schema_files,
     validate_output_schema_compatibility,
 )
+from .semantic_alignment import (
+    SEMANTICS_FILENAME, SemanticAlignment, SemanticPromotionError,
+    SemanticTrustState, text_sha256,
+)
 from .stagnation import StagnationTracker
 from .storage import (
     CanonicalGuard, EventStore, ProjectLayout, atomic_write_json, file_digest,
@@ -654,10 +658,13 @@ class AutonomousController:
             legacy_representation_id: legacy_representation.to_dict(),
         }
         self.audited_representation_bridges: set[tuple[str, str]] = set()
+        trusted: dict[str, Any] = {}
         if self.layout.trusted_state_path.is_file():
             trusted = json.loads(
                 self.layout.trusted_state_path.read_text(encoding="utf-8")
             )
+            if not isinstance(trusted, dict):
+                raise ValueError("canonical trusted state must be a JSON object")
             for representation_id, raw_contract in dict(
                 trusted.get("representation_contracts") or {}
             ).items():
@@ -693,6 +700,17 @@ class AutonomousController:
                 "configured final conjecture claim is absent from the claim graph: "
                 f"{self.final_conjecture_claim_id}"
             )
+        loaded_semantic_trust = SemanticTrustState.from_trusted_payload(trusted)
+        self.semantic_alignment = SemanticAlignment.load_optional(
+            config.project_root,
+            self.layout.autonomous_root / SEMANTICS_FILENAME,
+            required=loaded_semantic_trust.opted_in,
+        )
+        self.semantic_trust = self.semantic_alignment.reconcile_trust_state(
+            loaded_semantic_trust
+        )
+        self._semantic_trust_dirty = self.semantic_trust != loaded_semantic_trust
+        self._require_semantics_as_canonical_input()
         if mock:
             mock_graph_path = self.run_dir / "state" / "claim_graph.json"
             if resume and mock_graph_path.is_file():
@@ -713,6 +731,23 @@ class AutonomousController:
         else:
             self.inbox = CandidateInbox(self.layout)
             self.audit_root = self.layout.autonomous_root / "audits"
+        if self.final_conjecture_claim_id:
+            self.semantic_alignment.validate_project(
+                final_claim_id=self.final_conjecture_claim_id,
+                final_claim_statement=self.graph.claims[
+                    self.final_conjecture_claim_id
+                ].statement,
+                claim_ids=self.graph.claims,
+                trust_state=self.semantic_trust,
+                claim_statements={
+                    claim_id: claim.statement
+                    for claim_id, claim in self.graph.claims.items()
+                },
+                claim_objects=self.graph.claims,
+            )
+        self.graph.set_terminal_transition_guard(
+            self._guard_graph_terminal_transition
+        )
         self.audit_root.mkdir(parents=True, exist_ok=True)
         self.audit_gate = AuditGate(
             high_threshold=config.raw["audit"].get("immediate_threshold", "HIGH"),
@@ -925,6 +960,7 @@ class AutonomousController:
         self.stop_for_review: str | None = None
         self.conflicted_candidates: set[str] = set()
         self.candidate_artifact_hashes: dict[str, dict[str, str]] = {}
+        self.candidate_semantic_evidence_hashes: dict[str, dict[str, str]] = {}
         self.domain_evidence_receipts: dict[str, list[dict[str, Any]]] = {}
         self._schema_cache: dict[str, dict[str, Any]] = {}
         self._internal_failure = False
@@ -1438,6 +1474,48 @@ class AutonomousController:
         )
         return {field: failed}
 
+    def _semantic_final_postcondition(self) -> dict[Path, str]:
+        if not self.semantic_alignment.present:
+            return {}
+        self.semantic_alignment.assert_unchanged()
+        claim = self._final_claim()
+        if (
+            claim is None
+            or self.domain_semantics.final_outcome(claim.research_status) is None
+            or claim.trust_status not in {
+                TrustStatus.AUDITED_NIGHTLY,
+                TrustStatus.FORMALLY_VERIFIED,
+                TrustStatus.CANONICAL_TRUSTED,
+            }
+        ):
+            return {}
+        self._require_semantic_trust_journal()
+        return self.semantic_alignment.require_final_claim_acceptance(
+            self.final_conjecture_claim_id,
+            claims=self.graph.claims,
+            trust_state=self.semantic_trust,
+        )
+
+    def _guard_graph_terminal_transition(
+        self,
+        event: CandidateEvent,
+        target_status: str,
+        verified_evidence_level: str,
+    ) -> None:
+        del verified_evidence_level
+        if (
+            not self.semantic_alignment.present
+            or event.claim_id != self.final_conjecture_claim_id
+            or self.domain_semantics.final_outcome(target_status) is None
+        ):
+            return
+        self._require_semantic_trust_journal()
+        self.semantic_alignment.require_final_claim_acceptance(
+            event.claim_id,
+            claims=self.graph.claims,
+            trust_state=self.semantic_trust,
+        )
+
     def _begin_finalization_if_resolved(self, source: str) -> bool:
         claim = self._final_claim()
         if claim is None:
@@ -1451,6 +1529,22 @@ class AutonomousController:
             TrustStatus.CANONICAL_TRUSTED,
         }:
             return False
+        if self.semantic_alignment.present:
+            try:
+                self._semantic_final_postcondition()
+            except (SemanticPromotionError, ValueError) as exc:
+                self.store.append("SEMANTIC_FINALIZATION_BLOCKED", {
+                    "claim_id": self.final_conjecture_claim_id,
+                    "source": source,
+                    "error": _sanitize_live_text(exc),
+                    "semantic_head": self.semantic_alignment.source_sha256,
+                    "contract_head": self.semantic_trust.contract_head,
+                })
+                self._begin_internal_failure_drain(
+                    f"trusted final claim violates semantic postcondition: {exc}",
+                    source="semantic_finalization",
+                )
+                return False
         self.final_claim_resolved = True
         self.final_claim_outcome = outcome
         if self.domain_semantics.domain == "math-research":
@@ -1901,6 +1995,22 @@ class AutonomousController:
                     "RUN_MANIFEST route requests fast without explicit fast mode"
                 )
 
+    def _require_semantics_as_canonical_input(self) -> None:
+        if not self.semantic_trust.opted_in:
+            return
+        manifest = self.config.manifest
+        if manifest is None or self.semantic_alignment.path is None:
+            raise ValueError("semantic opt-in requires a project manifest and semantics file")
+        missing = [
+            role for role in ("director", "research", "audit")
+            if self.semantic_alignment.path not in manifest.canonical_for(role)
+        ]
+        if missing:
+            raise ValueError(
+                "semantic alignment must be a canonical input for every role; missing="
+                f"{missing}"
+            )
+
     def _trusted_state_payload(self, *, transition_kind: str) -> dict[str, Any]:
         existing: dict[str, Any] = {}
         if self.layout.trusted_state_path.is_file():
@@ -1915,7 +2025,7 @@ class AutonomousController:
             if value.trust_status == TrustStatus.AUDITED_NIGHTLY
             and key not in self.conflicted_candidates
         )
-        return {
+        payload = {
             "schema_version": 4,
             "updated_at": utc_now(),
             "source_run": self.run_id,
@@ -1948,6 +2058,9 @@ class AutonomousController:
                 }
             },
         }
+        if self.semantic_trust.opted_in:
+            payload["semantic_alignment"] = self.semantic_trust.to_payload()
+        return payload
 
     def _accept_authorized_canonical_targets(
         self, paths: Iterable[Path],
@@ -1962,7 +2075,22 @@ class AutonomousController:
         *,
         transition_kind: str,
         authorization: dict[str, Any],
+        preconditions: dict[Path, str] | None = None,
     ) -> str | None:
+        semantic_preconditions: dict[Path, str] = {}
+        if self.semantic_alignment.present:
+            self.semantic_alignment.assert_unchanged()
+            if self.semantic_alignment.path is None:
+                raise ValueError("semantic opt-in lost its declaration path")
+            semantic_preconditions[self.semantic_alignment.path] = str(
+                self.semantic_alignment.source_sha256
+            )
+            semantic_preconditions.update(self._semantic_final_postcondition())
+        for path, digest in (preconditions or {}).items():
+            prior = semantic_preconditions.get(path)
+            if prior is not None and prior != digest:
+                raise ValueError(f"canonical preconditions disagree for {path}")
+            semantic_preconditions[path] = digest
         if not self.persist_shared_state:
             self.graph.save()
             return None
@@ -1993,10 +2121,13 @@ class AutonomousController:
             authorization={
                 "kind": transition_kind,
                 "run_id": self.run_id,
+                "semantic_head": self.semantic_alignment.source_sha256,
+                "contract_head": self.semantic_trust.contract_head,
                 **authorization,
             },
             trusted_state_path=self.layout.trusted_state_path,
             claim_graph_sha256=graph_digest,
+            preconditions=semantic_preconditions,
         )
         self._accept_authorized_canonical_targets(targets)
         self.store.append("CANONICAL_TRANSITION_COMMITTED", {
@@ -2010,6 +2141,58 @@ class AutonomousController:
             "authorization": authorization,
         })
         return transition_id
+
+    def _persist_semantic_trust_state(self, *, transition_kind: str) -> str | None:
+        if not self._semantic_trust_dirty:
+            return None
+        if not self.persist_shared_state:
+            self._semantic_trust_dirty = False
+            return None
+        self.semantic_alignment.assert_unchanged()
+        graph_bytes = self.layout.claim_graph_path.read_bytes()
+        graph_digest = bytes_sha256(graph_bytes)
+        preconditions = (
+            {self.semantic_alignment.path: str(self.semantic_alignment.source_sha256)}
+            if self.semantic_alignment.path is not None else {}
+        )
+        targets = {
+            self.layout.claim_graph_path: graph_bytes,
+            self.layout.trusted_state_path: json_bytes(
+                self._trusted_state_payload(transition_kind=transition_kind)
+            ),
+        }
+        transition_id = self.canonical_transitions.commit(
+            targets=targets,
+            authorization={
+                "kind": transition_kind,
+                "run_id": self.run_id,
+                "semantic_head": self.semantic_alignment.source_sha256,
+                "contract_head": self.semantic_trust.contract_head,
+                "trust_upgrade": False,
+            },
+            trusted_state_path=self.layout.trusted_state_path,
+            claim_graph_sha256=graph_digest,
+            preconditions=preconditions,
+        )
+        self._accept_authorized_canonical_targets(targets)
+        self._semantic_trust_dirty = False
+        self.store.append("SEMANTIC_TRUST_STATE_COMMITTED", {
+            "transition_id": transition_id,
+            "transition_kind": transition_kind,
+            "semantic_head": self.semantic_alignment.source_sha256,
+            "contract_head": self.semantic_trust.contract_head,
+        })
+        return transition_id
+
+    def _require_semantic_trust_journal(self) -> None:
+        if not self.persist_shared_state or not self.semantic_trust.opted_in:
+            return
+        authorizations = [
+            dict(record.get("authorization") or {})
+            for record in self.canonical_transitions.records()
+            if record.get("kind") == "COMMITTED"
+        ]
+        self.semantic_trust.require_committed_journal(authorizations)
 
     def _reload_startup_claim_state(self) -> None:
         if self.persist_shared_state:
@@ -2034,10 +2217,13 @@ class AutonomousController:
         }
         self.representation_contracts = {legacy_id: legacy.to_dict()}
         self.audited_representation_bridges = set()
+        trusted: dict[str, Any] = {}
         if self.layout.trusted_state_path.is_file():
             trusted = json.loads(
                 self.layout.trusted_state_path.read_text(encoding="utf-8")
             )
+            if not isinstance(trusted, dict):
+                raise ValueError("canonical trusted state must be a JSON object")
             for representation_id, raw_contract in dict(
                 trusted.get("representation_contracts") or {}
             ).items():
@@ -2061,6 +2247,28 @@ class AutonomousController:
                     and all(isinstance(item, str) and item for item in pair)
                 ):
                     self.audited_representation_bridges.add(tuple(sorted(pair)))
+        loaded_semantic_trust = SemanticTrustState.from_trusted_payload(trusted)
+        self.semantic_alignment = SemanticAlignment.load_optional(
+            self.config.project_root,
+            self.layout.autonomous_root / SEMANTICS_FILENAME,
+            required=loaded_semantic_trust.opted_in,
+        )
+        self.semantic_trust = self.semantic_alignment.reconcile_trust_state(
+            loaded_semantic_trust
+        )
+        self._semantic_trust_dirty = self.semantic_trust != loaded_semantic_trust
+        self._require_semantics_as_canonical_input()
+        self._persist_semantic_trust_state(
+            transition_kind=(
+                "SEMANTIC_OPT_IN"
+                if not loaded_semantic_trust.opted_in
+                else "SEMANTIC_CONTRACT_APPENDED"
+            )
+        )
+        self._require_semantic_trust_journal()
+        self.graph.set_terminal_transition_guard(
+            self._guard_graph_terminal_transition
+        )
         if (
             self.final_conjecture_claim_id
             and self.final_conjecture_claim_id not in self.graph.claims
@@ -3080,6 +3288,9 @@ class AutonomousController:
                 event, extend_artifacts=False,
             )
             artifact_hashes = self._bind_candidate_artifacts(event)
+            semantic_evidence_hashes = self._bind_candidate_semantic_evidence(
+                event, artifact_hashes,
+            )
             self.graph.mark_candidate(event)
             self.inbox.persist(event)
             self.inbox.mark_processed(event, self.run_id, accepted=True)
@@ -3099,6 +3310,7 @@ class AutonomousController:
                 "proposed_evidence_level": event.proposed_evidence_level,
                 "source_run_id": source_run_id,
                 "artifact_hashes": artifact_hashes,
+                "semantic_evidence_hashes": semantic_evidence_hashes,
                 "domain_evidence_receipt_fingerprints": [
                     item["receipt_fingerprint"] for item in verified_receipts
                 ],
@@ -3400,6 +3612,13 @@ class AutonomousController:
                         self.candidate_artifact_hashes[fingerprint] = dict(recorded_hashes)
                     else:
                         self._bind_candidate_artifacts(candidate)
+                    semantic_hashes = self._bind_candidate_semantic_evidence(
+                        candidate, self.candidate_artifact_hashes[fingerprint],
+                    )
+                    if event["payload"].get("semantic_evidence_hashes", {}) != semantic_hashes:
+                        raise ValueError(
+                            "candidate semantic evidence binding changed during resume"
+                        )
                     recorded_receipts = event["payload"].get(
                         "domain_evidence_receipt_fingerprints", []
                     )
@@ -4651,6 +4870,9 @@ class AutonomousController:
                 imported_graph.validate()
                 imported_graph.path = self.graph.path
                 self.graph = imported_graph
+                self.graph.set_terminal_transition_guard(
+                    self._guard_graph_terminal_transition
+                )
                 self.graph.save()
 
         imported_research = 0
@@ -4884,6 +5106,11 @@ class AutonomousController:
                     raise ValueError("previous epoch audit result is invalid")
                 self.audit_gate.record(AuditResult.from_dict(result_raw))
             self.candidate_artifact_hashes[event.fingerprint] = hashes
+            semantic_hashes = self._bind_candidate_semantic_evidence(event, hashes)
+            if raw.get("semantic_evidence_hashes", {}) != semantic_hashes:
+                raise ValueError(
+                    "previous epoch candidate semantic evidence binding changed"
+                )
             self.satisfied_route_conditions.update({
                 event.fingerprint, f"new_evidence:{event.claim_id}",
             })
@@ -5552,6 +5779,7 @@ class AutonomousController:
 
     def _write_compact_snapshot(self) -> Path:
         self._assert_startup_canonical_sources()
+        self._semantic_final_postcondition()
         active_tasks = [active.task.to_dict() for active in self.active.values()]
         current_changes = [
             _bounded_value(item) for item in self.recent_changes[-20:]
@@ -5692,6 +5920,9 @@ class AutonomousController:
                 "artifact_hashes": dict(
                     self.candidate_artifact_hashes.get(fingerprint) or {}
                 ),
+                "semantic_evidence_hashes": dict(
+                    self.candidate_semantic_evidence_hashes.get(fingerprint) or {}
+                ),
                 "audit_status": state.trust_status,
                 "audit_results": [item.to_dict() for item in state.results],
                 "audits_required": state.required,
@@ -5738,6 +5969,7 @@ class AutonomousController:
             task.to_dict() for task in self.pending_audits
         ]
         snapshot["representation_compatibility"] = self._representation_compatibility_view()
+        snapshot["semantic_alignment"] = self._semantic_alignment_view()
         latest_routes: dict[str, dict[str, Any]] = {}
         for record in self.route_ledger.records():
             route_id = str(record.get("route_id") or "")
@@ -5856,6 +6088,40 @@ class AutonomousController:
             ],
             "known_contract_does_not_imply_compatibility": True,
         }
+
+    def _semantic_alignment_view(self) -> dict[str, Any]:
+        if not self.final_conjecture_claim_id:
+            return self.semantic_alignment.summary(
+                self.graph.claims,
+                trust_state=self.semantic_trust,
+                claim_statements={
+                    claim_id: claim.statement
+                    for claim_id, claim in self.graph.claims.items()
+                },
+                claim_objects=self.graph.claims,
+            )
+        return self.semantic_alignment.validate_project(
+            final_claim_id=self.final_conjecture_claim_id,
+            final_claim_statement=self.graph.claims[
+                self.final_conjecture_claim_id
+            ].statement,
+            claim_ids=self.graph.claims,
+            trust_state=self.semantic_trust,
+            claim_statements={
+                claim_id: claim.statement
+                for claim_id, claim in self.graph.claims.items()
+            },
+            claim_objects=self.graph.claims,
+        )
+
+    def _semantic_contract_input(self, workspace: Path) -> str | None:
+        if not self.semantic_alignment.present:
+            return None
+        self.semantic_alignment.assert_unchanged()
+        path = self.semantic_alignment.path
+        if path is None:
+            raise ValueError("semantic alignment path is unavailable")
+        return str(self.workspace.materialize_input(workspace, path))
 
     def _request_replan_when_cycle_idle(self) -> None:
         if not self._replan_after_wave or self.director_needed or self.scheduler_stop_reason:
@@ -5985,6 +6251,7 @@ class AutonomousController:
         history_input = self.workspace.materialize_input(
             workspace, self.run_dir / "EVENTS.jsonl",
         )
+        semantic_contract_input = self._semantic_contract_input(workspace)
         task.required_files = [str(snapshot_input), str(full_context_input)]
         packet = self.workspace.write_task_packet(workspace, {
             "task": task.to_dict(),
@@ -5994,6 +6261,7 @@ class AutonomousController:
             "constraints": self.director_constraints,
             "output_protocol_version": OUTPUT_PROTOCOL_VERSION,
             "state_version": snapshot_version,
+            "semantic_contract": semantic_contract_input,
             "research_policy": self._policy_view(Role.DIRECTOR),
             "workspace": metadata,
         })
@@ -7167,6 +7435,25 @@ class AutonomousController:
             raise ValueError(
                 "final claim candidates must use CRITICAL impact and two independent audits"
             )
+        if not self.semantic_alignment.present:
+            if event.semantic_bridge_ids:
+                raise ValueError("legacy candidates cannot claim semantic bridge verification")
+            return
+        binding = self.semantic_alignment.claims.get(event.claim_id)
+        if binding is None:
+            if event.semantic_bridge_ids:
+                raise ValueError("candidate names semantic bridges without a claim binding")
+            return
+        required_now = event.claim_id == self.final_conjecture_claim_id
+        if event.semantic_bridge_ids or required_now:
+            if tuple(event.semantic_bridge_ids) != binding.required_bridges:
+                raise ValueError(
+                    "candidate semantic_bridge_ids must exactly match the declared ordered path"
+                )
+            if event.representation_id != binding.representation_id:
+                raise ValueError(
+                    "candidate RepresentationContract does not match its semantic binding"
+                )
 
     def _validate_candidate_evidence(self, event: CandidateEvent) -> None:
         level = event.proposed_evidence_level
@@ -7308,6 +7595,38 @@ class AutonomousController:
         self.candidate_artifact_hashes[event.fingerprint] = hashes
         return dict(hashes)
 
+    def _bind_candidate_semantic_evidence(
+        self,
+        event: CandidateEvent,
+        artifact_hashes: dict[str, str],
+    ) -> dict[str, str]:
+        if not event.semantic_bridge_ids:
+            self.candidate_semantic_evidence_hashes.pop(event.fingerprint, None)
+            return {}
+        binding = self.semantic_alignment.claims.get(event.claim_id)
+        if binding is None or tuple(event.semantic_bridge_ids) != binding.required_bridges:
+            raise ValueError("candidate semantic bridge binding changed before sealing")
+        evidence_hashes: dict[str, str] = {}
+        for bridge_id in binding.required_bridges:
+            bridge = self.semantic_alignment.bridges.get(bridge_id)
+            if bridge is None:
+                raise ValueError(f"candidate semantic bridge is undeclared: {bridge_id}")
+            for relative in bridge.evidence:
+                path = (self.config.project_root / relative).resolve()
+                if not path.is_relative_to(self.config.project_root.resolve()) or not path.is_file():
+                    raise ValueError(
+                        f"semantic bridge evidence is unavailable: {relative}"
+                    )
+                evidence_hashes[relative] = file_digest(path)
+        if not set(evidence_hashes.values()).issubset(set(artifact_hashes.values())):
+            raise ValueError(
+                "candidate artifact bundle does not contain every declared semantic evidence file"
+            )
+        self.candidate_semantic_evidence_hashes[event.fingerprint] = dict(
+            sorted(evidence_hashes.items())
+        )
+        return dict(self.candidate_semantic_evidence_hashes[event.fingerprint])
+
     def _verify_candidate_artifacts(
         self, event: CandidateEvent,
     ) -> tuple[bool, dict[str, str], dict[str, str]]:
@@ -7364,9 +7683,13 @@ class AutonomousController:
                     event, extend_artifacts=True,
                 )
                 artifact_hashes = self._bind_candidate_artifacts(event)
+                semantic_evidence_hashes = self._bind_candidate_semantic_evidence(
+                    event, artifact_hashes,
+                )
                 self.graph.mark_candidate(event)
             except ValueError as exc:
                 self.candidate_artifact_hashes.pop(event.fingerprint, None)
+                self.candidate_semantic_evidence_hashes.pop(event.fingerprint, None)
                 self.domain_evidence_receipts.pop(event.fingerprint, None)
                 self.store.append("CANDIDATE_REJECTED", {
                     "event_id": event.event_id, "fingerprint": event.fingerprint,
@@ -7391,6 +7714,7 @@ class AutonomousController:
                 "impact": event.impact,
                 "proposed_evidence_level": event.proposed_evidence_level,
                 "artifact_hashes": artifact_hashes,
+                "semantic_evidence_hashes": semantic_evidence_hashes,
                 "domain_evidence_receipt_fingerprints": [
                     item["receipt_fingerprint"] for item in verified_receipts
                 ],
@@ -7459,6 +7783,13 @@ class AutonomousController:
             })
             return
         role = Role.EVALUATOR_AUDITOR if audit_kind == "independent_evaluator" else Role.AUDITOR
+        semantic_audit_context = self._semantic_audit_context(
+            event,
+            audit_kind=audit_kind,
+            artifact_hashes=dict(
+                self.candidate_artifact_hashes.get(event.fingerprint) or {}
+            ),
+        )
         task = ResearchTask(
             task_id=lease.lease_id,
             role=role, target_claim=event.claim_id,
@@ -7477,6 +7808,7 @@ class AutonomousController:
                 "artifact_hashes": dict(
                     self.candidate_artifact_hashes.get(event.fingerprint) or {}
                 ),
+                "semantic_audit_context": semantic_audit_context,
             },
             representation=event.representation,
         )
@@ -7486,6 +7818,60 @@ class AutonomousController:
             "lease_status": lease.status,
             **task.metadata,
         })
+
+    def _semantic_audit_context(
+        self,
+        event: CandidateEvent,
+        *,
+        audit_kind: str,
+        artifact_hashes: dict[str, str],
+    ) -> dict[str, str] | None:
+        if not event.semantic_bridge_ids:
+            return None
+        state = self.audit_gate.states[event.fingerprint]
+        identity = (
+            "controller-independent-evaluator"
+            if audit_kind == "independent_evaluator"
+            else "controller-independent-auditor"
+        )
+        version = "audit-result-v2"
+        pass_scope_sha256 = stable_hash({
+            "candidate_fingerprint": event.fingerprint,
+            "claim_id": event.claim_id,
+            "exact_statement": " ".join(event.exact_statement.split()),
+            "representation_id": event.representation_id,
+            "artifact_hashes": dict(sorted(artifact_hashes.items())),
+            "semantic_evidence_hashes": dict(sorted(
+                self.candidate_semantic_evidence_hashes.get(event.fingerprint, {}).items()
+            )),
+            "semantic_bridge_ids": list(event.semantic_bridge_ids),
+        })
+        config_sha256 = stable_hash({
+            "audit_kind": audit_kind,
+            "audit_required": state.required,
+            "output_schema_sha256": stable_hash(self._audit_output_schema(event)),
+            "policy_manifest_sha256": (
+                self.policy_manifest["manifest_sha256"]
+                if self.policy_manifest is not None else None
+            ),
+            "semantic_head": self.semantic_alignment.source_sha256,
+            "contract_head": self.semantic_trust.contract_head,
+        })
+        return {
+            "validator_identity": identity,
+            "validator_version": version,
+            "validator_config_sha256": config_sha256,
+            "pass_scope_sha256": pass_scope_sha256,
+        }
+
+    @staticmethod
+    def _require_semantic_audit_context(
+        assigned: Any, expected: dict[str, str] | None,
+    ) -> None:
+        if assigned != expected:
+            raise ValueError(
+                "semantic validator version, config, or PASS scope changed after assignment"
+            )
 
     async def _launch_audits(self) -> None:
         if not self.lifecycle.can_dispatch:
@@ -7558,6 +7944,7 @@ class AutonomousController:
             nightly_claim_graph = self.workspace.materialize_input(
                 workspace, self.active_graph_path,
             )
+            semantic_contract_input = self._semantic_contract_input(workspace)
             packet = self.workspace.write_task_packet(workspace, {
                 "candidate": event.to_dict(),
                 "candidate_artifact_hashes": expected_hashes,
@@ -7569,6 +7956,19 @@ class AutonomousController:
                 ],
                 "canonical_inputs": [str(path) for path in canonical_inputs],
                 "nightly_claim_graph": str(nightly_claim_graph),
+                "semantic_contract": semantic_contract_input,
+                "semantic_claim": self.semantic_alignment.evaluate_claim(
+                    event.claim_id,
+                    trust_state=self.semantic_trust,
+                    claim_statement=event.exact_statement,
+                    claim_assumptions=event.assumptions,
+                    claim_dependencies=event.dependencies,
+                    parent_claim_id=event.parent_claim_id,
+                    check_parent_claim_id=True,
+                ).to_dict(),
+                "semantic_audit_context": task.metadata.get(
+                    "semantic_audit_context"
+                ),
                 "producer_transcript": None,
                 "research_policy": self._policy_view(task.role),
                 "workspace": metadata,
@@ -7738,6 +8138,10 @@ class AutonomousController:
             nightly_claim_graph = self.workspace.materialize_input(
                 workspace, self.active_graph_path,
             )
+            semantic_contract_input = self._semantic_contract_input(workspace)
+            semantic_binding = self.semantic_alignment.claims.get(
+                task.target_claim,
+            )
             # The worker may submit a single validated event file, but cannot
             # write the controller-owned ledger, candidates, audits, or state.
             job_inbox = self._task_inbox(task.task_id)
@@ -7747,9 +8151,43 @@ class AutonomousController:
                 "task": task.to_dict(), "workspace": metadata,
                 "canonical_project": None,
                 "nightly_claim_graph": str(nightly_claim_graph),
+                "semantic_contract": semantic_contract_input,
+                "semantic_claim": self.semantic_alignment.evaluate_claim(
+                    task.target_claim,
+                    trust_state=self.semantic_trust,
+                    claim_statement=(
+                        self.graph.claims[task.target_claim].statement
+                        if task.target_claim in self.graph.claims else None
+                    ),
+                    claim_assumptions=(
+                        self.graph.claims[task.target_claim].assumptions
+                        if task.target_claim in self.graph.claims else None
+                    ),
+                    claim_dependencies=(
+                        self.graph.claims[task.target_claim].dependencies
+                        if task.target_claim in self.graph.claims else None
+                    ),
+                    parent_claim_id=(
+                        self.graph.claims[task.target_claim].parent_claim_id
+                        if task.target_claim in self.graph.claims else None
+                    ),
+                    check_parent_claim_id=task.target_claim in self.graph.claims,
+                ).to_dict(),
                 "required_file_access": required_file_access,
                 "candidate_protocol": {
                     "assigned_claim_id": task.target_claim,
+                    "semantic_binding": (
+                        {
+                            "representation_id": semantic_binding.representation_id,
+                            "required_bridge_ids": list(
+                                semantic_binding.required_bridges
+                            ),
+                            "required_for_final_claim": (
+                                task.target_claim == self.final_conjecture_claim_id
+                            ),
+                        }
+                        if semantic_binding is not None else None
+                    ),
                     "allow_derived_claims": bool(
                         task.metadata.get("allow_derived_claims", False)
                     ),
@@ -7964,6 +8402,7 @@ class AutonomousController:
                     str(active.task.metadata.get("candidate_fingerprint", "")),
                     dict(active.task.metadata.get("artifact_hashes") or {}),
                     str(active.task.metadata.get("audit_lease_id") or ""),
+                    active.task.metadata.get("semantic_audit_context"),
                 )
             else:
                 self._accept_research_result(outcome, active.task, record)
@@ -8405,6 +8844,41 @@ class AutonomousController:
             )
         return resolved
 
+    def _semantic_audit_receipts(
+        self, event: CandidateEvent,
+    ) -> list[dict[str, Any]]:
+        state = self.audit_gate.states[event.fingerprint]
+        artifact_hashes = dict(
+            self.candidate_artifact_hashes.get(event.fingerprint) or {}
+        )
+        receipts: list[dict[str, Any]] = []
+        for result in state.results:
+            if result.verdict != "PASS":
+                continue
+            context = self._semantic_audit_context(
+                event,
+                audit_kind=result.audit_kind,
+                artifact_hashes=artifact_hashes,
+            )
+            if context is None:
+                raise ValueError("semantic candidate PASS lacks a validator context")
+            path = self.audit_root / event.fingerprint / f"{result.audit_id}.json"
+            if not path.is_file():
+                raise ValueError(f"semantic audit result is unavailable: {result.audit_id}")
+            receipts.append({
+                "audit_id": result.audit_id,
+                "audit_kind": result.audit_kind,
+                "auditor_thread_id": result.auditor_thread_id,
+                "result_path": portable_project_uri(
+                    self.config.project_root, path,
+                ),
+                "result_sha256": file_digest(path),
+                "statement_checked_sha256": text_sha256(result.statement_checked),
+                "verified_evidence_level": result.verified_evidence_level,
+                **context,
+            })
+        return receipts
+
     def _accept_audit_result(
         self,
         outcome: JobOutcome,
@@ -8412,6 +8886,7 @@ class AutonomousController:
         assigned_fingerprint: str = "",
         assigned_artifact_hashes: dict[str, str] | None = None,
         audit_lease_id: str = "",
+        assigned_semantic_audit_context: Any = None,
     ) -> None:
         if (
             not outcome.succeeded
@@ -8563,6 +9038,14 @@ class AutonomousController:
             if not audit_lease_id:
                 raise ValueError("audit completion is missing its controller-owned lease")
             lease = self.audit_leases.by_id(audit_lease_id)
+            expected_semantic_context = self._semantic_audit_context(
+                state.event,
+                audit_kind=lease.audit_kind,
+                artifact_hashes=baseline_hashes,
+            )
+            self._require_semantic_audit_context(
+                assigned_semantic_audit_context, expected_semantic_context,
+            )
             result = AuditResult.from_wire_v2(
                 outcome.result,
                 audit_id=f"{lease.lease_id}-{outcome.job_id}",
@@ -8699,6 +9182,104 @@ class AutonomousController:
             return
         if trust == TrustStatus.AUDITED_NIGHTLY:
             verified_level = self.audit_gate.verified_evidence_level(fingerprint)
+            transition = self.domain_semantics.transition_for(
+                event.type, verified_level,
+            )
+            next_status = transition.get("status")
+            receipt: dict[str, Any] | None = None
+            try:
+                self.semantic_alignment.assert_unchanged()
+                if event.semantic_bridge_ids:
+                    receipt = self.semantic_alignment.build_verification_receipt(
+                        trust_state=self.semantic_trust,
+                        candidate=event,
+                        artifact_hashes=dict(
+                            self.candidate_artifact_hashes.get(fingerprint) or {}
+                        ),
+                        evidence_hashes=dict(
+                            self.candidate_semantic_evidence_hashes.get(fingerprint) or {}
+                        ),
+                        domain_evidence_receipt_fingerprints=[
+                            item["receipt_fingerprint"]
+                            for item in self.domain_evidence_receipts.get(fingerprint, [])
+                        ],
+                        audit_receipts=self._semantic_audit_receipts(event),
+                    )
+                    updated_semantic_trust = self.semantic_trust.with_receipt(receipt)
+                    if updated_semantic_trust != self.semantic_trust:
+                        self.semantic_trust = updated_semantic_trust
+                        self._semantic_trust_dirty = True
+                        receipt_preconditions = (
+                            self.semantic_alignment.receipt_file_preconditions(receipt)
+                        )
+                        semantic_transition_id = self._commit_claim_state_transition(
+                            transition_kind="SEMANTIC_VERIFICATION_TRANSITION",
+                            authorization={
+                                "candidate_fingerprint": fingerprint,
+                                "claim_id": event.claim_id,
+                                "semantic_receipt_fingerprint": receipt[
+                                    "receipt_fingerprint"
+                                ],
+                                "bridge_ids": list(event.semantic_bridge_ids),
+                                "audit_receipt_sha256": [
+                                    item["result_sha256"]
+                                    for item in receipt["audit_receipts"]
+                                ],
+                                "trust_upgrade": False,
+                            },
+                            preconditions=receipt_preconditions,
+                        )
+                        self._semantic_trust_dirty = False
+                        self.store.append("SEMANTIC_VERIFICATION_RECORDED", {
+                            "candidate_fingerprint": fingerprint,
+                            "claim_id": event.claim_id,
+                            "semantic_receipt_fingerprint": receipt[
+                                "receipt_fingerprint"
+                            ],
+                            "canonical_transition_id": semantic_transition_id,
+                        })
+                if (
+                    self.semantic_alignment.present
+                    and event.claim_id == self.final_conjecture_claim_id
+                    and next_status is not None
+                    and self.domain_semantics.final_outcome(str(next_status)) is not None
+                ):
+                    self.semantic_alignment.require_final_claim_acceptance(
+                        event.claim_id,
+                        claims=self.graph.claims,
+                        trust_state=self.semantic_trust,
+                    )
+            except SemanticPromotionError as exc:
+                semantic_decision = exc.decision
+                self.store.append("SEMANTIC_PROMOTION_BLOCKED", {
+                    "candidate_fingerprint": fingerprint,
+                    "target_status": next_status,
+                    "candidate_bound": True,
+                    **semantic_decision.to_dict(),
+                })
+                self._record_recent_change({
+                    "kind": "SEMANTIC_PROMOTION_BLOCKED",
+                    "claim_id": event.claim_id,
+                    "semantic_status": semantic_decision.status,
+                })
+                self.director_constraints.append({
+                    "action": "REPAIR_SEMANTIC_BRIDGE",
+                    "claim_id": event.claim_id,
+                    "semantic_status": semantic_decision.status,
+                    "issues": list(semantic_decision.issues),
+                    "source": "trusted_final_claim_gate",
+                })
+                self._request_director(
+                    "audited candidate failed the semantic bridge gate",
+                    meaningful_change=True,
+                )
+                return
+            except ValueError as exc:
+                self._begin_internal_failure_drain(
+                    f"semantic verification failed before claim transition: {exc}",
+                    source="semantic_alignment",
+                )
+                return
             conflict = self._claim_transition_conflict(event)
             if conflict:
                 self.conflicted_candidates.add(fingerprint)
@@ -8742,6 +9323,9 @@ class AutonomousController:
                         item["receipt_fingerprint"]
                         for item in self.domain_evidence_receipts.get(fingerprint, [])
                     ],
+                    "semantic_receipt_fingerprint": (
+                        receipt["receipt_fingerprint"] if receipt is not None else None
+                    ),
                 },
             )
             if bridge is not None:
@@ -8763,6 +9347,15 @@ class AutonomousController:
                     **self._claim_status_payload(changed_claim),
                     "evidence_level": verified_level,
                     "representation_id": event.representation_id,
+                    "semantic_status": self.semantic_alignment.evaluate_claim(
+                        event.claim_id,
+                        trust_state=self.semantic_trust,
+                        claim_statement=changed_claim.statement,
+                        claim_assumptions=changed_claim.assumptions,
+                        claim_dependencies=changed_claim.dependencies,
+                        parent_claim_id=changed_claim.parent_claim_id,
+                        check_parent_claim_id=True,
+                    ).status,
                     "canonical_transition_id": transition_id,
                 })
                 self._record_recent_change({
@@ -9788,6 +10381,7 @@ def build_mock_full_cycle_backend(
     domain: str = "math-research",
     evidence_path: str | None = None,
     evidence_receipts: list[dict[str, str]] | None = None,
+    semantic_bridge_ids: list[str] | None = None,
 ) -> MockCodexBackend:
     assumptions = list(assumptions or [])
     dependencies = list(dependencies or [])
@@ -9798,6 +10392,7 @@ def build_mock_full_cycle_backend(
     }:
         raise ValueError(f"unsupported mock lifecycle domain: {domain}")
     evidence_receipts = list(evidence_receipts or [])
+    semantic_bridge_ids = list(semantic_bridge_ids or [])
     if domain != "math-research" and (
         not evidence_path or not evidence_receipts
     ):
@@ -9884,6 +10479,7 @@ def build_mock_full_cycle_backend(
         "parent_claim_id": None,
         "representation": {"branch":"LEGACY_UNSPECIFIED","localization":"LEGACY_UNSPECIFIED","saturation":"LEGACY_UNSPECIFIED","normalization":"LEGACY_UNSPECIFIED","content":"LEGACY_UNSPECIFIED","exceptional_factors":[],"combination_scope":"LEGACY_UNSPECIFIED"},
         "bridge_representation_ids": [],
+        "semantic_bridge_ids": semantic_bridge_ids,
         "evidence_receipts": evidence_receipts,
         "proposed_evidence_level": proposed_evidence, "timestamp": utc_now(),
     }

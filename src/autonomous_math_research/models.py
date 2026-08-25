@@ -394,6 +394,7 @@ class CandidateEvent:
         default_factory=lambda: RepresentationContract.legacy().to_dict()
     )
     bridge_representation_ids: list[str] = field(default_factory=list)
+    semantic_bridge_ids: list[str] = field(default_factory=list)
     evidence_receipts: list[dict[str, str]] = field(default_factory=list)
     fingerprint_version: int = 1
     evidence_attempt_id: str | None = None
@@ -412,6 +413,7 @@ class CandidateEvent:
             "proposed_evidence_level", "parent_claim_id", "source_run_id",
             "representation",
             "bridge_representation_ids",
+            "semantic_bridge_ids",
             "evidence_receipts",
             "fingerprint_version",
             "evidence_attempt_id",
@@ -432,6 +434,7 @@ class CandidateEvent:
         normalized.setdefault("proposed_evidence_level", EvidenceLevel.E0_SPECULATIVE)
         normalized.setdefault("representation", RepresentationContract.legacy().to_dict())
         normalized.setdefault("bridge_representation_ids", [])
+        normalized.setdefault("semantic_bridge_ids", [])
         normalized.setdefault("evidence_receipts", [])
         normalized.setdefault("fingerprint_version", 1)
         normalized.setdefault("evidence_attempt_id", None)
@@ -462,6 +465,14 @@ class CandidateEvent:
                 raise ValueError("REPRESENTATION_BRIDGE must bind exactly two representations")
         elif bridge_ids:
             raise ValueError("only REPRESENTATION_BRIDGE may set bridge_representation_ids")
+        semantic_bridge_ids = normalized["semantic_bridge_ids"]
+        if not isinstance(semantic_bridge_ids, list) or any(
+            not isinstance(item, str) or not item.startswith("bridge:")
+            for item in semantic_bridge_ids
+        ):
+            raise ValueError("semantic_bridge_ids must contain semantic bridge ids")
+        if len(semantic_bridge_ids) != len(set(semantic_bridge_ids)):
+            raise ValueError("semantic_bridge_ids contains duplicates")
         receipts = normalized["evidence_receipts"]
         if not isinstance(receipts, list):
             raise ValueError("evidence_receipts must be an array")
@@ -533,6 +544,8 @@ class CandidateEvent:
             "representation_id": self.representation_id,
             "bridge_representation_ids": sorted(self.bridge_representation_ids),
         }
+        if self.semantic_bridge_ids:
+            payload["semantic_bridge_ids"] = list(self.semantic_bridge_ids)
         if self.evidence_receipts:
             payload["evidence_receipts"] = sorted(
                 self.evidence_receipts,

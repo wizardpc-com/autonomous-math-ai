@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .domain_semantics import (
     DomainSemantics, builtin_domain_contract, domain_semantics_from_contract,
@@ -30,10 +30,19 @@ class ClaimGraph:
         self.path = path
         self.updated_at = updated_at
         self.semantics = semantics or domain_semantics_from_contract(domain_contract)
+        self._terminal_transition_guard: (
+            Callable[[CandidateEvent, str, str], None] | None
+        ) = None
         for claim in self.claims.values():
             self.semantics.validate_status(claim.math_status)
         self._ensure_proof_obligations()
         self._rebuild_dependents()
+
+    def set_terminal_transition_guard(
+        self,
+        guard: Callable[[CandidateEvent, str, str], None] | None,
+    ) -> None:
+        self._terminal_transition_guard = guard
 
     @classmethod
     def load(
@@ -351,6 +360,14 @@ class ClaimGraph:
         if transition["status"] is None and not transition["trust_change"]:
             return
         next_status = transition["status"]
+        if (
+            next_status is not None
+            and self.semantics.final_outcome(next_status) is not None
+            and self._terminal_transition_guard is not None
+        ):
+            self._terminal_transition_guard(
+                event, str(next_status), verified_evidence_level,
+            )
         current_outcome = self.semantics.final_outcome(claim.math_status)
         next_outcome = (
             self.semantics.final_outcome(next_status)

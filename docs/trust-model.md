@@ -82,6 +82,22 @@ mapping, complete known contracts, and audited bridge pairs. Merely knowing a
 contract does not make it compatible. Persisted contract ids are recomputed from
 their content on load and a mismatch fails before model dispatch.
 
+## Semantic alignment contract
+
+The representation contract above compares low-level task/candidate encodings.
+An optional, domain-independent `semantics.json` adds the end-to-end question:
+does this exact canonical object, through this representation and this
+certificate/computation, reach a validator whose PASS entails this claim?
+
+Its receipt-derived `SemanticStatus` (`VERIFIED`, `BRIDGE_OPEN`,
+`TERM_AMBIGUOUS`, or `UNREVIEWED`) is orthogonal to claim, trust, evidence, and
+execution statuses. `semantics.json` is declaration only; controller-owned
+append-only receipts bind verification to one sealed candidate, its evidence,
+validator configuration and scope, audits, and semantic/contract heads. For an
+opted-in project, **No unverified bridge into trusted final claims** is checked
+over the complete dependency closure. Multi-agent agreement is not evidence for
+a bridge. See [semantic alignment](semantic-alignment.md).
+
 ## Structured output boundary
 
 Output Protocol v2 minimizes role-owned fields. Director, worker, auditor, and

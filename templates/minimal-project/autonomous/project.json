@@ -8,9 +8,9 @@
   "runtime_root": "autonomous",
   "prompt_root": "autonomous/prompts",
   "canonical_inputs": {
-    "director": ["claims/CLAIMS.md", "state/PROGRESS.md"],
-    "research": ["claims/CLAIMS.md", "state/PROGRESS.md"],
-    "audit": ["claims/CLAIMS.md", "state/PROGRESS.md"]
+    "director": ["claims/CLAIMS.md", "state/PROGRESS.md", "autonomous/semantics.json"],
+    "research": ["claims/CLAIMS.md", "state/PROGRESS.md", "autonomous/semantics.json"],
+    "audit": ["claims/CLAIMS.md", "state/PROGRESS.md", "autonomous/semantics.json"]
   },
   "protected_paths": [
     "claims", "proofs", "state", "artifacts", "experiments",
