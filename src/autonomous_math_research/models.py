@@ -583,6 +583,7 @@ class AuditResult:
     notes: list[str]
     report_path: str | None
     verified_evidence_level: str = EvidenceLevel.E0_SPECULATIVE
+    semantic_authority_context: dict[str, Any] | None = None
     timestamp: str = field(default_factory=utc_now)
 
     @classmethod
@@ -593,6 +594,7 @@ class AuditResult:
             raise ValueError(f"unknown audit fields: {sorted(unknown)}")
         required = allowed - {
             "timestamp", "auditor_thread_id", "report_path", "verified_evidence_level",
+            "semantic_authority_context",
             # Legacy run replay did not distinguish blocking gaps from
             # non-blocking audit notes. New App Server output schemas require
             # this field, while local recovery defaults it safely.
@@ -608,6 +610,11 @@ class AuditResult:
         normalized.setdefault("report_path", None)
         normalized.setdefault("notes", [])
         normalized.setdefault("verified_evidence_level", EvidenceLevel.E0_SPECULATIVE)
+        normalized.setdefault("semantic_authority_context", None)
+        if normalized["semantic_authority_context"] is not None and not isinstance(
+            normalized["semantic_authority_context"], dict
+        ):
+            raise ValueError("semantic audit authority context must be an object")
         evidence_rank(str(normalized["verified_evidence_level"]))
         return cls(**normalized)
 
@@ -622,6 +629,7 @@ class AuditResult:
         audit_kind: str,
         statement_checked: str,
         report_path: str | None = None,
+        semantic_authority_context: dict[str, Any] | None = None,
         timestamp: str | None = None,
     ) -> "AuditResult":
         expected = {
@@ -640,6 +648,7 @@ class AuditResult:
             "gaps": data["gaps"],
             "notes": data["notes"],
             "verified_evidence_level": data["verified_evidence_level"],
+            "semantic_authority_context": semantic_authority_context,
             "report_path": report_path,
             "timestamp": timestamp or utc_now(),
         })

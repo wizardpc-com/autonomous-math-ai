@@ -10,7 +10,12 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Semantic alignment verification is now controller-owned and candidate-bound.
   Persistent opt-in, append-only contract heads, evidence/audit/validator scope
-  receipts, dependency-closure final gates, and canonical commit preconditions
+  receipts, controller-owned independent execution identities, exact
+  terminal-state/candidate/receipt bindings for each positive promotion,
+  globally disjoint ClaimGraph claim/proof-obligation id namespaces,
+  ClaimGraph-normalized dependency closure, assignment-time audit authority
+  contexts, validation-authority freshness,
+  and fully verified `PREPARED`/`COMMITTED` canonical authorizations
   enforce **No unverified bridge into trusted final claims** across live,
   startup, resume, recovery, import, direct transition, and finalization paths.
   Structured `core_terms` checks no longer claim to discover arbitrary terms in

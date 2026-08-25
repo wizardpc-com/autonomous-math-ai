@@ -71,6 +71,40 @@ class AuditGate:
             return "independent_evaluator"
         return "adversarial"
 
+    @staticmethod
+    def _recompute_state(state: CandidateAuditState) -> None:
+        if any(result.verdict == "REJECT" for result in state.results):
+            state.trust_status = TrustStatus.REJECTED
+            state.terminal = True
+            return
+        passes = sum(result.verdict == "PASS" for result in state.results)
+        if passes >= state.required:
+            state.trust_status = TrustStatus.AUDITED_NIGHTLY
+            state.terminal = True
+        elif passes:
+            state.trust_status = TrustStatus.AUDIT_1_PASS
+            state.terminal = False
+        else:
+            state.trust_status = TrustStatus.AUDIT_PENDING
+            state.terminal = False
+
+    def discard_pass_results(
+        self, fingerprint: str, audit_ids: set[str],
+    ) -> list[AuditResult]:
+        state = self.states[fingerprint]
+        discarded = [
+            result for result in state.results
+            if result.verdict == "PASS" and result.audit_id in audit_ids
+        ]
+        if discarded:
+            discarded_ids = {result.audit_id for result in discarded}
+            state.results = [
+                result for result in state.results
+                if result.audit_id not in discarded_ids
+            ]
+            self._recompute_state(state)
+        return discarded
+
     def record(self, result: AuditResult) -> str:
         state = self.states[result.candidate_fingerprint]
         if state.terminal:

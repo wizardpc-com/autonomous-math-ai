@@ -3,6 +3,7 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from .models import stable_hash, utc_now
@@ -10,6 +11,20 @@ from .storage import atomic_write_bytes, append_jsonl, read_jsonl
 
 
 TRANSITION_SCHEMA_VERSION = 1
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PREPARED_KEYS = frozenset({
+    "schema_version", "kind", "transition_id", "timestamp", "authorization",
+    "preconditions", "targets",
+})
+_COMMITTED_KEYS = frozenset({
+    "schema_version", "kind", "transition_id", "timestamp", "recovered",
+    "authorization",
+})
+_PRECONDITION_KEYS = frozenset({"path", "sha256"})
+_TARGET_KEYS = frozenset({
+    "path", "before_sha256", "after_sha256", "before_snapshot",
+    "after_snapshot",
+})
 
 
 def json_bytes(value: Any) -> bytes:
@@ -54,17 +69,255 @@ class CanonicalTransitionStore:
     def records(self) -> list[dict[str, Any]]:
         return read_jsonl(self.ledger_path)
 
-    def target_paths(self, transition_id: str) -> tuple[Path, ...]:
-        prepared = next(
-            (
-                item for item in reversed(self.records())
-                if item.get("kind") == "PREPARED"
-                and item.get("transition_id") == transition_id
-            ),
-            None,
+    @staticmethod
+    def _require_exact_keys(
+        value: Any, keys: frozenset[str], label: str,
+    ) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != keys:
+            raise ValueError(f"{label} fields are invalid")
+        return value
+
+    @staticmethod
+    def _require_sha256(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"{label} is not a SHA256 digest")
+        return value
+
+    def _validate_prepared_record(
+        self, record: dict[str, Any], transition_id: str,
+    ) -> dict[str, Any]:
+        prepared = self._require_exact_keys(
+            record, _PREPARED_KEYS, "prepared canonical transition",
         )
-        if prepared is None:
-            raise ValueError("canonical transition lacks a prepared record")
+        if prepared["schema_version"] != TRANSITION_SCHEMA_VERSION:
+            raise ValueError("prepared canonical transition schema is unsupported")
+        if prepared["kind"] != "PREPARED" or prepared["transition_id"] != transition_id:
+            raise ValueError("prepared canonical transition identity is invalid")
+        if not isinstance(prepared["timestamp"], str) or not prepared["timestamp"]:
+            raise ValueError("prepared canonical transition timestamp is invalid")
+        authorization = prepared["authorization"]
+        if not isinstance(authorization, dict):
+            raise ValueError("prepared canonical transition authorization is invalid")
+
+        raw_preconditions = prepared["preconditions"]
+        if not isinstance(raw_preconditions, list):
+            raise ValueError("canonical transition preconditions are invalid")
+        preconditions: dict[str, str] = {}
+        for raw in raw_preconditions:
+            item = self._require_exact_keys(
+                raw, _PRECONDITION_KEYS, "canonical transition precondition",
+            )
+            uri = str(item["path"])
+            self._project_path(uri)
+            if uri in preconditions:
+                raise ValueError("canonical transition preconditions contain duplicate paths")
+            preconditions[uri] = self._require_sha256(
+                item["sha256"], "canonical transition precondition",
+            )
+
+        raw_targets = prepared["targets"]
+        if not isinstance(raw_targets, list) or not raw_targets:
+            raise ValueError("prepared canonical transition has no targets")
+        targets: dict[str, dict[str, Any]] = {}
+        trusted_targets: list[tuple[str, dict[str, Any]]] = []
+        for raw in raw_targets:
+            target = self._require_exact_keys(
+                raw, _TARGET_KEYS, "canonical transition target",
+            )
+            uri = str(target["path"])
+            self._project_path(uri)
+            if uri in targets:
+                raise ValueError("canonical transition targets contain duplicate paths")
+            before_sha = self._require_sha256(
+                target["before_sha256"], "canonical transition before digest",
+            )
+            after_sha = self._require_sha256(
+                target["after_sha256"], "canonical transition after digest",
+            )
+            before = self._bundle_file(transition_id, str(target["before_snapshot"]))
+            after = self._bundle_file(transition_id, str(target["after_snapshot"]))
+            if not before.is_file() or bytes_sha256(before.read_bytes()) != before_sha:
+                raise ValueError("canonical transition before-snapshot is invalid")
+            if not after.is_file() or bytes_sha256(after.read_bytes()) != after_sha:
+                raise ValueError("canonical transition after-snapshot is invalid")
+            normalized = dict(target)
+            targets[uri] = normalized
+            try:
+                payload = json.loads(after.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if (
+                isinstance(payload, dict)
+                and payload.get("last_transition_id") == transition_id
+            ):
+                trusted_targets.append((uri, payload))
+        if len(trusted_targets) != 1:
+            raise ValueError(
+                "canonical transition must identify exactly one trusted-state target"
+            )
+        trusted_uri, trusted_payload = trusted_targets[0]
+        claim_graph_sha256 = self._require_sha256(
+            trusted_payload.get("claim_graph_sha256"),
+            "canonical trusted-state claim graph digest",
+        )
+        claim_graph_uri = trusted_payload.get("claim_graph")
+        if claim_graph_uri is None:
+            matching_graph_targets = [
+                uri for uri, target in targets.items()
+                if uri != trusted_uri and target["after_sha256"] == claim_graph_sha256
+            ]
+            claim_graph_uri = (
+                matching_graph_targets[0] if len(matching_graph_targets) == 1 else None
+            )
+        if not isinstance(claim_graph_uri, str) or (
+            claim_graph_uri not in targets
+            or targets[claim_graph_uri]["after_sha256"] != claim_graph_sha256
+        ):
+            raise ValueError("canonical trusted state does not bind its claim graph target")
+        seed = {
+            "authorization": authorization,
+            "before": {
+                uri: target["before_sha256"] for uri, target in targets.items()
+            },
+            "after": {
+                uri: target["after_sha256"]
+                for uri, target in targets.items() if uri != trusted_uri
+            },
+            "claim_graph_sha256": claim_graph_sha256,
+            "preconditions": dict(sorted(preconditions.items())),
+        }
+        expected_id = f"transition-{stable_hash(seed)[:24]}"
+        if expected_id != transition_id:
+            raise ValueError("canonical transition identity does not match its transaction digest")
+        return prepared
+
+    def _validated_ledger(
+        self, records: list[dict[str, Any]], *, verify_current: bool,
+    ) -> tuple[list[str], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        ordered: list[str] = []
+        prepared_by_id: dict[str, dict[str, Any]] = {}
+        committed_by_id: dict[str, dict[str, Any]] = {}
+        committed: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("canonical transition ledger entry is invalid")
+            transition_id = record.get("transition_id")
+            if not isinstance(transition_id, str) or not transition_id:
+                raise ValueError("canonical transition ledger entry lacks an id")
+            kind = record.get("kind")
+            if kind == "PREPARED":
+                if transition_id in prepared_by_id:
+                    raise ValueError("canonical transition has duplicate PREPARED records")
+                prepared_by_id[transition_id] = self._validate_prepared_record(
+                    record, transition_id,
+                )
+                ordered.append(transition_id)
+                continue
+            if kind != "COMMITTED":
+                raise ValueError("canonical transition ledger contains an unsupported record")
+            committed_record = self._require_exact_keys(
+                record, _COMMITTED_KEYS, "committed canonical transition",
+            )
+            if committed_record["schema_version"] != TRANSITION_SCHEMA_VERSION:
+                raise ValueError("committed canonical transition schema is unsupported")
+            if not isinstance(committed_record["timestamp"], str) or not committed_record[
+                "timestamp"
+            ]:
+                raise ValueError("committed canonical transition timestamp is invalid")
+            if type(committed_record["recovered"]) is not bool:
+                raise ValueError("committed canonical transition recovery marker is invalid")
+            if transition_id in committed_by_id:
+                raise ValueError("canonical transition has duplicate COMMITTED records")
+            prepared = prepared_by_id.get(transition_id)
+            if prepared is None:
+                raise ValueError("committed canonical transition lacks a prepared record")
+            if committed_record["authorization"] != prepared["authorization"]:
+                raise ValueError(
+                    "committed canonical transition authorization disagrees with PREPARED"
+                )
+            committed_by_id[transition_id] = committed_record
+            committed.append(committed_record)
+        if verify_current and committed:
+            transition_id = str(committed[-1]["transition_id"])
+            prepared = prepared_by_id[transition_id]
+            for target in prepared["targets"]:
+                live = self._project_path(str(target["path"]))
+                if not live.is_file() or bytes_sha256(live.read_bytes()) != str(
+                    target["after_sha256"]
+                ):
+                    raise ValueError(
+                        "canonical state differs from the latest committed transition: "
+                        f"{target['path']}"
+                    )
+        return ordered, prepared_by_id, committed
+
+    def verified_committed_records(self, *, recover: bool = True) -> list[dict[str, Any]]:
+        """Return only COMMITTED records proven to belong to canonical transactions."""
+        if recover:
+            self.recover()
+        _, _, committed = self._validated_ledger(
+            self.records(), verify_current=True,
+        )
+        return [dict(item) for item in committed]
+
+    def verified_committed_authorizations(
+        self, *, recover: bool = True,
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(item["authorization"])
+            for item in self.verified_committed_records(recover=recover)
+        ]
+
+    def verified_committed_transactions(
+        self, *, recover: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return verified authorizations with their exact before/after snapshots."""
+        if recover:
+            self.recover()
+        _, prepared_by_id, committed = self._validated_ledger(
+            self.records(), verify_current=True,
+        )
+        transactions: list[dict[str, Any]] = []
+        for record in committed:
+            transition_id = str(record["transition_id"])
+            prepared = prepared_by_id[transition_id]
+            targets: list[dict[str, Any]] = []
+            for target in prepared["targets"]:
+                before = self._bundle_file(
+                    transition_id, str(target["before_snapshot"]),
+                ).read_bytes()
+                after = self._bundle_file(
+                    transition_id, str(target["after_snapshot"]),
+                ).read_bytes()
+                if bytes_sha256(before) != str(target["before_sha256"]) or (
+                    bytes_sha256(after) != str(target["after_sha256"])
+                ):
+                    raise ValueError("canonical transition snapshot is invalid")
+                targets.append({
+                    "path": str(target["path"]),
+                    "before": before,
+                    "after": after,
+                })
+            transactions.append({
+                "transition_id": transition_id,
+                "authorization": dict(record["authorization"]),
+                "targets": targets,
+            })
+        return transactions
+
+    def verified_prepared_record(
+        self, transition_id: str, *, recover: bool = True,
+    ) -> dict[str, Any]:
+        committed = self.verified_committed_records(recover=recover)
+        if transition_id not in {str(item["transition_id"]) for item in committed}:
+            raise ValueError("canonical transition is not a verified committed transaction")
+        _, prepared_by_id, _ = self._validated_ledger(
+            self.records(), verify_current=True,
+        )
+        return dict(prepared_by_id[transition_id])
+
+    def target_paths(self, transition_id: str) -> tuple[Path, ...]:
+        prepared = self.verified_prepared_record(transition_id)
         return tuple(
             self._project_path(str(target["path"]))
             for target in prepared["targets"]
@@ -72,21 +325,16 @@ class CanonicalTransitionStore:
 
     def recover(self) -> list[str]:
         records = self.records()
-        latest: dict[str, dict[str, Any]] = {}
-        ordered: list[str] = []
-        for record in records:
-            transition_id = str(record.get("transition_id") or "")
-            if not transition_id:
-                raise ValueError("canonical transition ledger entry lacks an id")
-            if transition_id not in latest:
-                ordered.append(transition_id)
-            latest[transition_id] = record
+        ordered, prepared_by_id, committed = self._validated_ledger(
+            records, verify_current=False,
+        )
+        committed_ids = {str(item["transition_id"]) for item in committed}
 
         recovered: list[str] = []
         for transition_id in ordered:
-            record = latest[transition_id]
-            if record.get("kind") != "PREPARED":
+            if transition_id in committed_ids:
                 continue
+            record = prepared_by_id[transition_id]
             preconditions = record.get("preconditions") or []
             if not isinstance(preconditions, list):
                 raise ValueError("canonical transition preconditions are invalid")
@@ -134,49 +382,15 @@ class CanonicalTransitionStore:
         return recovered
 
     def verify_current(self) -> None:
-        records = self.records()
-        committed = [item for item in records if item.get("kind") == "COMMITTED"]
-        if not committed:
-            return
-        transition_id = str(committed[-1]["transition_id"])
-        prepared = next(
-            (
-                item for item in reversed(records)
-                if item.get("kind") == "PREPARED"
-                and item.get("transition_id") == transition_id
-            ),
-            None,
-        )
-        if prepared is None:
-            raise ValueError("committed canonical transition lacks a prepared record")
-        for target in prepared["targets"]:
-            live = self._project_path(str(target["path"]))
-            if not live.is_file() or bytes_sha256(live.read_bytes()) != str(
-                target["after_sha256"]
-            ):
-                raise ValueError(
-                    "canonical state differs from the latest committed transition: "
-                    f"{target['path']}"
-                )
+        self._validated_ledger(self.records(), verify_current=True)
 
     def current_target_digests(self) -> dict[str, str]:
         """Return the exact live digests authorized by the latest transition."""
-        self.verify_current()
-        records = self.records()
-        committed = [item for item in records if item.get("kind") == "COMMITTED"]
+        committed = self.verified_committed_records()
         if not committed:
             return {}
         transition_id = str(committed[-1]["transition_id"])
-        prepared = next(
-            (
-                item for item in reversed(records)
-                if item.get("kind") == "PREPARED"
-                and item.get("transition_id") == transition_id
-            ),
-            None,
-        )
-        if prepared is None:
-            raise ValueError("committed canonical transition lacks a prepared record")
+        prepared = self.verified_prepared_record(transition_id, recover=False)
         return {
             str(target["path"]): str(target["after_sha256"])
             for target in prepared["targets"]

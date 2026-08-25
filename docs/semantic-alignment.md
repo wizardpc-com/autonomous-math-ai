@@ -49,7 +49,7 @@ Every bridge declaration has `source`, `target`, `justification`, and
 project-relative `evidence`. `semantics.json` has no trusted status field. It is
 only a declarative registry, contract, claim binding, and bridge path.
 
-A terminal claim path must be ordered and continuous:
+A terminal-positive claim path must be ordered and continuous:
 
 ```text
 object:... -> representation:... -> evidence:... -> validator:... -> claim:...
@@ -61,12 +61,27 @@ must be the exact claim id. Semantic Alignment v1 accepts only a linear path;
 relationships that cannot be expressed this way fail closed.
 
 `VERIFIED` is derived only from controller-owned append-only receipts in the
-canonical trusted-state journal. A receipt binds one sealed `CandidateEvent` to
+canonical trusted-state journal. An authoritative receipt is created only for
+the audited candidate that actually authorizes a terminal-positive transition;
+earlier semantic review is provisional evidence. A receipt binds one sealed `CandidateEvent` to
 its exact claim and statement, content-addressed `RepresentationContract`,
 artifact and bridge-evidence hashes, validator identity/version/config, exact
-PASS scope, independent audit result receipts, ordered bridge ids, and the
-contract and semantic heads current at verification time. Candidate A's receipt
-cannot verify candidate B.
+PASS scope, the ClaimGraph-normalized dependency shape, independent audit result
+receipts, ordered bridge ids, the validation-authority head, and the contract
+and semantic heads current at verification time. Its producer execution
+identity and every auditor execution identity are controller-injected, nonempty,
+and pairwise independent.
+
+The same canonical transaction installs the terminal ClaimGraph state, receipt,
+and a terminal binding containing the claim id, terminal status, exact candidate
+fingerprint, exact receipt fingerprint, representation/content hash, and
+authorization fingerprint. Validation accepts that authorization only after
+verifying the matching `PREPARED`/`COMMITTED` transaction and current canonical
+targets. The commit boundary and journal replay compare the exact before/after
+ClaimGraph snapshots: every non-positive to positive-terminal change must append
+a new receipt and binding in that same `AUDITED_CLAIM_TRANSITION`. Candidate A's
+historical receipt therefore cannot verify a later promotion or terminal state
+established by candidate B.
 
 The enforced invariant is **No unverified bridge into trusted final claims.**
 A validator PASS or collection of agreeing agents cannot replace a matching
@@ -83,10 +98,11 @@ The controller checks deterministically:
 - bridge existence, ordering, layer types, endpoints, and allowed
   representations;
 - sealed-candidate identity, representation, evidence and audit receipt hashes,
-  validator configuration and PASS scope;
+  validator configuration, validation-authority head, and PASS scope;
+- controller-owned producer/auditor identities and their independence;
 - persistent opt-in and append-only contract history;
-- semantic/contract/candidate preconditions at canonical commit and crash
-  recovery;
+- semantic/contract/candidate preconditions plus complete `PREPARED`/`COMMITTED`
+  authorization agreement at canonical commit and crash recovery;
 - the same final semantic postcondition at startup, resume, checkpoint/import,
   direct ClaimGraph terminal transition, canonical mutation, and finalization.
 
@@ -105,7 +121,28 @@ reach a domain-level terminal status while their semantic status remains
 `UNREVIEWED`, so ordinary internal research is not frozen. Before such a claim
 enters the transitive dependency closure of a trusted final claim, it must gain
 its own declaration binding and candidate-bound semantic audit receipt. The
-final acceptance gate traverses that complete dependency closure.
+final acceptance gate uses ClaimGraph's canonical resolver for both direct claim
+dependencies and every proof-obligation dependency. An obligation-id dependency
+resolves to its owning claim and is included in the same closure. The normalized
+shape is part of candidate audit scope and receipt freshness. Claim ids and
+proof-obligation ids must be globally disjoint; a collision makes the
+authoritative ClaimGraph invalid before dependency resolution. Once a
+subclaim has a semantic binding, every terminal-positive candidate for it must
+submit that binding's complete ordered `semantic_bridge_ids`.
+
+`validation_authority_head` is the deterministic hash of the accepted validator
+identities and version, canonical audit configuration digest, and policy-manifest
+digest. A changed head makes prior authoritative receipts stale; v1 requires a
+fresh audit rather than attempting policy migration. Each audit assignment and
+PASS result persist the controller-generated authority head, validator identity
+and version, audit and policy digests, PASS scope, and context schema version.
+Replay and checkpoint import retain that historical context; they never replace
+it with the current authority when constructing a receipt.
+
+Negative terminal states such as `FAILED`, `REFUTED`, and `NOT_SUPPORTED` keep
+their normal domain audit and canonical gates, but Semantic Alignment v1 does
+not claim that the positive validator-to-claim path entails a refutation. They
+therefore do not receive `VERIFIED` from this positive bridge contract.
 
 ## Legacy projects
 
@@ -138,5 +175,5 @@ For an existing project:
 
 Do not combine this migration with claim-status promotion. First establish and
 review the semantic declaration, then submit a sealed candidate through the
-normal audit and canonical gates. Opt-in and all later bridge-verification
-transitions remain in trusted append-only history.
+normal audit and canonical gates. Opt-in and all later terminal-positive
+bridge-verification transitions remain in trusted append-only history.

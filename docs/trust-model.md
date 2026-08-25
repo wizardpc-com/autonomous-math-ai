@@ -93,10 +93,21 @@ Its receipt-derived `SemanticStatus` (`VERIFIED`, `BRIDGE_OPEN`,
 `TERM_AMBIGUOUS`, or `UNREVIEWED`) is orthogonal to claim, trust, evidence, and
 execution statuses. `semantics.json` is declaration only; controller-owned
 append-only receipts bind verification to one sealed candidate, its evidence,
-validator configuration and scope, audits, and semantic/contract heads. For an
+the ClaimGraph-normalized dependency shape, validator configuration and
+validation-authority head, audits, and semantic/contract heads. Claim and
+proof-obligation ids occupy disjoint global namespaces. Audit PASS evidence
+also carries its controller-generated assignment-time authority context;
+current authority is never substituted during replay or receipt construction. For an
 opted-in project, **No unverified bridge into trusted final claims** is checked
 over the complete dependency closure. Multi-agent agreement is not evidence for
-a bridge. See [semantic alignment](semantic-alignment.md).
+a bridge. Producer and auditor execution identities are injected by the
+controller, persisted in the receipt, and required to be nonempty and distinct.
+The terminal-positive ClaimGraph state and its exact candidate/receipt binding
+are installed by one verified canonical transaction. Verified before/after
+snapshots require every new or repeated positive promotion to append its own
+authorization; historical bindings cannot authorize re-promotion. Negative terminal states
+retain their domain audit gates without being mislabeled as positive semantic
+entailment. See [semantic alignment](semantic-alignment.md).
 
 ## Structured output boundary
 

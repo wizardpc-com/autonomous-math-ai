@@ -52,9 +52,27 @@ class ClaimGraph:
         semantics: DomainSemantics | None = None,
         domain_contract: dict[str, Any] | None = None,
     ) -> "ClaimGraph":
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_payload(
+            raw,
+            path=path,
+            semantics=semantics,
+            domain_contract=domain_contract,
+        )
+
+    @classmethod
+    def from_payload(
+        cls,
+        raw: Any,
+        *,
+        path: Path | None = None,
+        semantics: DomainSemantics | None = None,
+        domain_contract: dict[str, Any] | None = None,
+    ) -> "ClaimGraph":
         if semantics is not None and domain_contract is not None:
             raise ValueError("use semantics or domain_contract, not both")
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("claim graph payload must be a JSON object")
         has_raw_domain = "domain" in raw
         raw_domain = raw.get("domain")
         if has_raw_domain and (
@@ -84,13 +102,170 @@ class ClaimGraph:
         }
         return cls(claims, path, raw.get("updated_at"), semantics=resolved_semantics)
 
+    def _obligation_owners(self) -> dict[str, str]:
+        owners: dict[str, str] = {}
+        claim_ids = set(self.claims)
+        for claim_id, claim in self.claims.items():
+            for obligation in claim.proof_obligations:
+                if obligation.obligation_id in claim_ids:
+                    raise ValueError(
+                        "claim ids and proof obligation ids must be globally disjoint: "
+                        f"{obligation.obligation_id}"
+                    )
+                prior = owners.setdefault(obligation.obligation_id, claim_id)
+                if prior != claim_id:
+                    raise ValueError("proof obligation ids must be globally unique")
+        return owners
+
+    @staticmethod
+    def normalize_dependency_shape(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != {
+            "claim_id", "claim_dependencies", "proof_obligations",
+        }:
+            raise ValueError("canonical dependency shape fields are invalid")
+        claim_id = value["claim_id"]
+        claim_dependencies = value["claim_dependencies"]
+        obligations = value["proof_obligations"]
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise ValueError("canonical dependency shape claim_id is invalid")
+        if (
+            not isinstance(claim_dependencies, list)
+            or any(not isinstance(item, str) or not item for item in claim_dependencies)
+            or claim_dependencies != sorted(set(claim_dependencies))
+        ):
+            raise ValueError("canonical claim dependencies are not normalized")
+        if not isinstance(obligations, list):
+            raise ValueError("canonical proof obligation dependencies are invalid")
+        normalized_obligations: list[dict[str, Any]] = []
+        prior_obligation_id: str | None = None
+        for raw_obligation in obligations:
+            if not isinstance(raw_obligation, dict) or set(raw_obligation) != {
+                "obligation_id", "dependencies",
+            }:
+                raise ValueError("canonical proof obligation dependency fields are invalid")
+            obligation_id = raw_obligation["obligation_id"]
+            dependencies = raw_obligation["dependencies"]
+            if not isinstance(obligation_id, str) or not obligation_id:
+                raise ValueError("canonical proof obligation id is invalid")
+            if prior_obligation_id is not None and obligation_id <= prior_obligation_id:
+                raise ValueError("canonical proof obligations are not normalized")
+            prior_obligation_id = obligation_id
+            if not isinstance(dependencies, list):
+                raise ValueError("canonical proof obligation dependencies are invalid")
+            normalized_dependencies: list[dict[str, str]] = []
+            prior_dependency_id: str | None = None
+            for dependency in dependencies:
+                if not isinstance(dependency, dict) or set(dependency) != {
+                    "dependency_id", "dependency_kind", "resolved_claim_id",
+                }:
+                    raise ValueError("canonical dependency reference fields are invalid")
+                dependency_id = dependency["dependency_id"]
+                dependency_kind = dependency["dependency_kind"]
+                resolved_claim_id = dependency["resolved_claim_id"]
+                if (
+                    not isinstance(dependency_id, str) or not dependency_id
+                    or dependency_kind not in {"claim", "proof_obligation"}
+                    or not isinstance(resolved_claim_id, str) or not resolved_claim_id
+                ):
+                    raise ValueError("canonical dependency reference is invalid")
+                if prior_dependency_id is not None and dependency_id <= prior_dependency_id:
+                    raise ValueError("canonical dependency references are not normalized")
+                prior_dependency_id = dependency_id
+                normalized_dependencies.append(dict(dependency))
+            normalized_obligations.append({
+                "obligation_id": obligation_id,
+                "dependencies": normalized_dependencies,
+            })
+        return {
+            "claim_id": claim_id,
+            "claim_dependencies": list(claim_dependencies),
+            "proof_obligations": normalized_obligations,
+        }
+
+    def canonical_dependency_shape(self, claim_id: str) -> dict[str, Any]:
+        claim = self.claims.get(claim_id)
+        if claim is None:
+            raise ValueError(f"dependency claim is absent: {claim_id}")
+        owners = self._obligation_owners()
+        missing_claim_dependencies = set(claim.dependencies) - set(self.claims)
+        if missing_claim_dependencies:
+            raise ValueError(
+                f"{claim_id} has missing dependencies: {sorted(missing_claim_dependencies)}"
+            )
+        obligations: list[dict[str, Any]] = []
+        for obligation in sorted(
+            claim.proof_obligations, key=lambda item: item.obligation_id,
+        ):
+            dependencies: list[dict[str, str]] = []
+            for dependency_id in sorted(set(obligation.dependencies)):
+                if dependency_id in self.claims:
+                    dependency_kind = "claim"
+                    resolved_claim_id = dependency_id
+                elif dependency_id in owners:
+                    dependency_kind = "proof_obligation"
+                    resolved_claim_id = owners[dependency_id]
+                else:
+                    raise ValueError(
+                        f"{obligation.obligation_id} has missing dependency: {dependency_id}"
+                    )
+                dependencies.append({
+                    "dependency_id": dependency_id,
+                    "dependency_kind": dependency_kind,
+                    "resolved_claim_id": resolved_claim_id,
+                })
+            obligations.append({
+                "obligation_id": obligation.obligation_id,
+                "dependencies": dependencies,
+            })
+        return self.normalize_dependency_shape({
+            "claim_id": claim_id,
+            "claim_dependencies": sorted(set(claim.dependencies)),
+            "proof_obligations": obligations,
+        })
+
+    def resolved_dependency_claim_ids(self, claim_id: str) -> tuple[str, ...]:
+        shape = self.canonical_dependency_shape(claim_id)
+        resolved = set(shape["claim_dependencies"])
+        for obligation in shape["proof_obligations"]:
+            resolved.update(
+                dependency["resolved_claim_id"]
+                for dependency in obligation["dependencies"]
+            )
+        resolved.discard(claim_id)
+        return tuple(sorted(resolved))
+
+    def dependency_claim_closure(self, root_claim_id: str) -> tuple[str, ...]:
+        closure: list[str] = []
+        pending = [root_claim_id]
+        seen: set[str] = set()
+        while pending:
+            claim_id = pending.pop()
+            if claim_id in seen:
+                continue
+            if claim_id not in self.claims:
+                raise ValueError(f"trusted final claim dependency is absent: {claim_id}")
+            seen.add(claim_id)
+            closure.append(claim_id)
+            pending.extend(reversed(self.resolved_dependency_claim_ids(claim_id)))
+        return tuple(closure)
+
+    def positive_terminal_promotions(
+        self, previous_statuses: dict[str, str],
+    ) -> tuple[tuple[str, str], ...]:
+        positive = self.semantics.terminal_positive
+        return tuple(
+            (claim_id, claim.research_status)
+            for claim_id, claim in sorted(self.claims.items())
+            if claim.research_status in positive
+            and previous_statuses.get(claim_id) not in positive
+        )
+
     def _rebuild_dependents(self) -> None:
         for claim in self.claims.values():
             claim.downstream_dependents = []
         for claim in self.claims.values():
-            for dep in claim.dependencies:
-                if dep in self.claims:
-                    self.claims[dep].downstream_dependents.append(claim.claim_id)
+            for dep in self.resolved_dependency_claim_ids(claim.claim_id):
+                self.claims[dep].downstream_dependents.append(claim.claim_id)
         for claim in self.claims.values():
             claim.downstream_dependents.sort()
 
@@ -111,7 +286,9 @@ class ClaimGraph:
             return
         if claim.proof_obligations:
             return
-        statements = [item for item in claim.current_gaps if str(item).strip()]
+        statements = list(dict.fromkeys(
+            item for item in claim.current_gaps if str(item).strip()
+        ))
         if not statements:
             statements = [claim.statement]
         trusted_terminal = claim.trust_status in {
@@ -147,6 +324,7 @@ class ClaimGraph:
             self._ensure_claim_obligations(claim)
 
     def validate(self) -> None:
+        self._obligation_owners()
         all_obligations = {
             obligation.obligation_id
             for claim in self.claims.values()
@@ -176,6 +354,7 @@ class ClaimGraph:
                         f"{obligation.obligation_id} has missing dependencies: "
                         f"{sorted(missing_obligation_dependencies)}"
                     )
+            self.canonical_dependency_shape(claim.claim_id)
         visiting: set[str] = set()
         visited: set[str] = set()
 
@@ -185,7 +364,7 @@ class ClaimGraph:
             if node in visited:
                 return
             visiting.add(node)
-            for dep in self.claims[node].dependencies:
+            for dep in self.resolved_dependency_claim_ids(node):
                 visit(dep)
             visiting.remove(node)
             visited.add(node)
@@ -449,8 +628,9 @@ class ClaimGraph:
         while changed:
             changed = False
             for claim in self.claims.values():
-                bad = sorted(set(claim.dependencies) & failed)
-                inherited = sorted(dep for dep in claim.dependencies if dep in blocked)
+                dependencies = self.resolved_dependency_claim_ids(claim.claim_id)
+                bad = sorted(set(dependencies) & failed)
+                inherited = sorted(dep for dep in dependencies if dep in blocked)
                 reasons = bad + inherited
                 if reasons and claim.claim_id not in blocked:
                     blocked[claim.claim_id] = reasons

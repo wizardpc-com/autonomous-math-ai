@@ -280,6 +280,11 @@ For `math-research`, proof obligations live inside each canonical `ClaimGraph`
 claim (schema v3). They have stable content-derived ids, status, dependencies,
 and evidence paths. `proof_frontier` derives `remaining_obligation_ids` and
 `next_obligation_id` from that graph; there is no parallel `proof_state`.
+ClaimGraph also owns the canonical dependency resolver: it normalizes direct
+claim and proof-obligation edges, resolves obligation ids to owning claims, and
+provides the dependency closure consumed by semantic receipts and final gates.
+Claim ids and proof-obligation ids are globally disjoint; a collision invalidates
+the graph before the resolver can apply either interpretation.
 Legacy v1/v2 math graphs gain a deterministic root/gap obligation on load.
 
 Non-math graphs use `research_frontier` with the pack's `certificate` or
@@ -291,11 +296,18 @@ The trusted-state file stores audit provenance and binds to the exact graph
 SHA-256; it is not a second frontier. Controller-authorized changes stage both
 files, append a `PREPARED` record, atomically install the staged bytes, then
 append `COMMITTED`. Recovery accepts only the recorded before or after digest
-for every target and otherwise fails closed. The retained snapshots make the
+for every target and otherwise fails closed. Authorization consumers also
+recompute the transaction identity, require matching `PREPARED` and `COMMITTED`
+authorization, and verify the current canonical targets. The retained snapshots make the
 transition reviewable and replayable without promoting a model result directly.
 If a canonical Markdown input contains the explicit machine-state markers, its
 generated block is another target in the same transaction; prose outside the
 block and all unmarked Markdown remain unchanged.
+
+Canonical project state is single-writer: one controller may own a project at a
+time. The transaction journal detects changed preconditions and corrupt or
+overlapping state, but this release does not provide a distributed lock for two
+controllers intentionally writing the same project concurrently.
 
 Status domains are intentionally separate: the pinned domain contract describes
 claim status (`MathStatus` remains the compatibility API for the math wire
@@ -312,8 +324,15 @@ to claims. It cannot declare trusted status. The controller supplies the frozen
 declaration and receipt-derived per-claim semantic status to Director,
 research, and Auditor packets.
 
-For opted-in projects, the controller records contract heads and candidate-bound
-verification receipts in the existing canonical trusted journal. The unified
+For opted-in projects, the controller records contract heads and exact
+candidate/receipt terminal bindings in the existing canonical trusted journal.
+Only the audited candidate that performs a terminal-positive transition receives
+an authoritative receipt. Every non-positive to positive-terminal change must
+append its new exact receipt and terminal binding in that same canonical
+`AUDITED_CLAIM_TRANSITION`; verified before/after snapshots enforce the rule at
+commit, startup, replay, and validation. Receipts also bind a deterministic
+validation-authority head over validator identities/version, audit configuration,
+and the policy manifest, so authority drift requires fresh audit. The unified
 authoritative mutation/finalization boundary checks the final claim's transitive
 dependency closure and enforces **No unverified bridge into trusted final
 claims** across live audit, direct graph transition, startup/resume,

@@ -22,19 +22,23 @@ from autonomous_math_research.models import (
     CandidateEvent,
     EvidenceLevel,
     Impact,
+    LifecyclePhase,
     MathStatus,
     TrustStatus,
     derived_claim_id,
 )
+from autonomous_math_research.policy import build_policy_manifest
 from autonomous_math_research.representation import RepresentationContract
 from autonomous_math_research.semantic_alignment import (
+    SEMANTIC_AUDIT_AUTHORITY_CONTEXT_SCHEMA_VERSION,
     SemanticAlignment,
     SemanticPromotionError,
     SemanticStatus,
     SemanticTrustState,
+    build_validation_authority_head,
     text_sha256,
 )
-from autonomous_math_research.storage import file_digest
+from autonomous_math_research.storage import append_jsonl, file_digest
 from autonomous_math_research.validation import validate_project
 
 
@@ -136,13 +140,15 @@ def candidate(
     statement: str = GOAL,
     dependencies: list[str] | None = None,
     bridge_ids: list[str] | None = None,
+    candidate_type: str = "THEOREM_CANDIDATE",
+    evidence_attempt_id: str | None = None,
 ) -> CandidateEvent:
     return CandidateEvent.from_dict({
         "event_id": f"candidate-{uuid4().hex}",
-        "producer_thread_id": None,
+        "producer_thread_id": "producer-thread",
         "producer_task_id": "test-prover",
         "claim_id": claim_id,
-        "type": "THEOREM_CANDIDATE",
+        "type": candidate_type,
         "impact": Impact.CRITICAL,
         "concise_summary": "sealed test candidate",
         "exact_statement": statement,
@@ -156,6 +162,8 @@ def candidate(
         "bridge_representation_ids": [],
         "semantic_bridge_ids": list(BRIDGES if bridge_ids is None else bridge_ids),
         "evidence_receipts": [],
+        "fingerprint_version": 2 if evidence_attempt_id is not None else 1,
+        "evidence_attempt_id": evidence_attempt_id,
         "proposed_evidence_level": EvidenceLevel.E0_SPECULATIVE,
     })
 
@@ -203,14 +211,44 @@ class SemanticAlignmentTests(unittest.TestCase):
         )
         return project
 
+    def validation_authority_head(self, project: Path) -> str:
+        config = load_config(project)
+        return build_validation_authority_head(
+            audit_config=dict(config.raw["audit"]),
+            policy_manifest_sha256=str(
+                build_policy_manifest(config)["manifest_sha256"]
+            ),
+        )
+
     def trust_and_receipt(
         self,
         project: Path,
         event: CandidateEvent | None = None,
+        *,
+        claim_graph: ClaimGraph | None = None,
+        base_trust: SemanticTrustState | None = None,
     ) -> tuple[SemanticAlignment, SemanticTrustState, dict]:
         alignment = SemanticAlignment.load_optional(project)
-        trust = alignment.reconcile_trust_state(SemanticTrustState.legacy())
+        trust = alignment.reconcile_trust_state(
+            base_trust or SemanticTrustState.legacy()
+        )
         event = event or candidate()
+        graph = claim_graph or ClaimGraph.load(
+            project / "autonomous" / "state" / "claim_graph.json"
+        )
+        authority_head = self.validation_authority_head(project)
+        config = load_config(project)
+        policy_manifest_sha256 = str(
+            build_policy_manifest(config)["manifest_sha256"]
+        )
+        dependency_shape_sha256 = payload_sha256(
+            graph.canonical_dependency_shape(event.claim_id)
+        )
+        candidate_scope_sha256 = payload_sha256({
+            "candidate_fingerprint": event.fingerprint,
+            "dependency_shape_sha256": dependency_shape_sha256,
+            "validation_authority_head": authority_head,
+        })
         evidence_path = project / EVIDENCE
         digest = file_digest(evidence_path)
         audit_path = project / "autonomous" / "state" / "test-audit.json"
@@ -226,6 +264,7 @@ class SemanticAlignmentTests(unittest.TestCase):
             "artifact_hashes": artifact_hashes,
             "semantic_evidence_hashes": evidence_hashes,
             "semantic_bridge_ids": list(event.semantic_bridge_ids),
+            "candidate_scope_sha256": candidate_scope_sha256,
         })
         audit_receipt = {
             "audit_id": "audit-test",
@@ -239,6 +278,20 @@ class SemanticAlignmentTests(unittest.TestCase):
             "validator_version": "audit-result-v2",
             "validator_config_sha256": "1" * 64,
             "pass_scope_sha256": pass_scope,
+            "authority_context": {
+                "schema_version": (
+                    SEMANTIC_AUDIT_AUTHORITY_CONTEXT_SCHEMA_VERSION
+                ),
+                "validation_authority_head": authority_head,
+                "validator_identity": "controller-independent-auditor",
+                "validator_version": "audit-result-v2",
+                "audit_config_sha256": payload_sha256(
+                    dict(config.raw["audit"])
+                ),
+                "policy_manifest_sha256": policy_manifest_sha256,
+                "validator_config_sha256": "1" * 64,
+                "pass_scope_sha256": pass_scope,
+            },
         }
         receipt = alignment.build_verification_receipt(
             trust_state=trust,
@@ -247,8 +300,19 @@ class SemanticAlignmentTests(unittest.TestCase):
             evidence_hashes=evidence_hashes,
             domain_evidence_receipt_fingerprints=[],
             audit_receipts=[audit_receipt],
+            producer_identity={
+                "run_id": "run-test",
+                "job_id": "job-test",
+                "task_id": event.producer_task_id,
+                "thread_id": str(event.producer_thread_id),
+                "role": "prover",
+            },
+            claim_graph=graph,
+            validation_authority_head=authority_head,
         )
-        return alignment, trust.with_receipt(receipt), receipt
+        trust = trust.with_receipt(receipt)
+        trust, _ = trust.with_terminal_binding(receipt, MathStatus.PROVED)
+        return alignment, trust, receipt
 
     def persistent_controller(self, project: Path) -> AutonomousController:
         return AutonomousController(
@@ -260,6 +324,71 @@ class SemanticAlignmentTests(unittest.TestCase):
             ),
             mock=False,
         )
+
+    def run_controller(self, controller: AutonomousController):
+        controller.mock = True
+        with patch(
+            "autonomous_math_research.provenance._codex_capability",
+            return_value={},
+        ), patch(
+            "autonomous_math_research.provenance._codex_identity",
+            return_value={
+                "codex_cli_version": "test-codex",
+                "app_server_schema_sha256": "1" * 64,
+                "app_server_required_protocol_sha256": "2" * 64,
+            },
+        ):
+            return asyncio.run(controller.run(0.02))
+
+    def corrupt_canonical_journal(
+        self,
+        project: Path,
+        controller: AutonomousController,
+        mode: str,
+    ) -> None:
+        ledger = controller.canonical_transitions.ledger_path
+        if mode == "prepared_committed_mismatch":
+            records = [json.loads(line) for line in ledger.read_text(
+                encoding="utf-8",
+            ).splitlines() if line.strip()]
+            committed = next(
+                item for item in reversed(records) if item.get("kind") == "COMMITTED"
+            )
+            committed["authorization"] = {
+                **committed["authorization"], "kind": "FORGED_AUTHORIZATION",
+            }
+            ledger.write_text(
+                "\n".join(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    for item in records
+                ) + "\n",
+                encoding="utf-8",
+            )
+            return
+        if mode == "forged_receipt_committed_only":
+            _, forged_trust, _ = self.trust_and_receipt(project)
+            trusted_path = project / "autonomous" / "state" / "nightly_trusted.json"
+            trusted = json.loads(trusted_path.read_text(encoding="utf-8"))
+            trusted["semantic_alignment"] = forged_trust.to_payload()
+            trusted_path.write_text(
+                json.dumps(trusted, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            controller.semantic_trust = forged_trust
+        append_jsonl(ledger, {
+            "schema_version": 1,
+            "kind": "COMMITTED",
+            "transition_id": f"forged-{mode}",
+            "timestamp": "2026-08-25T00:00:00Z",
+            "recovered": False,
+            "authorization": {
+                "kind": "SEMANTIC_VERIFICATION_TRANSITION",
+                "candidate_fingerprint": "f" * 64,
+                "claim_id": "C_ROOT",
+                "semantic_receipt_fingerprint": "e" * 64,
+                "bridge_ids": BRIDGES,
+            },
+        })
 
     def test_goal_text_cannot_be_silently_modified(self) -> None:
         document = semantic_document()
@@ -354,25 +483,30 @@ class SemanticAlignmentTests(unittest.TestCase):
         project = self.opted_project()
         event_a = candidate()
         alignment, trust, receipt = self.trust_and_receipt(project, event_a)
+        graph = ClaimGraph.load(project / "autonomous" / "state" / "claim_graph.json")
+        authority_head = self.validation_authority_head(project)
         decision = alignment.evaluate_claim(
-            "C_ROOT", trust_state=trust, claim_statement=GOAL,
+            "C_ROOT", trust_state=trust, claim_graph=graph,
+            validation_authority_head=authority_head,
         )
         self.assertEqual(decision.status, SemanticStatus.VERIFIED)
         self.assertEqual(receipt["candidate_fingerprint"], event_a.fingerprint)
         self.assertEqual(receipt["representation_id"], event_a.representation_id)
+        helper = deepcopy(graph.claims["C_ROOT"])
+        helper.claim_id = "C_HELPER"
+        helper.proof_obligations = []
+        graph.claims["C_HELPER"] = helper
+        graph.claims["C_ROOT"].dependencies = ["C_HELPER"]
         drifted = alignment.evaluate_claim(
             "C_ROOT",
             trust_state=trust,
-            claim_statement=GOAL,
-            claim_assumptions=[],
-            claim_dependencies=["C_HELPER"],
-            parent_claim_id=None,
-            check_parent_claim_id=True,
+            claim_graph=graph,
+            validation_authority_head=authority_head,
         )
         self.assertEqual(drifted.status, SemanticStatus.BRIDGE_OPEN)
-        self.assertTrue(any("dependencies" in item for item in drifted.issues))
+        self.assertTrue(any("dependency" in item for item in drifted.issues))
 
-        event_b = candidate(dependencies=["C_HELPER"])
+        event_b = candidate(evidence_attempt_id="attempt-" + "b" * 64)
         with self.assertRaisesRegex(SemanticPromotionError, "PASS scope"):
             alignment.build_verification_receipt(
                 trust_state=trust,
@@ -381,7 +515,144 @@ class SemanticAlignmentTests(unittest.TestCase):
                 evidence_hashes=receipt["evidence_hashes"],
                 domain_evidence_receipt_fingerprints=[],
                 audit_receipts=receipt["audit_receipts"],
+                producer_identity=receipt["producer_identity"],
+                claim_graph=ClaimGraph.load(
+                    project / "autonomous" / "state" / "claim_graph.json"
+                ),
+                validation_authority_head=authority_head,
             )
+
+    def test_candidate_a_receipt_cannot_authorize_candidate_b_terminal_state(self) -> None:
+        project = self.opted_project()
+        event_a = candidate()
+        event_b = candidate(evidence_attempt_id="attempt-" + "b" * 64)
+        alignment, trust, _ = self.trust_and_receipt(project, event_a)
+        payload = trust.to_payload()
+        terminal = payload["terminal_bindings"][-1]
+        terminal["candidate_fingerprint"] = event_b.fingerprint
+        unsigned = dict(terminal)
+        unsigned.pop("transition_authorization_fingerprint")
+        terminal["transition_authorization_fingerprint"] = payload_sha256(unsigned)
+        mismatched = SemanticTrustState.from_trusted_payload({
+            "semantic_alignment": payload,
+        })
+        graph = ClaimGraph.load(project / "autonomous" / "state" / "claim_graph.json")
+        graph.claims["C_ROOT"].math_status = MathStatus.PROVED
+
+        with self.assertRaisesRegex(
+            SemanticPromotionError, "exact audited candidate|terminal candidate",
+        ):
+            alignment.require_final_claim_acceptance(
+                "C_ROOT", claim_graph=graph, trust_state=mismatched,
+                validation_authority_head=self.validation_authority_head(project),
+            )
+
+    def test_terminal_binding_rejects_a_different_receipt_fingerprint(self) -> None:
+        project = self.opted_project()
+        alignment, trust, _ = self.trust_and_receipt(project)
+        payload = trust.to_payload()
+        terminal = payload["terminal_bindings"][-1]
+        terminal["semantic_receipt_fingerprint"] = "f" * 64
+        unsigned = dict(terminal)
+        unsigned.pop("transition_authorization_fingerprint")
+        terminal["transition_authorization_fingerprint"] = payload_sha256(unsigned)
+        mismatched = SemanticTrustState.from_trusted_payload({
+            "semantic_alignment": payload,
+        })
+        graph = ClaimGraph.load(project / "autonomous" / "state" / "claim_graph.json")
+        graph.claims["C_ROOT"].math_status = MathStatus.PROVED
+
+        with self.assertRaises(SemanticPromotionError):
+            alignment.require_final_claim_acceptance(
+                "C_ROOT", claim_graph=graph, trust_state=mismatched,
+                validation_authority_head=self.validation_authority_head(project),
+            )
+
+    def test_semantically_bound_subclaim_requires_complete_bridge_ids(self) -> None:
+        project = self.opted_project()
+        statement = "Every normalized helper record is stable."
+        lemma_id = derived_claim_id("C_ROOT", statement, [], [])
+        semantic_path = project / "autonomous" / "semantics.json"
+        document = json.loads(semantic_path.read_text(encoding="utf-8"))
+        subclaim_bridge = "bridge:validator-to-subclaim"
+        document["bridges"].append({
+            "id": subclaim_bridge,
+            "source": "validator:reference-checker",
+            "target": f"claim:{lemma_id}",
+            "justification": "The same checker contract covers the registered helper claim.",
+            "evidence": [EVIDENCE],
+        })
+        document["claims"].append({
+            "claim_id": lemma_id,
+            "canonical_object": "object:accepted-input",
+            "core_terms": ["accepted input"],
+            "required_bridges": [*BRIDGES[:-1], subclaim_bridge],
+            "representation_id": LEGACY_REPRESENTATION.representation_id,
+        })
+        semantic_path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        controller = self.persistent_controller(project)
+        lemma = candidate(
+            claim_id=lemma_id,
+            statement=statement,
+            bridge_ids=[],
+            candidate_type="KEY_LEMMA",
+        )
+        lemma.parent_claim_id = "C_ROOT"
+
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            controller._validate_final_target_candidate(lemma)
+
+    def test_semantic_receipt_requires_controller_owned_distinct_identities(self) -> None:
+        project = self.opted_project()
+        event = candidate()
+        alignment, trust, receipt = self.trust_and_receipt(project, event)
+
+        def rebuild(
+            producer_identity: object,
+            audit_receipts: list[dict],
+        ) -> None:
+            alignment.build_verification_receipt(
+                trust_state=trust,
+                candidate=event,
+                artifact_hashes=receipt["artifact_hashes"],
+                evidence_hashes=receipt["evidence_hashes"],
+                domain_evidence_receipt_fingerprints=[],
+                audit_receipts=audit_receipts,
+                producer_identity=producer_identity,  # type: ignore[arg-type]
+                claim_graph=ClaimGraph.load(
+                    project / "autonomous" / "state" / "claim_graph.json"
+                ),
+                validation_authority_head=self.validation_authority_head(project),
+            )
+
+        cases: list[tuple[str, object, list[dict], str]] = []
+        cases.append(("producer null", None, receipt["audit_receipts"], "producer"))
+        auditor_null = deepcopy(receipt["audit_receipts"])
+        auditor_null[0]["auditor_thread_id"] = None
+        cases.append(("auditor null", receipt["producer_identity"], auditor_null, "auditor"))
+        same_as_producer = deepcopy(receipt["audit_receipts"])
+        same_as_producer[0]["auditor_thread_id"] = receipt["producer_identity"][
+            "thread_id"
+        ]
+        cases.append((
+            "auditor equals producer", receipt["producer_identity"],
+            same_as_producer, "differ",
+        ))
+        duplicate_auditors = deepcopy(receipt["audit_receipts"])
+        second = deepcopy(duplicate_auditors[0])
+        second["audit_id"] = "audit-test-second"
+        duplicate_auditors.append(second)
+        cases.append((
+            "duplicate auditors", receipt["producer_identity"],
+            duplicate_auditors, "pairwise distinct",
+        ))
+        for label, producer, audits, message in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    rebuild(producer, audits)
 
         with self.assertRaises(SemanticPromotionError):
             alignment.build_verification_receipt(
@@ -391,6 +662,11 @@ class SemanticAlignmentTests(unittest.TestCase):
                 evidence_hashes=receipt["evidence_hashes"],
                 domain_evidence_receipt_fingerprints=[],
                 audit_receipts=receipt["audit_receipts"],
+                producer_identity=receipt["producer_identity"],
+                claim_graph=ClaimGraph.load(
+                    project / "autonomous" / "state" / "claim_graph.json"
+                ),
+                validation_authority_head=self.validation_authority_head(project),
             )
 
     def test_hand_written_trusted_receipt_lacks_canonical_transition_authority(self) -> None:
@@ -406,13 +682,46 @@ class SemanticAlignmentTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(ValueError, "committed append-only journal"):
+        with self.assertRaisesRegex(
+            ValueError, "committed append-only journal|latest committed transition",
+        ):
             validate_project(project)
+
+    def test_journal_corruption_fails_validation_guard_and_controller_bootstrap(self) -> None:
+        corruption_modes = (
+            "forged_receipt_committed_only",
+            "committed_without_prepared",
+            "prepared_committed_mismatch",
+        )
+        entrypoints = ("validation", "direct_guard", "controller_bootstrap")
+        for mode in corruption_modes:
+            for entrypoint in entrypoints:
+                with self.subTest(mode=mode, entrypoint=entrypoint):
+                    project = self.opted_project()
+                    controller = self.persistent_controller(project)
+                    controller._refresh_canonical_state()
+                    self.corrupt_canonical_journal(project, controller, mode)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "canonical transition|PREPARED|prepared|authorization",
+                    ):
+                        if entrypoint == "validation":
+                            validate_project(project)
+                        elif entrypoint == "controller_bootstrap":
+                            self.persistent_controller(project)._refresh_canonical_state()
+                        else:
+                            event = candidate()
+                            controller.graph.mark_candidate(event)
+                            controller.graph.apply_audit_pass(event, 2, 2)
 
     def test_validator_identity_version_config_and_scope_are_assignment_bound(self) -> None:
         expected = {
+            "schema_version": SEMANTIC_AUDIT_AUTHORITY_CONTEXT_SCHEMA_VERSION,
+            "validation_authority_head": "0" * 64,
             "validator_identity": "controller-independent-auditor",
             "validator_version": "audit-result-v2",
+            "audit_config_sha256": "3" * 64,
+            "policy_manifest_sha256": "4" * 64,
             "validator_config_sha256": "1" * 64,
             "pass_scope_sha256": "2" * 64,
         }
@@ -420,7 +729,9 @@ class SemanticAlignmentTests(unittest.TestCase):
         for key in expected:
             with self.subTest(key=key):
                 changed = dict(expected)
-                changed[key] = "different"
+                changed[key] = (
+                    2 if key == "schema_version" else "different"
+                )
                 with self.assertRaisesRegex(ValueError, "changed after assignment"):
                     AutonomousController._require_semantic_audit_context(
                         changed, expected,
@@ -429,17 +740,21 @@ class SemanticAlignmentTests(unittest.TestCase):
     def test_missing_or_stale_evidence_invalidates_a_trusted_receipt(self) -> None:
         project = self.opted_project()
         alignment, trust, _ = self.trust_and_receipt(project)
+        graph = ClaimGraph.load(project / "autonomous" / "state" / "claim_graph.json")
+        authority_head = self.validation_authority_head(project)
         evidence = project / EVIDENCE
         evidence.write_text("changed after verification\n", encoding="utf-8")
         decision = alignment.evaluate_claim(
-            "C_ROOT", trust_state=trust, claim_statement=GOAL,
+            "C_ROOT", trust_state=trust, claim_graph=graph,
+            validation_authority_head=authority_head,
         )
         self.assertEqual(decision.status, SemanticStatus.BRIDGE_OPEN)
         self.assertTrue(any("stale" in item for item in decision.issues))
         evidence.unlink()
         self.assertEqual(
             alignment.evaluate_claim(
-                "C_ROOT", trust_state=trust, claim_statement=GOAL,
+                "C_ROOT", trust_state=trust, claim_graph=graph,
+                validation_authority_head=authority_head,
             ).status,
             SemanticStatus.BRIDGE_OPEN,
         )
@@ -586,6 +901,28 @@ class SemanticAlignmentTests(unittest.TestCase):
             controller.graph.claims["C_ROOT"].math_status, MathStatus.PROVED,
         )
 
+    def test_negative_terminal_does_not_claim_positive_semantic_entailment(self) -> None:
+        project = self.opted_project()
+        controller = self.persistent_controller(project)
+        controller._refresh_canonical_state()
+        refutation = candidate(
+            bridge_ids=[], candidate_type="COUNTEREXAMPLE",
+        )
+        controller._validate_final_target_candidate(refutation)
+        controller.graph.mark_candidate(refutation)
+
+        controller.graph.apply_audit_pass(refutation, 2, 2)
+
+        self.assertEqual(
+            controller.graph.claims["C_ROOT"].math_status, MathStatus.FAILED,
+        )
+        self.assertEqual(
+            controller.semantic_alignment.evaluate_claim(
+                "C_ROOT", trust_state=controller.semantic_trust, claim_statement=GOAL,
+            ).status,
+            SemanticStatus.BRIDGE_OPEN,
+        )
+
     def test_dynamic_subclaim_can_close_but_cannot_support_final_unreviewed(self) -> None:
         project = self.opted_project()
         controller = self.persistent_controller(project)
@@ -599,37 +936,89 @@ class SemanticAlignmentTests(unittest.TestCase):
         )
         lemma.parent_claim_id = "C_ROOT"
         controller.graph.mark_candidate(lemma)
-        controller.graph.apply_audit_pass(lemma, 1, 1)
+        controller._commit_claim_state_transition(
+            transition_kind="CANDIDATE_REGISTERED",
+            authorization={
+                "candidate_fingerprint": lemma.fingerprint,
+                "claim_id": lemma.claim_id,
+                "trust_upgrade": False,
+            },
+        )
+        controller.graph.apply_audit_pass(lemma, 2, 2)
+        controller._commit_claim_state_transition(
+            transition_kind="AUDITED_CLAIM_TRANSITION",
+            authorization={
+                "candidate_fingerprint": lemma.fingerprint,
+                "claim_id": lemma.claim_id,
+                "terminal_status": MathStatus.PROVED,
+                "semantic_receipt_fingerprint": None,
+                "semantic_terminal_binding": None,
+                "trust_upgrade": False,
+            },
+        )
         self.assertEqual(controller.graph.claims[lemma_id].math_status, MathStatus.PROVED)
         self.assertEqual(
             controller.semantic_alignment.evaluate_claim(lemma_id).status,
             SemanticStatus.UNREVIEWED,
         )
-
-        _, trusted, receipt = self.trust_and_receipt(
-            project, candidate(dependencies=[lemma_id]),
+        lemma_obligation_id = controller.graph.claims[lemma_id].proof_obligations[
+            0
+        ].obligation_id
+        controller.graph.claims["C_ROOT"].proof_obligations[0].dependencies = [
+            lemma_obligation_id
+        ]
+        self.assertEqual(
+            controller.graph.resolved_dependency_claim_ids("C_ROOT"),
+            (lemma_id,),
         )
-        controller.semantic_trust = trusted
         controller._commit_claim_state_transition(
-            transition_kind="SEMANTIC_VERIFICATION_TRANSITION",
-            authorization={
-                "candidate_fingerprint": receipt["candidate_fingerprint"],
-                "claim_id": receipt["claim_id"],
-                "semantic_receipt_fingerprint": receipt["receipt_fingerprint"],
-                "bridge_ids": receipt["bridge_ids"],
-                "trust_upgrade": False,
-            },
-            preconditions=controller.semantic_alignment.receipt_file_preconditions(
-                receipt,
-            ),
+            transition_kind="PROOF_OBLIGATION_DEPENDENCY_UPDATED",
+            authorization={"claim_id": "C_ROOT", "trust_upgrade": False},
         )
-        controller.graph.claims["C_ROOT"].dependencies = [lemma_id]
-        controller.graph.claims["C_ROOT"].math_status = MathStatus.PROVED
-        controller.graph.claims["C_ROOT"].trust_status = TrustStatus.AUDITED_NIGHTLY
-        with self.assertRaises(SemanticPromotionError) as caught:
-            controller._semantic_final_postcondition()
-        self.assertEqual(caught.exception.decision.claim_id, lemma_id)
-        self.assertEqual(caught.exception.decision.status, SemanticStatus.UNREVIEWED)
+
+        result = self.run_controller(controller)
+
+        self.assertFalse(result.internal_failure, result.stopped_reason)
+        self.assertFalse(controller.final_conjecture_proved)
+        persisted = ClaimGraph.load(
+            project / "autonomous" / "state" / "claim_graph.json"
+        )
+        self.assertEqual(persisted.claims[lemma_id].math_status, MathStatus.PROVED)
+        self.assertNotEqual(persisted.claims["C_ROOT"].math_status, MathStatus.PROVED)
+        validation = validate_project(project)
+        self.assertTrue(validation["valid"])
+        self.assertEqual(
+            validation["semantic_alignment"]["claims"][lemma_id]["status"],
+            SemanticStatus.UNREVIEWED,
+        )
+
+    def test_claim_and_obligation_ids_are_globally_disjoint_before_lifecycle(self) -> None:
+        project = self.opted_project()
+        graph_path = project / "autonomous" / "state" / "claim_graph.json"
+        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        root = next(
+            item for item in payload["claims"] if item["claim_id"] == "C_ROOT"
+        )
+        self.assertEqual(root["math_status"], MathStatus.OPEN)
+        root["proof_obligations"][0]["obligation_id"] = "C_ROOT"
+        graph_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "globally disjoint"):
+            ClaimGraph.load(graph_path)
+        with self.assertRaisesRegex(ValueError, "globally disjoint"):
+            self.persistent_controller(project)
+        with self.assertRaisesRegex(ValueError, "globally disjoint"):
+            validate_project(project)
+
+        persisted = json.loads(graph_path.read_text(encoding="utf-8"))
+        persisted_root = next(
+            item for item in persisted["claims"]
+            if item["claim_id"] == "C_ROOT"
+        )
+        self.assertEqual(persisted_root["math_status"], MathStatus.OPEN)
 
     def test_semantic_head_change_blocks_commit(self) -> None:
         project = self.opted_project()
@@ -712,11 +1101,486 @@ class SemanticAlignmentTests(unittest.TestCase):
         self.assertEqual(receipt["claim_id"], "C_ROOT")
         self.assertEqual(receipt["bridge_ids"], BRIDGES)
         self.assertEqual(len(receipt["audit_receipts"]), 2)
+        self.assertEqual(
+            receipt["dependency_shape"],
+            controller.graph.canonical_dependency_shape("C_ROOT"),
+        )
+        self.assertEqual(
+            receipt["validation_authority_head"],
+            controller._current_validation_authority_head(),
+        )
         parsed = SemanticTrustState.from_trusted_payload(trusted)
         self.assertEqual(
             parsed.verification_receipts[0]["receipt_fingerprint"],
             receipt["receipt_fingerprint"],
         )
+        terminal = parsed.terminal_bindings[-1]
+        self.assertEqual(terminal["claim_id"], "C_ROOT")
+        self.assertEqual(terminal["terminal_status"], MathStatus.PROVED)
+        self.assertEqual(
+            terminal["candidate_fingerprint"], receipt["candidate_fingerprint"],
+        )
+        self.assertEqual(
+            terminal["semantic_receipt_fingerprint"], receipt["receipt_fingerprint"],
+        )
+        self.assertEqual(terminal["representation_id"], receipt["representation_id"])
+        self.assertEqual(
+            terminal["representation_content_sha256"],
+            receipt["representation_id"].removeprefix("rep:"),
+        )
+        self.assertEqual(
+            terminal["validation_authority_head"],
+            receipt["validation_authority_head"],
+        )
+        self.assertEqual(
+            terminal["dependency_shape_sha256"],
+            payload_sha256(receipt["dependency_shape"]),
+        )
+        authorizations = controller.canonical_transitions.verified_committed_authorizations()
+        terminal_authorization = next(
+            item for item in reversed(authorizations)
+            if item.get("semantic_terminal_binding") is not None
+        )
+        self.assertEqual(terminal_authorization["kind"], "AUDITED_CLAIM_TRANSITION")
+        self.assertEqual(terminal_authorization["semantic_terminal_binding"], terminal)
+        self.assertEqual(
+            terminal_authorization["candidate_fingerprint"],
+            receipt["candidate_fingerprint"],
+        )
+        self.assertEqual(
+            terminal_authorization["semantic_receipt_fingerprint"],
+            receipt["receipt_fingerprint"],
+        )
+        self.assertEqual(
+            terminal_authorization["transition_authorization_fingerprint"],
+            terminal["transition_authorization_fingerprint"],
+        )
+        self.assertTrue(receipt["producer_identity"]["thread_id"])
+        auditor_ids = [
+            item["auditor_thread_id"] for item in receipt["audit_receipts"]
+        ]
+        self.assertEqual(len(auditor_ids), len(set(auditor_ids)))
+        self.assertNotIn(receipt["producer_identity"]["thread_id"], auditor_ids)
+
+    def test_authority_change_mid_audit_requires_two_fresh_passes(self) -> None:
+        project = self.opted_project()
+        controller = self.persistent_controller(project)
+        original_queue = controller._queue_next_audit
+        switched = False
+        checked_partial_v3_frontier = False
+        semantic_version = patch(
+            "autonomous_math_research.semantic_alignment."
+            "SEMANTIC_VALIDATOR_VERSION",
+            "audit-result-v3",
+        )
+        controller_version = patch(
+            "autonomous_math_research.controller.SEMANTIC_VALIDATOR_VERSION",
+            "audit-result-v3",
+        )
+
+        def queue_with_authority_change(event: CandidateEvent) -> None:
+            nonlocal switched, checked_partial_v3_frontier
+            pass_events = [
+                item for item in controller.store.replay()
+                if item["kind"] == "AUDIT_RECORDED"
+                and item["payload"].get("verdict") == "PASS"
+            ]
+            if len(pass_events) == 1 and not switched:
+                semantic_version.start()
+                controller_version.start()
+                switched = True
+            elif len(pass_events) == 2 and switched:
+                checked_partial_v3_frontier = True
+                self.assertEqual(
+                    controller.audit_gate.pass_count(event.fingerprint), 1,
+                )
+                self.assertNotEqual(
+                    controller.graph.claims["C_ROOT"].math_status,
+                    MathStatus.PROVED,
+                )
+                self.assertEqual(
+                    controller.semantic_trust.verification_receipts, (),
+                )
+            original_queue(event)
+
+        controller._queue_next_audit = queue_with_authority_change
+        try:
+            result = self.run_controller(controller)
+            self.assertFalse(result.internal_failure, result.stopped_reason)
+            self.assertTrue(controller.final_conjecture_proved)
+            self.assertTrue(switched)
+            self.assertTrue(checked_partial_v3_frontier)
+
+            pass_events = [
+                item for item in controller.store.replay()
+                if item["kind"] == "AUDIT_RECORDED"
+                and item["payload"].get("verdict") == "PASS"
+            ]
+            self.assertEqual(len(pass_events), 3)
+            versions = [
+                item["payload"]["semantic_authority_context"][
+                    "validator_version"
+                ]
+                for item in pass_events
+            ]
+            self.assertEqual(versions, [
+                "audit-result-v2", "audit-result-v3", "audit-result-v3",
+            ])
+            old_audit_id = pass_events[0]["payload"]["audit_id"]
+            current_head = controller._current_validation_authority_head()
+            receipt = controller.semantic_trust.verification_receipts[-1]
+            self.assertEqual(len(receipt["audit_receipts"]), 2)
+            self.assertNotIn(
+                old_audit_id,
+                {item["audit_id"] for item in receipt["audit_receipts"]},
+            )
+            for audit_receipt in receipt["audit_receipts"]:
+                context = audit_receipt["authority_context"]
+                self.assertEqual(
+                    context["validator_version"], "audit-result-v3",
+                )
+                self.assertEqual(
+                    context["validation_authority_head"], current_head,
+                )
+            self.assertTrue(any(
+                item["kind"] == "SEMANTIC_AUDIT_PASSES_STALE"
+                for item in controller.store.replay()
+            ))
+
+            persisted = ClaimGraph.load(
+                project / "autonomous" / "state" / "claim_graph.json"
+            )
+            self.assertEqual(
+                persisted.claims["C_ROOT"].math_status, MathStatus.PROVED,
+            )
+            trusted = json.loads(
+                (
+                    project / "autonomous" / "state" / "nightly_trusted.json"
+                ).read_text(encoding="utf-8")
+            )
+            parsed = SemanticTrustState.from_trusted_payload(trusted)
+            self.assertEqual(
+                parsed.terminal_bindings[-1]["semantic_receipt_fingerprint"],
+                receipt["receipt_fingerprint"],
+            )
+            self.assertTrue(validate_project(project)["valid"])
+        finally:
+            if switched:
+                controller_version.stop()
+                semantic_version.stop()
+
+    def test_checkpoint_import_preserves_old_audit_authority_context(self) -> None:
+        project = self.opted_project()
+        first = self.persistent_controller(project)
+        original_queue = first._queue_next_audit
+        checkpoint_requested = False
+
+        def stop_after_first_pass(event: CandidateEvent) -> None:
+            nonlocal checkpoint_requested
+            if (
+                not checkpoint_requested
+                and first.audit_gate.pass_count(event.fingerprint) == 1
+            ):
+                checkpoint_requested = True
+                first.lifecycle.transition(
+                    LifecyclePhase.DRAINING_EPOCH,
+                    reason="test checkpoint after authority-v2 PASS",
+                )
+                first.scheduler_stop_reason = (
+                    "test checkpoint after authority-v2 PASS"
+                )
+                return
+            original_queue(event)
+
+        first._queue_next_audit = stop_after_first_pass
+        first_result = self.run_controller(first)
+        self.assertFalse(first_result.internal_failure, first_result.stopped_reason)
+        self.assertFalse(first.final_conjecture_proved)
+        self.assertTrue(checkpoint_requested)
+        self.assertTrue(validate_project(project)["valid"])
+
+        checkpoint_path = first.run_dir / "state" / "compact_snapshot.json"
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        frontier = checkpoint["candidate_audit_frontier"]
+        self.assertEqual(len(frontier), 1)
+        old_result = frontier[0]["audit_results"][0]
+        old_audit_id = old_result["audit_id"]
+        self.assertEqual(
+            old_result["semantic_authority_context"]["validator_version"],
+            "audit-result-v2",
+        )
+        old_head = old_result["semantic_authority_context"][
+            "validation_authority_head"
+        ]
+
+        with patch(
+            "autonomous_math_research.semantic_alignment."
+            "SEMANTIC_VALIDATOR_VERSION",
+            "audit-result-v3",
+        ), patch(
+            "autonomous_math_research.controller.SEMANTIC_VALIDATOR_VERSION",
+            "audit-result-v3",
+        ):
+            second = AutonomousController(
+                load_config(project),
+                backend=build_mock_full_cycle_backend(
+                    statement=GOAL,
+                    evidence_path=str(project / EVIDENCE),
+                    semantic_bridge_ids=BRIDGES,
+                ),
+                mock=False,
+                run_id=f"authority-v3-{uuid4().hex}",
+                campaign_id=first.campaign_id,
+                previous_epoch_id=first.run_id,
+                campaign_hours=first.campaign_hours,
+                epoch_hours=first.epoch_hours,
+            )
+            second_result = self.run_controller(second)
+            self.assertFalse(
+                second_result.internal_failure, second_result.stopped_reason,
+            )
+            self.assertTrue(second.final_conjecture_proved)
+            self.assertTrue(any(
+                item["kind"] == "EPOCH_CHECKPOINT_IMPORTED"
+                for item in second.store.replay()
+            ))
+            current_head = second._current_validation_authority_head()
+            self.assertNotEqual(old_head, current_head)
+            receipt = second.semantic_trust.verification_receipts[-1]
+            self.assertEqual(len(receipt["audit_receipts"]), 2)
+            self.assertNotIn(
+                old_audit_id,
+                {item["audit_id"] for item in receipt["audit_receipts"]},
+            )
+            for audit_receipt in receipt["audit_receipts"]:
+                self.assertEqual(
+                    audit_receipt["authority_context"]["validator_version"],
+                    "audit-result-v3",
+                )
+                self.assertEqual(
+                    audit_receipt["authority_context"][
+                        "validation_authority_head"
+                    ],
+                    current_head,
+                )
+            persisted = ClaimGraph.load(
+                project / "autonomous" / "state" / "claim_graph.json"
+            )
+            self.assertEqual(
+                persisted.claims["C_ROOT"].math_status, MathStatus.PROVED,
+            )
+            trusted = json.loads(
+                (
+                    project / "autonomous" / "state" / "nightly_trusted.json"
+                ).read_text(encoding="utf-8")
+            )
+            parsed = SemanticTrustState.from_trusted_payload(trusted)
+            self.assertEqual(
+                parsed.terminal_bindings[-1]["semantic_receipt_fingerprint"],
+                receipt["receipt_fingerprint"],
+            )
+            self.assertTrue(validate_project(project)["valid"])
+
+        preserved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            preserved["candidate_audit_frontier"][0]["audit_results"][0][
+                "semantic_authority_context"
+            ]["validation_authority_head"],
+            old_head,
+        )
+
+    def test_repromotion_requires_a_new_audited_transition(self) -> None:
+        project = self.opted_project()
+        first = self.persistent_controller(project)
+        first_result = self.run_controller(first)
+        self.assertFalse(first_result.internal_failure, first_result.stopped_reason)
+        self.assertTrue(first.final_conjecture_proved)
+        first_receipt = first.semantic_trust.verification_receipts[-1]
+
+        refutation = candidate(
+            bridge_ids=[], candidate_type="COUNTEREXAMPLE",
+            evidence_attempt_id="attempt-" + "f" * 64,
+        )
+        first.graph.mark_candidate(refutation)
+        first._commit_claim_state_transition(
+            transition_kind="CANDIDATE_REGISTERED",
+            authorization={
+                "candidate_fingerprint": refutation.fingerprint,
+                "claim_id": refutation.claim_id,
+                "trust_upgrade": False,
+            },
+        )
+        first.graph.apply_audit_pass(refutation, 2, 2)
+        first._commit_claim_state_transition(
+            transition_kind="AUDITED_CLAIM_TRANSITION",
+            authorization={
+                "candidate_fingerprint": refutation.fingerprint,
+                "claim_id": refutation.claim_id,
+                "terminal_status": MathStatus.FAILED,
+                "semantic_receipt_fingerprint": None,
+                "semantic_terminal_binding": None,
+                "trust_upgrade": False,
+            },
+        )
+        self.assertEqual(first.graph.claims["C_ROOT"].math_status, MathStatus.FAILED)
+
+        first.graph.claims["C_ROOT"].math_status = MathStatus.PROVED
+        with self.assertRaisesRegex(
+            ValueError, "current audited canonical transition",
+        ):
+            first._commit_claim_state_transition(
+                transition_kind="MANUAL_REPROMOTION",
+                authorization={"claim_id": "C_ROOT", "trust_upgrade": False},
+            )
+        persisted = ClaimGraph.load(
+            project / "autonomous" / "state" / "claim_graph.json"
+        )
+        self.assertEqual(persisted.claims["C_ROOT"].math_status, MathStatus.FAILED)
+        self.assertTrue(validate_project(project)["valid"])
+
+        (project / EVIDENCE).write_text(
+            "semantic bridge evidence for a fresh audited attempt\n",
+            encoding="utf-8",
+        )
+        second = self.persistent_controller(project)
+        second._refresh_canonical_state()
+        fresh_candidate = candidate(
+            evidence_attempt_id="attempt-" + "2" * 64,
+        )
+        second.graph.mark_candidate(fresh_candidate)
+        _, updated_trust, second_receipt = self.trust_and_receipt(
+            project,
+            fresh_candidate,
+            claim_graph=second.graph,
+            base_trust=second.semantic_trust,
+        )
+        producer_identity = second_receipt["producer_identity"]
+        second._commit_claim_state_transition(
+            transition_kind="CANDIDATE_REGISTERED",
+            authorization={
+                "candidate_fingerprint": fresh_candidate.fingerprint,
+                "claim_id": fresh_candidate.claim_id,
+                "producer_identity": producer_identity,
+                "trust_upgrade": False,
+            },
+        )
+        second.semantic_trust = updated_trust
+        terminal_binding = updated_trust.terminal_bindings[-1]
+        authorization = {
+            "candidate_fingerprint": fresh_candidate.fingerprint,
+            "claim_id": fresh_candidate.claim_id,
+            "terminal_status": MathStatus.PROVED,
+            "semantic_receipt_fingerprint": second_receipt["receipt_fingerprint"],
+            "representation_id": second_receipt["representation_id"],
+            "representation_content_sha256": terminal_binding[
+                "representation_content_sha256"
+            ],
+            "bridge_ids": second_receipt["bridge_ids"],
+            "semantic_terminal_binding": terminal_binding,
+            "candidate_scope_sha256": terminal_binding["candidate_scope_sha256"],
+            "dependency_shape_sha256": terminal_binding[
+                "dependency_shape_sha256"
+            ],
+            "transition_authorization_fingerprint": terminal_binding[
+                "transition_authorization_fingerprint"
+            ],
+            "trust_upgrade": False,
+        }
+        second._pending_semantic_authorization = (
+            second._canonical_transition_authorization(
+                "AUDITED_CLAIM_TRANSITION", authorization,
+            )
+        )
+        try:
+            second.graph.apply_audit_pass(fresh_candidate, 2, 2)
+            second._commit_claim_state_transition(
+                transition_kind="AUDITED_CLAIM_TRANSITION",
+                authorization=authorization,
+                preconditions=second.semantic_alignment.receipt_file_preconditions(
+                    second_receipt
+                ),
+            )
+        finally:
+            second._pending_semantic_authorization = None
+        self.assertEqual(
+            second.graph.claims["C_ROOT"].math_status, MathStatus.PROVED,
+        )
+        self.assertEqual(len(second.semantic_trust.verification_receipts), 2)
+        self.assertNotEqual(
+            first_receipt["candidate_fingerprint"],
+            second_receipt["candidate_fingerprint"],
+        )
+        self.assertEqual(
+            second.semantic_trust.terminal_bindings[-1][
+                "semantic_receipt_fingerprint"
+            ],
+            second_receipt["receipt_fingerprint"],
+        )
+        self.assertTrue(validate_project(project)["valid"])
+
+    def test_validation_authority_change_invalidates_authoritative_receipt(self) -> None:
+        project = self.opted_project()
+        controller = self.persistent_controller(project)
+        result = self.run_controller(controller)
+        self.assertFalse(result.internal_failure, result.stopped_reason)
+        self.assertTrue(controller.final_conjecture_proved)
+        self.assertTrue(validate_project(project)["valid"])
+
+        authority_patches = (
+            (
+                "autonomous_math_research.semantic_alignment."
+                "SEMANTIC_AUDITOR_IDENTITY",
+                "controller-independent-auditor-v2",
+            ),
+            (
+                "autonomous_math_research.semantic_alignment."
+                "SEMANTIC_VALIDATOR_VERSION",
+                "audit-result-v3",
+            ),
+        )
+        for target, replacement in authority_patches:
+            with self.subTest(target=target), patch(target, replacement):
+                with self.assertRaisesRegex(ValueError, "authority|validator"):
+                    validate_project(project)
+                with self.assertRaisesRegex(
+                    (ValueError, SemanticPromotionError), "authority|validator",
+                ):
+                    controller._semantic_final_postcondition()
+
+        original_threshold = controller.config.raw["audit"]["immediate_threshold"]
+        controller.config.raw["audit"]["immediate_threshold"] = "MEDIUM"
+        try:
+            with self.assertRaisesRegex(SemanticPromotionError, "authority"):
+                controller._semantic_final_postcondition()
+        finally:
+            controller.config.raw["audit"]["immediate_threshold"] = original_threshold
+
+        config_path = project / "autonomous" / "config.yaml"
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+        changed_config = deepcopy(raw_config)
+        changed_config["audit"]["immediate_threshold"] = "MEDIUM"
+        config_path.write_text(
+            json.dumps(changed_config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(SemanticPromotionError, "authority"):
+            validate_project(project)
+
+        changed_policy = deepcopy(raw_config)
+        worker = changed_policy["policy"]["one_shot_compute_worker"]
+        worker["estimated_tokens"] = int(worker["estimated_tokens"]) + 1
+        config_path.write_text(
+            json.dumps(changed_policy, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(SemanticPromotionError, "authority"):
+            validate_project(project)
+
+        config_path.write_text(
+            json.dumps(raw_config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(validate_project(project)["valid"])
 
 
 if __name__ == "__main__":
