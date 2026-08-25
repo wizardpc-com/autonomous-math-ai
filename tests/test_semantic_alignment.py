@@ -11,7 +11,11 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.claim_graph import ClaimGraph
-from autonomous_math_research.canonical_transition import CanonicalTransitionStore
+from autonomous_math_research.canonical_transition import (
+    CanonicalTransitionStore,
+    bytes_sha256,
+    json_bytes,
+)
 from autonomous_math_research.config import load_config
 from autonomous_math_research.controller import (
     AutonomousController,
@@ -26,6 +30,7 @@ from autonomous_math_research.models import (
     MathStatus,
     TrustStatus,
     derived_claim_id,
+    stable_hash,
 )
 from autonomous_math_research.policy import build_policy_manifest
 from autonomous_math_research.representation import RepresentationContract
@@ -210,6 +215,74 @@ class SemanticAlignmentTests(unittest.TestCase):
             encoding="utf-8",
         )
         return project
+
+    def install_legacy_transition(
+        self, project: Path, *, committed: bool = True,
+    ) -> tuple[CanonicalTransitionStore, str]:
+        graph_path = project / "autonomous" / "state" / "claim_graph.json"
+        trusted_path = project / "autonomous" / "state" / "nightly_trusted.json"
+        store = CanonicalTransitionStore(
+            project_root=project,
+            runtime_root=project / "autonomous",
+        )
+        authorization = {
+            "kind": "CANDIDATE_REGISTERED",
+            "claim_id": "C_ROOT",
+            "candidate_fingerprint": "legacy-fixture",
+            "trust_upgrade": False,
+        }
+        current_id = store.commit(
+            targets={
+                graph_path: graph_path.read_bytes(),
+                trusted_path: trusted_path.read_bytes(),
+            },
+            authorization=authorization,
+            trusted_state_path=trusted_path,
+            claim_graph_sha256=file_digest(graph_path),
+        )
+        prepared, terminal = deepcopy(store.records())
+        trusted_uri = "project://autonomous/state/nightly_trusted.json"
+        legacy_seed = {
+            "authorization": authorization,
+            "before": {
+                item["path"]: item["before_sha256"]
+                for item in prepared["targets"]
+            },
+            "after": {
+                item["path"]: item["after_sha256"]
+                for item in prepared["targets"]
+                if item["path"] != trusted_uri
+            },
+            "claim_graph_sha256": file_digest(graph_path),
+        }
+        legacy_id = f"transition-{stable_hash(legacy_seed)[:24]}"
+        (store.root / current_id).rename(store.root / legacy_id)
+
+        prepared["schema_version"] = 1
+        prepared["transition_id"] = legacy_id
+        prepared.pop("preconditions")
+        trusted_target = next(
+            item for item in prepared["targets"] if item["path"] == trusted_uri
+        )
+        trusted_after = store.root / legacy_id / trusted_target["after_snapshot"]
+        trusted_payload = json.loads(trusted_after.read_text(encoding="utf-8"))
+        trusted_payload["last_transition_id"] = legacy_id
+        trusted_bytes = json_bytes(trusted_payload)
+        trusted_after.write_bytes(trusted_bytes)
+        trusted_target["after_sha256"] = bytes_sha256(trusted_bytes)
+        trusted_path.write_bytes(trusted_bytes)
+
+        terminal["schema_version"] = 1
+        terminal["transition_id"] = legacy_id
+        records = [prepared, *([terminal] if committed else [])]
+        store.ledger_path.write_text(
+            "".join(
+                json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                for item in records
+            ),
+            encoding="utf-8",
+        )
+        return store, legacy_id
 
     def validation_authority_head(self, project: Path) -> str:
         config = load_config(project)
@@ -402,6 +475,177 @@ class SemanticAlignmentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "changed after.*frozen"):
             alignment.assert_unchanged()
+
+    def test_legacy_journal_supports_first_strict_opt_in_and_zero_model_dry_run(
+        self,
+    ) -> None:
+        project = self.opted_project()
+        graph_path = project / "autonomous" / "state" / "claim_graph.json"
+        graph_path.write_text(
+            graph_path.read_text(encoding="utf-8").replace(
+                "AMR_PLACEHOLDER: mathematical content is not configured.",
+                "The semantic lifecycle fixture remains open.",
+            ).replace(
+                "AMR_PLACEHOLDER: research protocol and evidence contract are not configured.",
+                "Use the deterministic fixture evidence and controller-owned receipt.",
+            ),
+            encoding="utf-8",
+        )
+        (project / "claims" / "CLAIMS.md").write_text(
+            f"# Claims\n\n- `C_ROOT`: {GOAL}\n",
+            encoding="utf-8",
+        )
+        store, transition_id = self.install_legacy_transition(project)
+        canonical_paths = (
+            project / "autonomous" / "state" / "claim_graph.json",
+            project / "autonomous" / "state" / "nightly_trusted.json",
+        )
+        canonical_before = {path: path.read_bytes() for path in canonical_paths}
+        journal_before = store.ledger_path.read_bytes()
+
+        transactions = store.verified_committed_transactions(recover=False)
+        self.assertEqual([item["transition_id"] for item in transactions], [transition_id])
+        self.assertEqual(
+            store.verified_prepared_record(transition_id, recover=False)["preconditions"],
+            [],
+        )
+        result = validate_project(project, strict=True)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["model_turns_started"], 0)
+
+        controller = self.persistent_controller(project)
+        with patch(
+            "autonomous_math_research.provenance._codex_capability",
+            return_value={},
+        ), patch(
+            "autonomous_math_research.provenance._codex_identity",
+            return_value={
+                "codex_cli_version": "test-codex",
+                "app_server_schema_sha256": "1" * 64,
+                "app_server_required_protocol_sha256": "2" * 64,
+            },
+        ):
+            dry_run = asyncio.run(controller.run(0.001, dry_run=True))
+        self.assertEqual(dry_run.jobs_started, 0)
+        self.assertEqual(store.recover(), [])
+        self.assertEqual(
+            {path: path.read_bytes() for path in canonical_paths},
+            canonical_before,
+        )
+        self.assertEqual(store.ledger_path.read_bytes(), journal_before)
+
+    def test_legacy_prepared_recovery_preserves_canonical_state(self) -> None:
+        project = self.opted_project()
+        store, transition_id = self.install_legacy_transition(
+            project, committed=False,
+        )
+        canonical_paths = (
+            project / "autonomous" / "state" / "claim_graph.json",
+            project / "autonomous" / "state" / "nightly_trusted.json",
+        )
+        before = {path: path.read_bytes() for path in canonical_paths}
+
+        self.assertEqual(store.recover(), [transition_id])
+        self.assertEqual(
+            {path: path.read_bytes() for path in canonical_paths},
+            before,
+        )
+        self.assertEqual(store.records()[-1]["schema_version"], 1)
+
+    def test_legacy_journal_rejects_incomplete_or_contradictory_history(self) -> None:
+        project = self.opted_project()
+        store, _ = self.install_legacy_transition(project)
+        records = store.records()
+        records[0]["targets"] = [
+            item for item in records[0]["targets"]
+            if not item["path"].endswith("nightly_trusted.json")
+        ]
+        store.ledger_path.write_text(
+            "".join(
+                json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                for item in records
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "exactly one trusted-state target"):
+            store.verified_committed_transactions(recover=False)
+
+    def test_legacy_journal_cannot_carry_semantic_trust_state(self) -> None:
+        project = self.opted_project()
+        store, transition_id = self.install_legacy_transition(project)
+        records = store.records()
+        trusted_target = next(
+            item for item in records[0]["targets"]
+            if item["path"].endswith("nightly_trusted.json")
+        )
+        trusted_after = (
+            store.root / transition_id / trusted_target["after_snapshot"]
+        )
+        payload = json.loads(trusted_after.read_text(encoding="utf-8"))
+        payload["semantic_alignment"] = {}
+        changed = json_bytes(payload)
+        trusted_after.write_bytes(changed)
+        trusted_target["after_sha256"] = bytes_sha256(changed)
+        (project / "autonomous" / "state" / "nightly_trusted.json").write_bytes(
+            changed
+        )
+        store.ledger_path.write_text(
+            "".join(
+                json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                for item in records
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot authorize semantic trust"):
+            store.verified_committed_transactions(recover=False)
+
+    def test_v11_and_current_records_cannot_drop_preconditions(self) -> None:
+        for schema_version in (1, 2):
+            with self.subTest(schema_version=schema_version):
+                project = self.opted_project()
+                graph_path = project / "autonomous" / "state" / "claim_graph.json"
+                trusted_path = (
+                    project / "autonomous" / "state" / "nightly_trusted.json"
+                )
+                store = CanonicalTransitionStore(
+                    project_root=project,
+                    runtime_root=project / "autonomous",
+                )
+                store.commit(
+                    targets={
+                        graph_path: graph_path.read_bytes(),
+                        trusted_path: trusted_path.read_bytes(),
+                    },
+                    authorization={
+                        "kind": "CURRENT_FORMAT_FIXTURE",
+                        "trust_upgrade": False,
+                    },
+                    trusted_state_path=trusted_path,
+                    claim_graph_sha256=file_digest(graph_path),
+                    preconditions={
+                        project / "autonomous" / "semantics.json": file_digest(
+                            project / "autonomous" / "semantics.json"
+                        ),
+                    },
+                )
+                records = store.records()
+                for record in records:
+                    record["schema_version"] = schema_version
+                records[0].pop("preconditions")
+                store.ledger_path.write_text(
+                    "".join(
+                        json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                        for item in records
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, "fields are invalid|identity does not match",
+                ):
+                    store.verified_committed_transactions(recover=False)
 
     def test_goal_change_requires_a_new_chained_version(self) -> None:
         document = semantic_document()

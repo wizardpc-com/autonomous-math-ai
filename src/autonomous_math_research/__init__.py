@@ -3,4 +3,4 @@
 from .models import CandidateEvent, Claim, DirectorPlan, ResearchTask
 
 __all__ = ["CandidateEvent", "Claim", "DirectorPlan", "ResearchTask"]
-__version__ = "0.2.6"
+__version__ = "0.2.7"

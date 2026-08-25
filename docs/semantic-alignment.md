@@ -150,6 +150,8 @@ If the file has never been supplied, validation and campaigns continue with
 semantic status `UNREVIEWED`. This is a compatibility state, not a claim
 failure. Once the controller persists opt-in, a missing or malformed file is a
 trust-boundary failure and cannot silently revert the project to legacy mode.
+Zero-model dry-runs inspect a declarative opt-in without persisting it; only an
+explicit non-dry controller run can append the first `SEMANTIC_OPT_IN` transition.
 
 ## Semantic Migration v1
 

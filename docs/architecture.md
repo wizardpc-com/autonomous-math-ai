@@ -304,6 +304,13 @@ If a canonical Markdown input contains the explicit machine-state markers, its
 generated block is another target in the same transaction; prose outside the
 block and all unmarked Markdown remain unchanged.
 
+New canonical transactions use schema v2 and always carry an explicit
+`preconditions` list. The reader can replay pre-v1.1 schema-v1 `PREPARED`
+records that lack that field only after recomputing the historical transaction
+identity from their exact authorization, before/after snapshots, and trusted
+ClaimGraph binding. This normalization is in memory only, rejects semantic
+trust state, and never rewrites the append-only journal.
+
 Canonical project state is single-writer: one controller may own a project at a
 time. The transaction journal detects changed preconditions and corrupt or
 overlapping state, but this release does not provide a distributed lock for two

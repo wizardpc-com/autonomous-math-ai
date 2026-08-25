@@ -8,6 +8,13 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Canonical-transition schema v2 requires explicit preconditions for every new
+  record. A read-only compatibility adapter accepts pre-v1.1 schema-v1 records
+  only when their exact legacy fields, snapshots, trusted-state binding,
+  authorization, and legacy transaction digest agree; it never admits semantic
+  trust state. Declarative validation now initializes its transition reader
+  before reconciliation, and zero-model dry-runs cannot persist semantic opt-in.
+
 - Semantic alignment verification is now controller-owned and candidate-bound.
   Persistent opt-in, append-only contract heads, evidence/audit/validator scope
   receipts, controller-owned independent execution identities, exact

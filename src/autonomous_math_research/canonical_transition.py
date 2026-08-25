@@ -10,12 +10,18 @@ from .models import stable_hash, utc_now
 from .storage import atomic_write_bytes, append_jsonl, read_jsonl
 
 
-TRANSITION_SCHEMA_VERSION = 1
+LEGACY_TRANSITION_SCHEMA_VERSION = 1
+TRANSITION_SCHEMA_VERSION = 2
+_SUPPORTED_TRANSITION_SCHEMA_VERSIONS = frozenset({
+    LEGACY_TRANSITION_SCHEMA_VERSION,
+    TRANSITION_SCHEMA_VERSION,
+})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PREPARED_KEYS = frozenset({
     "schema_version", "kind", "transition_id", "timestamp", "authorization",
     "preconditions", "targets",
 })
+_LEGACY_PREPARED_KEYS = _PREPARED_KEYS - {"preconditions"}
 _COMMITTED_KEYS = frozenset({
     "schema_version", "kind", "transition_id", "timestamp", "recovered",
     "authorization",
@@ -86,11 +92,20 @@ class CanonicalTransitionStore:
     def _validate_prepared_record(
         self, record: dict[str, Any], transition_id: str,
     ) -> dict[str, Any]:
-        prepared = self._require_exact_keys(
-            record, _PREPARED_KEYS, "prepared canonical transition",
+        if not isinstance(record, dict):
+            raise ValueError("prepared canonical transition fields are invalid")
+        schema_version = record.get("schema_version")
+        legacy = (
+            schema_version == LEGACY_TRANSITION_SCHEMA_VERSION
+            and set(record) == _LEGACY_PREPARED_KEYS
         )
-        if prepared["schema_version"] != TRANSITION_SCHEMA_VERSION:
+        if not legacy:
+            self._require_exact_keys(
+                record, _PREPARED_KEYS, "prepared canonical transition",
+            )
+        if schema_version not in _SUPPORTED_TRANSITION_SCHEMA_VERSIONS:
             raise ValueError("prepared canonical transition schema is unsupported")
+        prepared = record
         if prepared["kind"] != "PREPARED" or prepared["transition_id"] != transition_id:
             raise ValueError("prepared canonical transition identity is invalid")
         if not isinstance(prepared["timestamp"], str) or not prepared["timestamp"]:
@@ -99,7 +114,7 @@ class CanonicalTransitionStore:
         if not isinstance(authorization, dict):
             raise ValueError("prepared canonical transition authorization is invalid")
 
-        raw_preconditions = prepared["preconditions"]
+        raw_preconditions = [] if legacy else prepared["preconditions"]
         if not isinstance(raw_preconditions, list):
             raise ValueError("canonical transition preconditions are invalid")
         preconditions: dict[str, str] = {}
@@ -156,6 +171,26 @@ class CanonicalTransitionStore:
                 "canonical transition must identify exactly one trusted-state target"
             )
         trusted_uri, trusted_payload = trusted_targets[0]
+        if legacy:
+            trusted_before_path = self._bundle_file(
+                transition_id, str(targets[trusted_uri]["before_snapshot"]),
+            )
+            try:
+                trusted_before = json.loads(
+                    trusted_before_path.read_text(encoding="utf-8")
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "legacy canonical trusted-state before-snapshot is invalid"
+                ) from exc
+            if not isinstance(trusted_before, dict) or (
+                "semantic_alignment" in trusted_before
+                or "semantic_alignment" in trusted_payload
+                or str(authorization.get("kind", "")).startswith("SEMANTIC_")
+            ):
+                raise ValueError(
+                    "legacy canonical transition cannot authorize semantic trust state"
+                )
         claim_graph_sha256 = self._require_sha256(
             trusted_payload.get("claim_graph_sha256"),
             "canonical trusted-state claim graph digest",
@@ -174,7 +209,7 @@ class CanonicalTransitionStore:
             or targets[claim_graph_uri]["after_sha256"] != claim_graph_sha256
         ):
             raise ValueError("canonical trusted state does not bind its claim graph target")
-        seed = {
+        seed: dict[str, Any] = {
             "authorization": authorization,
             "before": {
                 uri: target["before_sha256"] for uri, target in targets.items()
@@ -184,12 +219,17 @@ class CanonicalTransitionStore:
                 for uri, target in targets.items() if uri != trusted_uri
             },
             "claim_graph_sha256": claim_graph_sha256,
-            "preconditions": dict(sorted(preconditions.items())),
         }
+        if not legacy:
+            seed["preconditions"] = dict(sorted(preconditions.items()))
         expected_id = f"transition-{stable_hash(seed)[:24]}"
         if expected_id != transition_id:
             raise ValueError("canonical transition identity does not match its transaction digest")
-        return prepared
+        if not legacy:
+            return prepared
+        normalized = dict(prepared)
+        normalized["preconditions"] = []
+        return normalized
 
     def _validated_ledger(
         self, records: list[dict[str, Any]], *, verify_current: bool,
@@ -218,7 +258,9 @@ class CanonicalTransitionStore:
             committed_record = self._require_exact_keys(
                 record, _COMMITTED_KEYS, "committed canonical transition",
             )
-            if committed_record["schema_version"] != TRANSITION_SCHEMA_VERSION:
+            if committed_record["schema_version"] not in (
+                _SUPPORTED_TRANSITION_SCHEMA_VERSIONS
+            ):
                 raise ValueError("committed canonical transition schema is unsupported")
             if not isinstance(committed_record["timestamp"], str) or not committed_record[
                 "timestamp"
@@ -231,6 +273,10 @@ class CanonicalTransitionStore:
             prepared = prepared_by_id.get(transition_id)
             if prepared is None:
                 raise ValueError("committed canonical transition lacks a prepared record")
+            if committed_record["schema_version"] != prepared["schema_version"]:
+                raise ValueError(
+                    "committed canonical transition schema disagrees with PREPARED"
+                )
             if committed_record["authorization"] != prepared["authorization"]:
                 raise ValueError(
                     "committed canonical transition authorization disagrees with PREPARED"
@@ -376,6 +422,7 @@ class CanonicalTransitionStore:
             self._append_terminal(
                 transition_id, "COMMITTED", recovered=True,
                 authorization=dict(record.get("authorization") or {}),
+                schema_version=int(record["schema_version"]),
             )
             recovered.append(transition_id)
         self.verify_current()
@@ -515,9 +562,10 @@ class CanonicalTransitionStore:
         *,
         recovered: bool,
         authorization: dict[str, Any],
+        schema_version: int = TRANSITION_SCHEMA_VERSION,
     ) -> None:
         append_jsonl(self.ledger_path, {
-            "schema_version": TRANSITION_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "kind": kind,
             "transition_id": transition_id,
             "timestamp": utc_now(),

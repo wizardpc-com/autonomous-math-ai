@@ -5321,6 +5321,10 @@ class AutonomousController:
 
     async def run(self, hours: float | None, dry_run: bool = False) -> RunResult:
         self._dry_run = bool(dry_run)
+        if dry_run:
+            # Declarative opt-in is inspected during dry-run, but crossing the
+            # persistent semantic trust boundary requires an explicit real run.
+            self.persist_shared_state = False
         mode = "dry-run" if dry_run else ("mock" if self.mock else "real")
         attempt = self.store.append("ATTEMPT_STARTED", {
             "attempt_id": self._attempt_id,

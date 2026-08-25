@@ -132,11 +132,11 @@ def validate_project(
         policy_manifest_sha256=str(policy["manifest_sha256"]),
     )
     semantic_trust = SemanticTrustState.from_trusted_payload(trusted_payload)
+    transition_store = CanonicalTransitionStore(
+        project_root=root,
+        runtime_root=layout.autonomous_root,
+    )
     if semantic_trust.opted_in:
-        transition_store = CanonicalTransitionStore(
-            project_root=root,
-            runtime_root=layout.autonomous_root,
-        )
         semantic_trust.require_committed_journal(
             transition_store.verified_committed_authorizations()
         )
