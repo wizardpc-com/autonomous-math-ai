@@ -14,6 +14,7 @@ from autonomous_math_research.backend import MockCodexBackend
 from autonomous_math_research.canonical_state import (
     MARKDOWN_STATE_BEGIN,
     MARKDOWN_STATE_END,
+    _git_revision,
     render_markdown_state_block,
     validate_canonical_mathematical_state,
 )
@@ -600,8 +601,25 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.7")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.8")
         self.assertIn("canonical_state", run_manifest)
+
+    @patch("autonomous_math_research.canonical_state.subprocess.run")
+    def test_git_revision_scopes_safe_directory_to_the_workspace(self, run) -> None:
+        (self.root / ".git").mkdir()
+        run.return_value.returncode = 0
+        run.return_value.stdout = "a" * 40 + "\n"
+
+        revision = _git_revision(self.root)
+
+        self.assertEqual(revision["head"], "a" * 40)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "git", "-c", f"safe.directory={self.root.resolve()}",
+                "rev-parse", "HEAD",
+            ],
+        )
 
     def test_stale_trusted_binding_fails_before_model_turn(self) -> None:
         graph = self.runtime / "state" / "claim_graph.json"

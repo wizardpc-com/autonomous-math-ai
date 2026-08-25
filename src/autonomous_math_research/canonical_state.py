@@ -53,7 +53,10 @@ def _git_revision(workspace_root: Path) -> dict[str, str] | None:
         return None
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root,
+            [
+                "git", "-c", f"safe.directory={root}",
+                "rev-parse", "HEAD",
+            ], cwd=root,
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

@@ -14,6 +14,9 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   authorization, and legacy transaction digest agree; it never admits semantic
   trust state. Declarative validation now initializes its transition reader
   before reconciliation, and zero-model dry-runs cannot persist semantic opt-in.
+- Canonical startup records the workspace HEAD with a command-scoped exact
+  `safe.directory` value, so read-only revision freezing works under an isolated
+  Windows sandbox SID without changing global or repository Git configuration.
 
 - Semantic alignment verification is now controller-owned and candidate-bound.
   Persistent opt-in, append-only contract heads, evidence/audit/validator scope
