@@ -663,7 +663,8 @@ def forbidden_worker_activity(
 ) -> dict[str, Any] | None:
     """Detect recursive, unapproved-tool, or out-of-scope worker activity."""
     forbidden_item_types = {
-        "collabtoolcall", "mcp_tool_call", "mcptoolcall", "dynamictoolcall",
+        "collabtoolcall", "collabagenttoolcall", "subagentactivity",
+        "mcp_tool_call", "mcptoolcall", "dynamictoolcall",
         "websearch", "web_search", "browser", "appcall", "plugincall",
     }
     forbidden_command = re.compile(
@@ -771,7 +772,9 @@ def classify_probe_failure(stdout_path: Path, stderr_path: Path) -> dict[str, An
             fragments.append(stderr_path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             pass
-    detail = "\n".join(fragments).strip()[:4000]
+    combined_detail_raw = "\n".join(fragments)
+    detail = combined_detail_raw.strip()[:4000]
+    combined_detail = combined_detail_raw.casefold()
     # Only a structured service-side turn failure may poison the persistent
     # route cache. Stderr is retained for diagnosis, but a local filesystem or
     # wrapper message containing "access denied" must never disable Spark.
@@ -793,6 +796,15 @@ def classify_probe_failure(stdout_path: Path, stderr_path: Path) -> dict[str, An
     )
     provider_quota_exhausted = bool(service_failures) and any(
         marker in service_detail for marker in quota_markers
+    )
+    windows_sandbox_incompatible = any(
+        marker in combined_detail
+        for marker in (
+            "windows unelevated restricted-token sandbox cannot enforce split "
+            "filesystem read restrictions directly",
+            "failed to prepare windows sandbox wrapper: windows unelevated "
+            "restricted-token sandbox",
+        )
     )
     provider_reset_at = None
     if provider_quota_exhausted:
@@ -843,11 +855,24 @@ def classify_probe_failure(stdout_path: Path, stderr_path: Path) -> dict[str, An
         )
     )
     return {
-        "failure_scope": "service" if service_failures else "local-or-transport",
+        "failure_scope": (
+            "service" if service_failures
+            else "local-policy" if windows_sandbox_incompatible
+            else "local-or-transport"
+        ),
         "failure_detail": detail or None,
         "cache_as_unavailable": cache_as_unavailable,
         "failure_kind": (
-            "provider_quota_exhausted" if provider_quota_exhausted else None
+            "provider_quota_exhausted" if provider_quota_exhausted
+            else "worker_sandbox_incompatible" if windows_sandbox_incompatible
+            else None
+        ),
+        "retryable": not (
+            provider_quota_exhausted or windows_sandbox_incompatible
+        ),
+        "failure_message": (
+            "mechanical worker sandbox is incompatible with this Windows host"
+            if windows_sandbox_incompatible else None
         ),
         "provider_reset_at": provider_reset_at,
     }
@@ -2023,11 +2048,18 @@ def main() -> int:
                 )
                 execution_failure = {
                     "kind": failure_kind,
-                    "retryable": failure_kind not in {
-                        "model_unavailable", "provider_quota_exhausted",
-                    },
+                    "retryable": (
+                        False
+                        if failure_kind in {
+                            "model_unavailable", "provider_quota_exhausted",
+                            "worker_sandbox_incompatible",
+                        }
+                        else bool(classified.get("retryable", True))
+                    ),
                     "message": (
-                        "provider quota exhausted"
+                        str(classified.get("failure_message"))
+                        if classified.get("failure_message")
+                        else "provider quota exhausted"
                         if failure_kind == "provider_quota_exhausted"
                         else f"worker exited with code {exit_code}"
                     ),
@@ -2037,7 +2069,7 @@ def main() -> int:
                     execution_failure["provider_reset_at"] = classified[
                         "provider_reset_at"
                     ]
-                raise ContractError(f"worker exited with code {exit_code}")
+                raise ContractError(str(execution_failure["message"]))
             verify_immutable_snapshot(run_dir, immutable_before)
             result = validate_worker_result(read_json(last_message), packet, run_dir)
         except ContractError as exc:

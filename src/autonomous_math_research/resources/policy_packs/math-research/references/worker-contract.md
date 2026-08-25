@@ -98,6 +98,9 @@ policy bundle. The exact primary route may continue once on the fallback after
 `model_unavailable`, `provider_quota_exhausted`, `transport_transient`, or
 `timeout_transient`. Policy, permission, eligibility, schema, protocol, and
 artifact failures never trigger fallback.
+Windows restricted-token hosts that cannot enforce the requested split-filesystem
+boundary fail as non-retryable `worker_sandbox_incompatible` policy errors and do
+not trigger route fallback.
 Environment route overrides are rejected. The child uses `approval_policy=never`, disables network access, memories, plugins, apps, multi-agent tools, and web search. The Codex process retains `CODEX_HOME` only to reuse the existing login, while a native permission profile denies model-started commands access to the filesystem root, grants only minimal runtime reads and the isolated workspace, and disables network. The command also uses `--strict-config`, so unsupported permission or isolation keys fail before a turn rather than silently weakening the boundary. `shell_environment_policy` removes `CODEX_HOME`, home/profile locators, API keys, tokens, passwords, credential helpers, and similar secret-bearing variables from model-started commands.
 
 Persist the exact primary configuration as unavailable only after an explicit

@@ -682,6 +682,49 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
             self.runner_module.classify_probe_failure(stdout, stderr)["cache_as_unavailable"]
         )
 
+    def test_windows_split_filesystem_sandbox_failure_is_nonretryable(self) -> None:
+        stdout = self.root / "sandbox-failure.jsonl"
+        stderr = self.root / "sandbox-failure.stderr"
+        stdout.write_text("", encoding="utf-8")
+        stderr.write_text(
+            "failed to prepare windows sandbox wrapper: windows unelevated "
+            "restricted-token sandbox cannot enforce split filesystem read "
+            "restrictions directly; refusing to run unsandboxed\n",
+            encoding="utf-8",
+        )
+
+        classified = self.runner_module.classify_probe_failure(stdout, stderr)
+
+        self.assertEqual(classified["failure_kind"], "worker_sandbox_incompatible")
+        self.assertEqual(classified["failure_scope"], "local-policy")
+        self.assertFalse(classified["retryable"])
+        self.assertFalse(classified["cache_as_unavailable"])
+
+        def incompatible(_command, **kwargs):
+            kwargs["stdout_path"].write_text("", encoding="utf-8")
+            kwargs["stderr_path"].write_text(
+                "windows unelevated restricted-token sandbox cannot enforce split "
+                "filesystem read restrictions directly; refusing to run unsandboxed\n",
+                encoding="utf-8",
+            )
+            return 1, False, 0.01
+
+        code, metadata = self._invoke_main(
+            "sandbox-incompatible",
+            cached_model_unavailable=lambda **_kwargs: None,
+            run_one_shot=incompatible,
+        )
+
+        self.assertEqual(code, 4)
+        self.assertEqual(metadata["_mock_calls"]["run_one_shot"], 1)
+        self.assertEqual(metadata["_mock_calls"]["record"], [])
+        self.assertIsNone(metadata["fallback"])
+        self.assertEqual(
+            metadata["failure"]["kind"], "worker_sandbox_incompatible",
+        )
+        self.assertFalse(metadata["failure"]["retryable"])
+        self.assertIn("incompatible", metadata["failure"]["message"])
+
     def test_cli_service_tier_attestation_distinguishes_unknown_null_and_violation(self) -> None:
         path = self.root / "tier-events.jsonl"
         path.write_text('{"type":"turn.started"}\n', encoding="utf-8", newline="\n")
@@ -944,14 +987,20 @@ class WorkerRouteTests(TempProjectMixin, unittest.TestCase):
         violation = self.runner_module.forbidden_worker_activity(path)
         self.assertIsNotNone(violation)
         self.assertIn("recursive", violation["reason"])
-        path.write_text(
-            json.dumps({
-                "type": "item.started",
-                "item": {"type": "collabToolCall", "tool": "spawn_agent"},
-        }) + "\n",
-            encoding="utf-8", newline="\n",
-        )
-        self.assertIsNotNone(self.runner_module.forbidden_worker_activity(path))
+        for item_type in (
+            "collabToolCall", "collabAgentToolCall", "subAgentActivity",
+        ):
+            with self.subTest(item_type=item_type):
+                path.write_text(
+                    json.dumps({
+                        "type": "item.started",
+                        "item": {"type": item_type, "tool": "spawnAgent"},
+                    }) + "\n",
+                    encoding="utf-8", newline="\n",
+                )
+                self.assertIsNotNone(
+                    self.runner_module.forbidden_worker_activity(path)
+                )
 
     def test_worker_event_gate_enforces_packet_tools_and_isolated_file_scope(self) -> None:
         path = self.root / "worker-capability-activity.jsonl"
@@ -1442,6 +1491,40 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         ]
         self.assertEqual(len(terminal), 1)
         self.assertEqual(terminal[0]["payload"]["runner_reported_status"], "COMPLETED")
+
+    async def test_windows_sandbox_incompatibility_is_terminal_without_retry(self) -> None:
+        failure = MechanicalExecution(
+            status="TOOL_ERROR",
+            result={},
+            model=PRIMARY_MECHANICAL_ROUTE["model"],
+            reasoning_effort="high",
+            token_usage=TokenUsage(),
+            token_telemetry="unknown",
+            error="mechanical worker sandbox is incompatible with this Windows host",
+            failure_kind="worker_sandbox_incompatible",
+            retryable=False,
+        )
+        runner = SequenceMechanicalRunner([failure])
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=runner,
+        )
+        _job, _request, response_path = self._activate_parent(
+            controller, role="prover", suffix="sandbox-incompatible",
+        )
+
+        await controller._poll_mechanical_requests()
+        await self._drain_mechanical(controller)
+
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+        self.assertEqual(response["failure_kind"], "worker_sandbox_incompatible")
+        self.assertFalse(response["retryable"])
+        self.assertEqual(len(runner.calls), 1)
+        kinds = [event["kind"] for event in controller.store.replay()]
+        self.assertNotIn("MECHANICAL_SUBTASK_RETRY_QUEUED", kinds)
+        self.assertNotIn("MECHANICAL_SUBTASK_FALLBACK", kinds)
 
     async def test_transient_retry_stays_on_spark_and_permanent_denial_falls_back_once(self) -> None:
         transient = MechanicalExecution(
@@ -1987,7 +2070,7 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             "params": {
                 "threadId": "thread-x",
                 "turnId": "turn-x",
-                "item": {"type": "collabToolCall", "command": "codex exec ..."},
+                "item": {"type": "collabAgentToolCall", "tool": "spawnAgent"},
             },
         })
         self.assertTrue(controller._internal_failure)
@@ -1998,6 +2081,37 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             ),
             1,
         )
+
+        intercepted = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        await intercepted._trace_notification({
+            "method": "amr/unauthorizedDelegation",
+            "params": {
+                "threadId": "thread-intercepted",
+                "turnId": "turn-intercepted",
+                "itemId": "activity-1",
+                "itemType": "subAgentActivity",
+                "agentThreadId": "child-thread",
+            },
+        })
+        self.assertTrue(intercepted._internal_failure)
+        intercepted_events = intercepted.store.replay()
+        self.assertEqual(
+            [item["kind"] for item in intercepted_events].count(
+                "UNAUTHORIZED_DELEGATION_ATTEMPT"
+            ),
+            1,
+        )
+        violation = next(
+            item["payload"] for item in intercepted_events
+            if item["kind"] == "UNAUTHORIZED_DELEGATION_ATTEMPT"
+        )
+        self.assertEqual(violation["item_type"], "subAgentActivity")
+        self.assertEqual(violation["agent_thread_id"], "child-thread")
 
         second = AutonomousController(
             self.config,

@@ -662,6 +662,22 @@ class _HangingTurnClient(AppServerClient):
         return {}
 
 
+class _DelegationContainmentClient(AppServerClient):
+    def __init__(self):
+        super().__init__(codex_executable="unused")
+        self.traced: list[dict[str, object]] = []
+        self.notification_handler = self.traced.append
+        self.interrupt_calls: list[tuple[str, str]] = []
+
+    @property
+    def transport_available(self) -> bool:
+        return True
+
+    async def interrupt(self, thread_id: str, turn_id: str) -> object:
+        self.interrupt_calls.append((thread_id, turn_id))
+        return {}
+
+
 class _TransportLostStartClient(AppServerClient):
     def __init__(self):
         super().__init__(codex_executable="unused")
@@ -1033,6 +1049,7 @@ class AppServerThreadPermissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             captured["runtimeWorkspaceRoots"], [str(Path.cwd().resolve())],
         )
+        self.assertIn("disabled", captured["multiAgentMode"]["custom"].lower())
         self.assertNotIn("sandbox", captured)
 
     async def test_thread_permission_profile_mismatch_fails_closed(self) -> None:
@@ -1119,7 +1136,44 @@ class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             params["runtimeWorkspaceRoots"], [str(Path.cwd().resolve())],
         )
+        self.assertIn("disabled", params["multiAgentMode"]["custom"].lower())
         self.assertNotIn("sandboxPolicy", params)
+
+    async def test_current_delegation_events_interrupt_parent_and_fail_closed(self) -> None:
+        for item in (
+            {
+                "id": "collab-1",
+                "type": "collabAgentToolCall",
+                "tool": "spawnAgent",
+                "receiverThreadIds": ["child-collab"],
+            },
+            {
+                "id": "activity-1",
+                "type": "subAgentActivity",
+                "kind": "started",
+                "agentThreadId": "child-activity",
+            },
+        ):
+            with self.subTest(item_type=item["type"]):
+                client = _DelegationContainmentClient()
+                client._handle_notification({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": item,
+                    },
+                })
+                await asyncio.sleep(0)
+
+                self.assertEqual(client.interrupt_calls, [("thread-1", "turn-1")])
+                self.assertEqual(len(client.traced), 1)
+                self.assertEqual(
+                    client.traced[0]["method"], "amr/unauthorizedDelegation",
+                )
+                self.assertEqual(
+                    client.traced[0]["params"]["itemType"], item["type"],
+                )
 
     async def test_mismatched_response_and_stream_ids_remain_correlated(self) -> None:
         client = _CorrelatedTurnClient(

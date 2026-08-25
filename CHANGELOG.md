@@ -19,6 +19,12 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   command contract. This boundary
   does not claim that the App Server's own `CODEX_HOME` configuration files are
   unreadable on current Windows Codex runtimes.
+- Controller-owned thread and turn requests explicitly disable multi-agent
+  delegation. Current and legacy collaboration events are intercepted in the
+  App Server client, the parent turn is interrupted, and the run fails closed.
+- Mechanical workers classify an unenforceable Windows split-filesystem sandbox
+  as a deterministic, non-retryable policy failure, without provider fallback
+  or repeated attempts.
 - The monitor distinguishes a recoverable nonzero local-command exit from an
   actual App Server tool-call failure instead of reporting both as the same
   red tool error.

@@ -456,10 +456,16 @@ def _live_item_summary(item: dict[str, Any]) -> dict[str, Any]:
             "tool": item.get("tool"), "success": item.get("success"),
             "duration_ms": item.get("durationMs"),
         })
-    elif item_type == "collabToolCall":
+    elif item_type in {
+        "collabToolCall", "collabAgentToolCall", "subAgentActivity",
+    }:
         summary.update({
             "tool": item.get("tool"), "agent_status": item.get("agentStatus"),
             "new_thread_id": item.get("newThreadId"),
+            "agent_thread_id": item.get("agentThreadId"),
+            "receiver_thread_ids": item.get("receiverThreadIds"),
+            "agent_path": item.get("agentPath"),
+            "activity_kind": item.get("kind"),
         })
     elif item_type == "webSearch":
         summary["query"] = _sanitize_live_text(item.get("query"))[:500]
@@ -2733,6 +2739,40 @@ class AutonomousController:
                 "action": "interrupt_and_fail_closed",
                 "interrupt_error_type": params.get("errorType"),
             })
+        if method == "amr/unauthorizedDelegation":
+            thread_id = str(params.get("threadId") or "")
+            identity = self._live_identity(thread_id)
+            job_id = str(identity.get("job_id") or "")
+            reason = (
+                "top-level role attempted direct or recursive delegation outside the "
+                "controller mechanical broker"
+            )
+            self._internal_failure = True
+            self.stop_for_review = reason
+            self.store.append("UNAUTHORIZED_DELEGATION_ATTEMPT", {
+                "job_id": job_id or None,
+                "role": identity.get("role"),
+                "thread_id": thread_id or None,
+                "turn_id": params.get("turnId"),
+                "item_id": params.get("itemId"),
+                "item_type": params.get("itemType"),
+                "tool": params.get("tool"),
+                "agent_thread_id": params.get("agentThreadId"),
+                "receiver_thread_ids": params.get("receiverThreadIds"),
+                "action": "interrupt parent turn and fail closed",
+            })
+            if job_id:
+                self._schedule_backend_cancel(job_id, reason)
+        if method == "amr/unauthorizedDelegationInterruptFailed":
+            reason = "App Server could not interrupt an unauthorized delegation turn"
+            self._internal_failure = True
+            self.stop_for_review = reason
+            self.store.append("UNAUTHORIZED_DELEGATION_CONTAINMENT_FAILED", {
+                "thread_id": params.get("threadId"),
+                "turn_id": params.get("turnId"),
+                "interrupt_error_type": params.get("errorType"),
+                "action": "fail closed",
+            })
         if method == "model/rerouted":
             thread_id = str(params.get("threadId") or "")
             identity = self._live_identity(thread_id)
@@ -2759,7 +2799,9 @@ class AutonomousController:
             item_type = str(item.get("type") or "")
             command = _sanitize_live_text(item.get("command"))
             forbidden_command = _is_unauthorized_top_level_delegation(command)
-            if item_type == "collabToolCall" or forbidden_command:
+            if item_type in {
+                "collabToolCall", "collabAgentToolCall", "subAgentActivity",
+            } or forbidden_command:
                 thread_id = str(params.get("threadId") or "")
                 identity = self._live_identity(thread_id)
                 job_id = str(identity.get("job_id") or "")
@@ -2796,6 +2838,8 @@ class AutonomousController:
             "thread/started", "turn/started", "turn/completed", "thread/tokenUsage/updated",
             "account/rateLimits/updated", "thread/goal/updated", "model/rerouted", "warning",
             "amr/unmanagedContinuation", "amr/unmanagedContinuationInterruptFailed",
+            "amr/unauthorizedDelegation",
+            "amr/unauthorizedDelegationInterruptFailed",
         }:
             self.store.append("APP_SERVER_NOTIFICATION", {
                 "method": method,

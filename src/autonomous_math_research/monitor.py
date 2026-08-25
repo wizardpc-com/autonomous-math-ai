@@ -180,6 +180,7 @@ def build_status(
             "DIRECTOR_AUDIT_REQUEST_REJECTED", "CANDIDATE_REJECTED",
             "MECHANICAL_SUBTASK_FAILED", "MECHANICAL_LIFECYCLE_INVARIANT_FAILED",
             "UNAUTHORIZED_DELEGATION_ATTEMPT", "MECHANICAL_BROKER_INTEGRITY_FAILURE",
+            "UNAUTHORIZED_DELEGATION_CONTAINMENT_FAILED",
             "MECHANICAL_ROUTE_CACHE_PERSIST_FAILED",
             "ATTEMPT_FAILED", "RUN_ARTIFACT_FINALIZATION_FAILED",
         }:
@@ -728,8 +729,8 @@ def _tool_activity(payload: dict[str, Any], *, completed: bool) -> tuple[str, st
         if completed and failed:
             return "工具调用失败", f"{tool} 调用失败"
         return "外部工具", f"正在调用 {tool}" if not completed else f"{tool} 调用完成"
-    if item_type == "collabToolCall":
-        return "协作", "正在协调其他 Agent" if not completed else "Agent 协作步骤完成"
+    if item_type in {"collabToolCall", "collabAgentToolCall", "subAgentActivity"}:
+        return "隔离违规", "检测到越权 Agent 协作" if not completed else "越权 Agent 协作已终止"
     if item_type == "imageView":
         return "查看材料", "正在查看图像材料" if not completed else "图像材料查看完成"
     return "工具", f"正在执行 {item_type}" if not completed else f"{item_type} 已完成"

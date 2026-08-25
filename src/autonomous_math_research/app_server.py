@@ -64,6 +64,16 @@ _MODEL_SHELL_ENVIRONMENT_FILTERS = (
     "WINDIR",
 )
 _DEFAULT_APP_SERVER_PERMISSION_PROFILE = "amr-role"
+_CONTROLLER_DISABLED_MULTI_AGENT_MODE = {
+    "custom": (
+        "Multi-agent delegation is disabled for this controller-owned role, "
+        "including explicit requests. Never spawn, message, resume, wait for, "
+        "or otherwise use subagents."
+    ),
+}
+_FORBIDDEN_DELEGATION_ITEM_TYPES = frozenset({
+    "collabToolCall", "collabAgentToolCall", "subAgentActivity",
+})
 
 _AUTH_SECRET_KEYS = {
     "accesstoken", "refreshtoken", "idtoken", "authtoken", "sessiontoken",
@@ -765,6 +775,51 @@ class AppServerClient:
             if asyncio.iscoroutine(result):
                 self._track_background(result)
 
+    async def _interrupt_forbidden_delegation(
+        self, thread_id: str, turn_id: str,
+    ) -> None:
+        try:
+            await self.interrupt(thread_id, turn_id)
+        except Exception as exc:
+            if self.notification_handler:
+                result = self.notification_handler({
+                    "method": "amr/unauthorizedDelegationInterruptFailed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "errorType": type(exc).__name__,
+                    },
+                })
+                if asyncio.iscoroutine(result):
+                    await result
+
+    def _report_forbidden_delegation(
+        self, thread_id: str, turn_id: str, item: dict[str, Any],
+    ) -> None:
+        receiver_thread_ids = item.get("receiverThreadIds")
+        if not isinstance(receiver_thread_ids, list):
+            receiver_thread_ids = []
+        if thread_id and turn_id and self.transport_available:
+            self._track_background(
+                self._interrupt_forbidden_delegation(thread_id, turn_id)
+            )
+        if self.notification_handler:
+            result = self.notification_handler({
+                "method": "amr/unauthorizedDelegation",
+                "params": redact_auth_material({
+                    "threadId": thread_id or None,
+                    "turnId": turn_id or None,
+                    "itemId": item.get("id"),
+                    "itemType": item.get("type"),
+                    "tool": item.get("tool"),
+                    "agentThreadId": item.get("agentThreadId"),
+                    "receiverThreadIds": receiver_thread_ids[:20],
+                    "action": "interrupt_parent_and_fail_closed",
+                }),
+            })
+            if asyncio.iscoroutine(result):
+                self._track_background(result)
+
     def _forward_notification(self, message: dict[str, Any]) -> None:
         if self.notification_handler:
             result = self.notification_handler(redact_auth_material(message))
@@ -1138,6 +1193,18 @@ class AppServerClient:
             or (turn_payload.get("id") if isinstance(turn_payload, dict) else "")
             or ""
         )
+        if method == "item/started":
+            item = params.get("item") or {}
+            if (
+                isinstance(item, dict)
+                and str(item.get("type") or "") in _FORBIDDEN_DELEGATION_ITEM_TYPES
+            ):
+                self._report_forbidden_delegation(
+                    thread_id,
+                    event_turn_id or self._notification_turn_by_thread.get(thread_id, ""),
+                    item,
+                )
+                return
         if event_turn_id in self._retired_turn_ids_by_thread.get(thread_id, set()):
             # Late telemetry from a completed turn remains observable but must
             # not mutate buffers, usage, aliases, or ownership for its successor.
@@ -1237,6 +1304,7 @@ class AppServerClient:
             "serviceName": "autonomous_math_research",
             "serviceTier": service_tier,
             "allowProviderModelFallback": False,
+            "multiAgentMode": dict(_CONTROLLER_DISABLED_MULTI_AGENT_MODE),
         }
         if developer_instructions:
             params["developerInstructions"] = developer_instructions
@@ -1294,6 +1362,7 @@ class AppServerClient:
             "summary": "concise",
             "serviceTier": service_tier,
             "outputSchema": output_schema,
+            "multiAgentMode": dict(_CONTROLLER_DISABLED_MULTI_AGENT_MODE),
         }
         self._notification_turn_by_thread.pop(thread_id, None)
         self._response_turn_by_thread.pop(thread_id, None)
