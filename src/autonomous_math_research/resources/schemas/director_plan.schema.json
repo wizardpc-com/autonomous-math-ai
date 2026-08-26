@@ -29,8 +29,14 @@
           "metadata": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["allow_derived_claims"],
-            "properties": {"allow_derived_claims": {"type": "boolean"}}
+            "required": ["allow_derived_claims", "independent_exploration"],
+            "properties": {
+              "allow_derived_claims": {"type": "boolean"},
+              "independent_exploration": {
+                "type": "boolean",
+                "description": "True only for a genuinely differentiated route that satisfies a reserved independent-exploration slot. The explorer role alone does not satisfy the reserve."
+              }
+            }
           },
           "representation": {
             "type": "object",

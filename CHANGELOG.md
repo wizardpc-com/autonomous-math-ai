@@ -16,6 +16,15 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Director plans can now explicitly mark genuinely differentiated tasks as
+  `metadata.independent_exploration=true`, matching the scheduler's reserved
+  independent-slot contract. If bounded Director repair still ends without a
+  dispatchable job, the controller seals and checkpoints the epoch instead of
+  silently polling a nonempty but non-runnable queue; resume preserves that
+  isolation decision and advances the append-only Director-context generation
+  rather than colliding with an existing archive filename. Legacy continuation
+  tasks retain their original packet identity through checkpoint verification,
+  then receive the new scheduler-only metadata in the fresh epoch.
 - Director route updates now pass through a controller-owned state machine.
   `RESUME` and `RETRY` require the exact stored retry condition and independent
   controller evidence that it is satisfied; existing route representations are

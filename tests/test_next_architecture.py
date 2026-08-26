@@ -103,7 +103,10 @@ def research_task(
         required_files=[],
         stop_conditions=["return the finite result"],
         route_family=route,
-        metadata={"allow_derived_claims": False},
+        metadata={
+            "allow_derived_claims": False,
+            "independent_exploration": route == "independent",
+        },
         representation=(contract or RepresentationContract.legacy()).to_dict(),
     )
 
@@ -606,7 +609,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.10")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.11")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -1608,6 +1611,149 @@ class NextArchitectureTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_independent_exploration_marker_is_available_to_director(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="independent-marker", campaign_id="independent-marker",
+        )
+        schema = controller._schema("director_plan.schema.json")
+        metadata = schema["properties"]["spawn"]["items"]["properties"][
+            "metadata"
+        ]
+        self.assertEqual(
+            metadata["properties"]["independent_exploration"]["type"],
+            "boolean",
+        )
+        task = research_task("marked-independent")
+        task.metadata["independent_exploration"] = True
+        self.assertTrue(task.is_independent_exploration)
+
+        controller._pin_run_inputs(0.01, True)
+        snapshot = controller._write_compact_snapshot()
+        prompt = director_prompt(
+            self.project,
+            snapshot,
+            [],
+            controller._policy_view("director"),
+            full_context_path=controller._latest_director_context_path,
+        )
+        self.assertIn("metadata.independent_exploration=true", prompt)
+        self.assertIn("role=explorer alone does not satisfy", prompt)
+
+    def test_isolated_director_failure_checkpoints_nonrunnable_pending_queue(self) -> None:
+        async def scenario() -> None:
+            controller = AutonomousController(
+                load_config(self.project), backend=MockCodexBackend(), mock=True,
+                run_id="isolated-nonrunnable", campaign_id="isolated-nonrunnable",
+            )
+            controller._pin_run_inputs(0.01, True)
+            controller.lifecycle.transition(
+                LifecyclePhase.RUNNING, reason="test scheduling",
+            )
+            controller.director_needed = False
+            controller.pending_research = [
+                research_task(f"regular-route-{index}", route=f"regular-route-{index}")
+                for index in range(8)
+            ]
+            controller.director_retry_counts["model_protocol"] = 1
+
+            controller._queue_director_retry(
+                "director_no_runnable_work",
+                retryable=True,
+                source="test",
+            )
+            controller._request_director(
+                "scheduler requested another repair",
+                meaningful_change=True,
+            )
+            await controller._maybe_launch_director()
+            await controller._launch_research(
+                capacity=8, allow_exploration=True,
+            )
+
+            self.assertEqual(controller.active, {})
+            self.assertTrue(
+                controller._pause_if_isolated_director_failure_is_idle()
+            )
+            self.assertEqual(
+                controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH,
+            )
+            self.assertIn(
+                "director failed after bounded retries",
+                controller.scheduler_stop_reason or "",
+            )
+            self.assertEqual(len(controller.pending_research), 8)
+            self.assertFalse(controller.director_needed)
+            self.assertIn(
+                "DIRECTOR_FAILURE_CHECKPOINT_REQUESTED",
+                [event["kind"] for event in controller.store.replay()],
+            )
+
+        asyncio.run(scenario())
+
+    def test_resume_restores_isolated_director_failure_latch(self) -> None:
+        run_id = "resume-isolated-director"
+        first = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id=run_id, campaign_id=run_id,
+        )
+        task = research_task("preserved-after-director-failure")
+        first.store.append("TASK_ACCEPTED", {
+            "task_id": task.task_id,
+            "fingerprint": task.fingerprint,
+            "representation_id": task.representation_id,
+            "task": task.to_dict(),
+        })
+        reason = "director failed after bounded retries: director_no_runnable_work"
+        first.store.append("DIRECTOR_FAILURE_ISOLATED", {
+            "reason": reason,
+            "failure_kind": "director_no_runnable_work",
+        })
+
+        resumed = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id=run_id, campaign_id=run_id, resume=True,
+        )
+        resumed.recover()
+        resumed.lifecycle.transition(LifecyclePhase.RUNNING, reason="resume test")
+        asyncio.run(resumed._maybe_launch_director())
+
+        self.assertEqual(resumed._isolated_director_failure_reason, reason)
+        self.assertEqual(
+            [item.task_id for item in resumed.pending_research], [task.task_id]
+        )
+        self.assertEqual(resumed.active, {})
+
+    def test_resume_advances_append_only_director_context_generation(self) -> None:
+        run_id = "resume-director-context-generation"
+        first = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id=run_id, campaign_id=run_id,
+        )
+        first._pin_run_inputs(0.01, False)
+        first._write_compact_snapshot()
+        first._write_compact_snapshot()
+        archive_two = (
+            first.run_dir / "state" / "director_context_archive"
+            / "context-00000002.json"
+        )
+        archive_two_bytes = archive_two.read_bytes()
+
+        resumed = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id=run_id, campaign_id=run_id, resume=True,
+        )
+        resumed._pin_run_inputs(0.01, False)
+        resumed.recover()
+        resumed._write_compact_snapshot()
+
+        self.assertEqual(resumed._snapshot_generation, 3)
+        self.assertEqual(archive_two.read_bytes(), archive_two_bytes)
+        self.assertEqual(
+            resumed._latest_director_context_path.name,
+            "context-00000003.json",
+        )
+
     def test_cancelled_active_research_is_retained_in_next_epoch_snapshot(self) -> None:
         async def scenario() -> None:
             config = load_config(self.project)
@@ -1867,6 +2013,7 @@ class NextArchitectureTests(unittest.TestCase):
         )
         first._pin_run_inputs(0.01, True)
         task = research_task("long-proof-task")
+        task.metadata.pop("independent_exploration")
         outcome = JobOutcome(
             job_id="job-long-proof",
             task_id=task.task_id,
@@ -1886,6 +2033,7 @@ class NextArchitectureTests(unittest.TestCase):
         )
         first._accept_research_result(outcome, task)
         continued = first.deferred_research_continuations[0]
+        self.assertNotIn("independent_exploration", continued.metadata)
         first._write_compact_snapshot()
 
         second = AutonomousController(
@@ -1904,8 +2052,12 @@ class NextArchitectureTests(unittest.TestCase):
             second.task_fingerprints_by_id[continued.task_id],
             continued.fingerprint,
         )
+        self.assertFalse(
+            second.pending_research[0].metadata["independent_exploration"]
+        )
         events = [item["kind"] for item in second.store.replay()]
         self.assertIn("RESEARCH_CONTINUATION_IMPORTED", events)
+        self.assertIn("TASK_METADATA_COMPATIBILITY_ADAPTED", events)
         self.assertIn("TASK_ACCEPTED", events)
         self.assertEqual(second.route_ledger.records()[-1]["status"], "ACTIVE")
 

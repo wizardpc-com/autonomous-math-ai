@@ -219,7 +219,7 @@ class ResearchTask:
         self.priority = priority
         self.route_family = route_family
         self.modifies_code = modifies_code
-        self.metadata = {} if metadata is None else metadata
+        self.metadata = {} if metadata is None else dict(metadata)
         self.representation = (
             RepresentationContract.legacy().to_dict()
             if representation is None else representation

@@ -179,12 +179,15 @@ def director_prompt(
         "next_epoch_pending_research and deferred_research_continuation_ids are checkpointed "
         "for a fresh epoch and MUST NOT appear in this turn's spawn list. A RESUME or RETRY "
         "request cannot satisfy its own retry_condition; only controller-owned state can do so.\n"
+        "A reserved independent-exploration slot is satisfied only when a genuinely "
+        "differentiated task sets metadata.independent_exploration=true; role=explorer "
+        "alone does not satisfy that reserve.\n"
         f"mechanical_broker_command={MECHANICAL_BROKER_COMMAND_MARKER}\n"
         "Use that broker only for a finite deterministic packet; never delegate strategy or judgment.\n\n"
         "OUTPUT\n"
         f"Return one schema-valid Output Protocol v2 JSON object with exactly: "
         f"{render_contract_keys(DIRECTOR_PLAN_KEYS)}. "
-        "Do not emit output_contract or independent_exploration. The controller owns termination, "
+        "Do not emit output_contract. The controller owns termination, "
         "pruning, candidate identity, audit leases, and route-state application."
     )
     enforce_director_prompt_limit(prompt)

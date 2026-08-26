@@ -948,6 +948,7 @@ class AutonomousController:
         self._bound_jobs: dict[str, tuple[str, str]] = {}
         self._blocker_repair_jobs: set[str] = set()
         self.scheduler_stop_reason: str | None = None
+        self._isolated_director_failure_reason: str | None = None
         self._provider_transport_lost: dict[str, Any] | None = None
         self.lifecycle = MonotoneLifecycle()
         self.final_claim_resolved = False
@@ -1434,6 +1435,7 @@ class AutonomousController:
             self._begin_internal_failure_drain(reason, source=source)
             return False
         self.director_needed = False
+        self._isolated_director_failure_reason = reason
         self.director_constraints.append({
             "action": "DIVERSIFY",
             "claim_id": self.final_conjecture_claim_id or "FRONTIER",
@@ -1462,6 +1464,33 @@ class AutonomousController:
             )
             self.scheduler_stop_reason = pause_reason
         return False
+
+    def _pause_if_isolated_director_failure_is_idle(self) -> bool:
+        reason = self._isolated_director_failure_reason
+        if (
+            not reason
+            or self.scheduler_stop_reason
+            or self.active
+            or self.active_mechanical
+        ):
+            return False
+        pause_reason = f"campaign paused: {reason}"
+        self.director_needed = False
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(
+                LifecyclePhase.DRAINING_EPOCH, reason=pause_reason,
+            )
+        self.scheduler_stop_reason = pause_reason
+        self.store.append("DIRECTOR_FAILURE_CHECKPOINT_REQUESTED", {
+            "reason": pause_reason,
+            "pending_research_preserved": len(self.pending_research),
+            "pending_audits_preserved": len(self.pending_audits),
+            "action": (
+                "no research, audit, or mechanical job remains active after the "
+                "post-failure dispatch attempt; seal the epoch and preserve the frontier"
+            ),
+        })
+        return True
 
     @property
     def active_graph_path(self) -> Path:
@@ -3615,6 +3644,18 @@ class AutonomousController:
         return directive
 
     def recover(self) -> None:
+        archive_root = self.run_dir / "state" / "director_context_archive"
+        if archive_root.is_dir():
+            archive_generations = [
+                int(match.group(1))
+                for path in archive_root.iterdir()
+                if path.is_file()
+                and (match := re.fullmatch(r"context-(\d{8})\.json", path.name))
+            ]
+            if archive_generations:
+                self._snapshot_generation = max(
+                    self._snapshot_generation, max(archive_generations),
+                )
         records = self.store.replay()
         last_director_success_sequence = max(
             (
@@ -3857,6 +3898,10 @@ class AutonomousController:
                     int(event["payload"].get("retry", 0)),
                 )
                 self.director_retry_count = sum(self.director_retry_counts.values())
+            elif event["kind"] == "DIRECTOR_FAILURE_ISOLATED":
+                self._isolated_director_failure_reason = str(
+                    event["payload"].get("reason") or "Director failure isolated"
+                )
             elif event["kind"] == "DIRECTOR_REPLAN_REQUESTED":
                 self._state_version = max(
                     self._state_version, int(event["payload"].get("state_version", 0))
@@ -5050,6 +5095,9 @@ class AutonomousController:
                     f"next_epoch:{self.previous_epoch_id}"
                 )
                 imported_continuation_ids.add(task.task_id)
+            self._adapt_legacy_imported_task_metadata(
+                task, source=f"epoch:{self.previous_epoch_id}",
+            )
             validation_error = self._validate_director_task(task, check_route=False)
             if validation_error:
                 raise ValueError(
@@ -5154,6 +5202,9 @@ class AutonomousController:
                     or terminal.get("exit_reason") != stopped.get("reason")
                 ):
                     continue
+                self._adapt_legacy_imported_task_metadata(
+                    task, source=f"legacy-events:{self.previous_epoch_id}",
+                )
                 validation_error = self._validate_director_task(
                     task, check_route=False,
                 )
@@ -5827,6 +5878,8 @@ class AutonomousController:
                     min(decision.max_research or 0, self.max_research_workers),
                     decision.allow_exploration,
                 )
+                if self._pause_if_isolated_director_failure_is_idle():
+                    continue
 
                 if (
                     not self.active and not self.active_mechanical
@@ -6319,6 +6372,7 @@ class AutonomousController:
             not self.lifecycle.can_dispatch
             or not self.director_needed
             or self._director_active
+            or self._isolated_director_failure_reason
             or self.scheduler_stop_reason
         ):
             return
@@ -9200,8 +9254,13 @@ class AutonomousController:
                 "accepts existing ClaimGraph claim ids, not task ids; schedule task "
                 "sequencing in a later Director wave"
             )
-        if set(task.metadata) != {"allow_derived_claims"}:
-            return "research task metadata must contain exactly allow_derived_claims"
+        if set(task.metadata) != {
+            "allow_derived_claims", "independent_exploration",
+        }:
+            return (
+                "research task metadata must contain exactly allow_derived_claims "
+                "and independent_exploration"
+            )
         if not all(isinstance(task.metadata[key], bool) for key in task.metadata):
             return "research task metadata values must be booleans"
         for dependency in task.dependencies:
@@ -9222,6 +9281,27 @@ class AutonomousController:
         except ValueError as exc:
             return _sanitize_live_text(exc)
         return None
+
+    def _adapt_legacy_imported_task_metadata(
+        self, task: ResearchTask, *, source: str,
+    ) -> None:
+        if (
+            set(task.metadata) != {"allow_derived_claims"}
+            or not isinstance(task.metadata["allow_derived_claims"], bool)
+        ):
+            return
+        value = task.route_family == "independent"
+        task.metadata["independent_exploration"] = value
+        self.store.append("TASK_METADATA_COMPATIBILITY_ADAPTED", {
+            "task_id": task.task_id,
+            "source": source,
+            "field": "independent_exploration",
+            "value": value,
+            "action": (
+                "preserve the verified legacy task identity, then add the current "
+                "scheduler-only metadata field in the new epoch"
+            ),
+        })
 
     def _required_file_access(self, task: ResearchTask) -> list[dict[str, str]]:
         return [
@@ -10920,7 +11000,10 @@ def build_mock_full_cycle_backend(
                 ],
                 "priority": 0.9,
                 "route_family": "main", "modifies_code": False,
-                "metadata": {"allow_derived_claims": False},
+                "metadata": {
+                    "allow_derived_claims": False,
+                    "independent_exploration": False,
+                },
                 "representation": {"branch":"LEGACY_UNSPECIFIED","localization":"LEGACY_UNSPECIFIED","saturation":"LEGACY_UNSPECIFIED","normalization":"LEGACY_UNSPECIFIED","content":"LEGACY_UNSPECIFIED","exceptional_factors":[],"combination_scope":"LEGACY_UNSPECIFIED"},
             },
             {
@@ -10936,7 +11019,10 @@ def build_mock_full_cycle_backend(
                 "stop_conditions": ["check n=0 through 20 exactly"],
                 "priority": 0.8,
                 "route_family": "independent", "modifies_code": False,
-                "metadata": {"allow_derived_claims": False},
+                "metadata": {
+                    "allow_derived_claims": False,
+                    "independent_exploration": True,
+                },
                 "representation": {"branch":"LEGACY_UNSPECIFIED","localization":"LEGACY_UNSPECIFIED","saturation":"LEGACY_UNSPECIFIED","normalization":"LEGACY_UNSPECIFIED","content":"LEGACY_UNSPECIFIED","exceptional_factors":[],"combination_scope":"LEGACY_UNSPECIFIED"},
             },
         ],
