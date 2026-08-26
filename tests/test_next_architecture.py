@@ -22,7 +22,12 @@ from autonomous_math_research.canonical_transition import (
     CanonicalTransitionStore, bytes_sha256, json_bytes,
 )
 from autonomous_math_research.config import load_config
-from autonomous_math_research.controller import ActiveJob, AutonomousController, RunResult
+from autonomous_math_research.controller import (
+    NEXT_EPOCH_FRONTIER_READY_REASON,
+    ActiveJob,
+    AutonomousController,
+    RunResult,
+)
 from autonomous_math_research.cli import (
     ResumeContext, _auto_epoch_allowed, _execute_epoch, _latest_run, _run_command,
 )
@@ -601,7 +606,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.8")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.10")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -1468,6 +1473,17 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertFalse(_auto_epoch_allowed(quota, checkpoint))
         self.assertFalse(_auto_epoch_allowed(failure, checkpoint))
 
+    def test_auto_epochs_continue_for_controller_attested_next_epoch_frontier(self) -> None:
+        checkpoint = type("Checkpoint", (), {"remaining_seconds": 100.0})()
+        result = RunResult(
+            run_id="next-epoch", report_path=self.runtime / "next-epoch.md",
+            stopped_reason=NEXT_EPOCH_FRONTIER_READY_REASON,
+            job_count=1, event_count=1, run_mode="real",
+            campaign_status="PAUSED", artifacts_finalized=True,
+        )
+
+        self.assertTrue(_auto_epoch_allowed(result, checkpoint))
+
     def test_fresh_epoch_imports_valid_pending_research(self) -> None:
         config = load_config(self.project)
         first = AutonomousController(
@@ -1767,8 +1783,10 @@ class NextArchitectureTests(unittest.TestCase):
         snapshot = json.loads(
             first._write_compact_snapshot().read_text(encoding="utf-8")
         )
+        self.assertEqual(snapshot["schema_version"], 3)
+        self.assertEqual(snapshot["pending_research"], [])
         self.assertEqual(
-            [item["task_id"] for item in snapshot["pending_research"]],
+            [item["task_id"] for item in snapshot["next_epoch_pending_research"]],
             [continued.task_id],
         )
         self.assertEqual(
@@ -1891,6 +1909,64 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertIn("TASK_ACCEPTED", events)
         self.assertEqual(second.route_ledger.records()[-1]["status"], "ACTIVE")
 
+    def test_next_epoch_imports_legacy_combined_pending_frontier(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="legacy-frontier-one", campaign_id="legacy-frontier-campaign",
+        )
+        first._pin_run_inputs(0.01, True)
+        task = research_task("legacy-long-proof-task")
+        first._accept_research_result(JobOutcome(
+            job_id="legacy-job", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed",
+            result={
+                "result_type": "NO_PROGRESS", "status": "OPEN",
+                "main_finding": "The obligation remains open.",
+                "next_suggested_question": "Continue the exact same task.",
+                "artifact_paths": [], "evidence_level": "E0_SPECULATIVE",
+            },
+            turn_history=[{"turn_index": index} for index in range(1, 13)],
+            logical_stop_reason="bounded same-thread turn limit reached",
+        ), task)
+        continued = first.deferred_research_continuations[0]
+        compact_path = first._write_compact_snapshot()
+        compact = json.loads(compact_path.read_text(encoding="utf-8"))
+        archive_path = compact_path.parent / compact["full_context_archive"]["relative_path"]
+        full = json.loads(archive_path.read_text(encoding="utf-8"))
+        full.pop("schema_version", None)
+        full["pending_research"] = [
+            *full["pending_research"], *full.pop("next_epoch_pending_research"),
+        ]
+        archive_path.write_text(
+            json.dumps(full, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        compact["schema_version"] = 2
+        compact["pending_research"] = [
+            *compact["pending_research"], *compact.pop("next_epoch_pending_research"),
+        ]
+        compact["section_manifest"].pop("next_epoch_pending_research", None)
+        compact["summary_counts"].pop("next_epoch_pending_research", None)
+        compact["full_context_archive"]["bytes"] = archive_path.stat().st_size
+        compact["full_context_archive"]["sha256"] = file_digest(archive_path)
+        compact_path.write_text(
+            json.dumps(compact, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        second = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="legacy-frontier-two", campaign_id="legacy-frontier-campaign",
+            previous_epoch_id="legacy-frontier-one",
+        )
+        second._pin_run_inputs(0.01, True)
+        second._import_previous_epoch_checkpoint()
+
+        self.assertEqual(
+            [item.task_id for item in second.pending_research], [continued.task_id],
+        )
+
     def test_next_epoch_rejects_tampered_turn_limit_checkpoint(self) -> None:
         config = load_config(self.project)
         first = AutonomousController(
@@ -1968,7 +2044,7 @@ class NextArchitectureTests(unittest.TestCase):
         first._accept_research_result(outcome, task)
         snapshot_path = first._write_compact_snapshot()
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        snapshot["pending_research"][0]["why_now"] = "tampered rationale"
+        snapshot["next_epoch_pending_research"][0]["why_now"] = "tampered rationale"
         snapshot_path.write_text(
             json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -2101,6 +2177,136 @@ class NextArchitectureTests(unittest.TestCase):
             "DIRECTOR_FAILURE_ISOLATED",
             [item["kind"] for item in controller.store.replay()],
         )
+
+    def test_director_cannot_satisfy_a_paused_route_retry_condition(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="route-authorization", campaign_id="campaign-1",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        contract = representation("preserved")
+        condition = "next_epoch:route-authorization"
+        controller.route_ledger.append(
+            route_id="route-a", representation_id=contract.representation_id,
+            method_tags=["finite"], status="PAUSED", failure_class=None,
+            retry_condition=condition, evidence_refs=["artifact://checkpoint"],
+            source="controller",
+        )
+        blocked_plan = {
+            "assessment": "Resume the deferred route.",
+            "spawn": [],
+            "audit_priorities": [],
+            "route_updates": [{
+                "route_id": "route-a", "action": "RESUME",
+                "reason": "the Director says the next epoch condition is satisfied",
+                "retry_condition": condition,
+            }],
+            "short_rationale": "Exercise route authorization.",
+        }
+
+        controller._accept_director_result(JobOutcome(
+            job_id="director-blocked", task_id="director-blocked", role="director",
+            claim_id="FRONTIER", status="completed", result=blocked_plan,
+        ))
+
+        latest = controller.route_ledger.records()[-1]
+        self.assertEqual(latest["status"], "PAUSED")
+        self.assertEqual(latest["representation_id"], contract.representation_id)
+        rejected = [
+            event for event in controller.store.replay()
+            if event["kind"] == "DIRECTOR_ROUTE_UPDATE_REJECTED"
+        ]
+        self.assertEqual(rejected[-1]["payload"]["reason_code"], "condition_unsatisfied")
+
+        controller.scheduler_stop_reason = None
+        controller.director_needed = False
+        controller.satisfied_route_conditions.add(condition)
+        task = research_task("authorized-resume", contract=contract)
+        authorized_plan = {
+            **blocked_plan,
+            "spawn": [task.to_dict()],
+            "short_rationale": "Use controller-authorized retry evidence.",
+        }
+        controller._accept_director_result(JobOutcome(
+            job_id="director-authorized", task_id="director-authorized", role="director",
+            claim_id="FRONTIER", status="completed", result=authorized_plan,
+        ))
+
+        latest = controller.route_ledger.records()[-1]
+        self.assertEqual(latest["status"], "ACTIVE")
+        self.assertEqual(latest["representation_id"], contract.representation_id)
+        self.assertEqual([item.task_id for item in controller.pending_research], [task.task_id])
+
+    def test_director_selecting_only_deferred_work_closes_current_epoch_cleanly(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="deferred-frontier", campaign_id="campaign-1",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        continuation = research_task("next-epoch-continuation")
+        controller.deferred_research_continuations = [continuation]
+        controller.task_fingerprints_by_id[continuation.task_id] = continuation.fingerprint
+        controller.seen_task_fingerprints.add(continuation.fingerprint)
+        plan = {
+            "assessment": "Continue the exact checkpointed task.",
+            "spawn": [continuation.to_dict()],
+            "audit_priorities": [],
+            "route_updates": [],
+            "short_rationale": "The selected work is next-epoch only.",
+        }
+
+        controller._accept_director_result(JobOutcome(
+            job_id="director-deferred", task_id="director-deferred", role="director",
+            claim_id="FRONTIER", status="completed", result=plan,
+        ))
+
+        self.assertEqual(controller.scheduler_stop_reason, NEXT_EPOCH_FRONTIER_READY_REASON)
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        self.assertFalse(controller.director_needed)
+        kinds = [event["kind"] for event in controller.store.replay()]
+        self.assertIn("TASK_DEFERRED_UNTIL_NEXT_EPOCH", kinds)
+        self.assertIn("NEXT_EPOCH_FRONTIER_READY", kinds)
+        self.assertNotIn("DIRECTOR_RETRY_QUEUED", kinds)
+
+    def test_director_retry_requires_the_stored_controller_condition(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="retry-authorization", campaign_id="campaign-1",
+        )
+        condition = "new_evidence:C_ROOT"
+        controller.route_ledger.append(
+            route_id="route-a", representation_id="rep:preserved",
+            method_tags=["finite"], status="FAILED", failure_class="exhausted",
+            retry_condition=condition, evidence_refs=["artifact://failure"],
+            source="controller",
+        )
+        controller.satisfied_route_conditions.add(condition)
+
+        disposition, rejection = controller._apply_director_route_update(
+            {
+                "route_id": "route-a", "action": "RETRY",
+                "reason": "use a different condition", "retry_condition": "different",
+            },
+            accepted_tasks=[], stale=False,
+        )
+
+        self.assertEqual(disposition, "rejected")
+        self.assertEqual(rejection["reason_code"], "condition_mismatch")
+        self.assertEqual(controller.route_ledger.records()[-1]["status"], "FAILED")
+
+        disposition, rejection = controller._apply_director_route_update(
+            {
+                "route_id": "route-a", "action": "RETRY",
+                "reason": "use controller-owned evidence", "retry_condition": condition,
+            },
+            accepted_tasks=[], stale=False,
+        )
+
+        self.assertEqual(disposition, "applied")
+        self.assertIsNone(rejection)
+        latest = controller.route_ledger.records()[-1]
+        self.assertEqual(latest["status"], "ACTIVE")
+        self.assertEqual(latest["representation_id"], "rep:preserved")
 
     def test_director_required_files_accept_portable_and_legacy_paths(self) -> None:
         controller = AutonomousController(

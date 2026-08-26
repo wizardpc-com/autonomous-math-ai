@@ -11,6 +11,8 @@ from autonomous_math_research.config import load_config
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.launcher import (
     COMMON_OVERRIDE_PATHS,
+    LauncherProject,
+    find_unfinished_campaigns,
     _monitor_command,
     _open_monitor_window,
     format_config_summary,
@@ -22,6 +24,7 @@ from autonomous_math_research.launcher import (
     scan_workspace,
     temporary_profile,
 )
+from autonomous_math_research.lifecycle.campaign import CampaignStore
 
 
 RUNTIME = Path(__file__).resolve().parent / "_runtime"
@@ -44,6 +47,42 @@ class UnifiedLauncherTests(unittest.TestCase):
     def _inputs(values: list[str]):
         iterator = iter(values)
         return lambda _prompt="": next(iterator)
+
+    def _campaign(
+        self,
+        campaign_id: str,
+        *,
+        epoch_id: str,
+        mode: str,
+        sealed: bool,
+        created_at: str,
+    ) -> CampaignStore:
+        runtime = self.project / "autonomous"
+        store = CampaignStore(runtime, campaign_id)
+        store.create(
+            project_id="alpha", campaign_hours=2.0, epoch_hours=1.0,
+        )
+        manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+        manifest["created_at"] = created_at
+        store.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        store.append_epoch_started(
+            epoch_id=epoch_id, previous_epoch_id=None, mode=mode,
+        )
+        if sealed:
+            checkpoint = runtime / "runs" / epoch_id / "state" / "compact_snapshot.json"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text("{}\n", encoding="utf-8")
+            store.append_epoch_sealed(
+                epoch_id=epoch_id,
+                elapsed_seconds=60.0,
+                status="PAUSED",
+                stopped_reason="epoch time limit reached",
+                checkpoint_uri=f"epoch://{epoch_id}/state/compact_snapshot.json",
+            )
+        return store
 
     def test_fallback_scan_excludes_nested_repo_runtime_and_reports_invalid(self) -> None:
         nested = self.root / "tools" / "nested-harness"
@@ -215,6 +254,101 @@ class UnifiedLauncherTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(commands[0][:2], ["validate", "--project"])
         self.assertEqual(load_launcher_state(self.state)["last_project_id"], "alpha")
+
+    def test_unfinished_campaigns_are_newest_first_and_distinguish_recovery(self) -> None:
+        older = self._campaign(
+            "older-sealed", epoch_id="older-epoch", mode="real", sealed=True,
+            created_at="2026-08-25T00:00:00Z",
+        )
+        newer = self._campaign(
+            "newer-active", epoch_id="newer-epoch", mode="mock", sealed=False,
+            created_at="2026-08-26T00:00:00Z",
+        )
+        completed = self._campaign(
+            "newest-completed", epoch_id="completed-epoch", mode="real", sealed=True,
+            created_at="2026-08-27T00:00:00Z",
+        )
+        self._campaign(
+            "newest-dry-run", epoch_id="dry-run-epoch", mode="dry-run", sealed=True,
+            created_at="2026-08-28T00:00:00Z",
+        )
+        completed_manifest = json.loads(
+            completed.manifest_path.read_text(encoding="utf-8")
+        )
+        completed_manifest["status"] = "COMPLETED"
+        completed.manifest_path.write_text(
+            json.dumps(completed_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        project = LauncherProject(
+            "alpha", "A_FINAL", self.project,
+            self.project / "autonomous" / "config.yaml",
+        )
+        campaigns, issues = find_unfinished_campaigns(project)
+
+        self.assertEqual(issues, [])
+        self.assertEqual(
+            [item.campaign_id for item in campaigns],
+            [newer.campaign_id, older.campaign_id],
+        )
+        self.assertEqual(campaigns[0].continuation_kind, "resume")
+        self.assertEqual(campaigns[0].epoch_id, "newer-epoch")
+        self.assertEqual(campaigns[1].continuation_kind, "continue")
+        self.assertEqual(campaigns[1].epoch_id, "older-epoch")
+
+    def test_interactive_launcher_prompts_and_resumes_latest_unsealed_campaign(self) -> None:
+        self._campaign(
+            "active-mock", epoch_id="active-epoch", mode="mock", sealed=False,
+            created_at="2026-08-26T00:00:00Z",
+        )
+        commands: list[list[str]] = []
+        messages: list[str] = []
+
+        result = run_launcher(
+            project_root=self.project,
+            state_path=self.state,
+            input_fn=self._inputs(["8", "", "0"]),
+            output=messages.append,
+            command_runner=lambda args: commands.append(list(args)) or 0,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(any("检测到上一轮未完成 campaign" in item for item in messages))
+        self.assertEqual(commands[0][:3], ["run", "--project", str(self.project)])
+        self.assertEqual(
+            commands[0][commands[0].index("--resume") + 1], "active-epoch",
+        )
+        self.assertIn("--auto-epochs", commands[0])
+        self.assertIn("--mock", commands[0])
+
+    def test_direct_continue_action_confirms_real_sealed_campaign(self) -> None:
+        self._campaign(
+            "paused-real", epoch_id="sealed-epoch", mode="real", sealed=True,
+            created_at="2026-08-26T00:00:00Z",
+        )
+        commands: list[list[str]] = []
+
+        result = run_launcher(
+            project_root=self.project,
+            action="continue",
+            state_path=self.state,
+            input_fn=self._inputs(["CONTINUE paused-real"]),
+            output=lambda _text: None,
+            command_runner=lambda args: commands.append(list(args)) or 0,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(commands[0][:2], ["campaign", "continue"])
+        self.assertEqual(
+            commands[0][commands[0].index("--campaign") + 1], "paused-real",
+        )
+        self.assertRegex(
+            commands[0][commands[0].index("--run-id") + 1],
+            r"^\d{8}T\d{6}\.\d{6}Z$",
+        )
+        self.assertIn("--auto-epochs", commands[0])
+        self.assertNotIn("--mock", commands[0])
 
     def test_summary_contains_routes_but_no_secret_values(self) -> None:
         summary = format_config_summary(load_config(self.project))

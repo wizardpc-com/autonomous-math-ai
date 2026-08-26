@@ -16,6 +16,7 @@ from autonomous_math_research.app_server import (
     AppServerTransportClosed, AppServerTurnTimeout,
     AppServerTurnTransportLost, TurnOwnershipRegistry,
     _configured_mcp_server_names, app_server_command, app_server_environment,
+    runtime_python_read_roots,
 )
 from autonomous_math_research.backend import (
     AppServerBackend, TurnDirective, _classify_failure,
@@ -867,6 +868,31 @@ class AppServerLaunchIsolationTests(unittest.TestCase):
         )
         self.assertEqual(environment["CODEX_HOME"], str(Path("C:/codex-home")))
         self.assertNotIn("UNIT_TEST_API_KEY", environment)
+
+    def test_runtime_python_read_roots_include_a_detected_virtual_environment(self) -> None:
+        root = TEST_RUNTIME / f"venv-roots-{uuid4().hex}"
+        executable = root / "Scripts" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        (root / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+        try:
+            roots = runtime_python_read_roots(executable)
+        finally:
+            shutil.rmtree(root)
+
+        self.assertEqual(roots, (executable.parent.resolve(), root.resolve()))
+
+    def test_runtime_python_read_roots_do_not_widen_a_non_venv_runtime(self) -> None:
+        root = TEST_RUNTIME / f"plain-runtime-{uuid4().hex}"
+        executable = root / "bin" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        try:
+            roots = runtime_python_read_roots(executable)
+        finally:
+            shutil.rmtree(root)
+
+        self.assertEqual(roots, (executable.parent.resolve(),))
 
     def test_environment_removes_the_codex_entrypoint_from_role_path(self) -> None:
         codex = Path("C:/codex-bin/codex.exe")

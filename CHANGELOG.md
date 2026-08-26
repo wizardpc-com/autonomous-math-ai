@@ -6,8 +6,27 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The Windows launcher now detects the newest real or mock campaign that still
+  has budget and offers `Continue previous`. It routes unsealed epochs through
+  pinned `run --resume` recovery and sealed checkpoints through `campaign
+  continue`, preserves the prior execution mode, enables safe cross-epoch
+  continuation, and opens the monitor on the exact resumed or reserved run ID.
+
 ### Fixed
 
+- Director route updates now pass through a controller-owned state machine.
+  `RESUME` and `RETRY` require the exact stored retry condition and independent
+  controller evidence that it is satisfied; existing route representations are
+  preserved across status changes.
+- Director context schema v3 separates current-epoch research from checkpointed
+  next-epoch continuations. Selecting only deferred work now seals a clean epoch
+  boundary that `--auto-epochs` can continue, while legacy combined frontiers
+  remain readable without rewriting historical checkpoints.
+- Windows App Server roles receive the detected virtual-environment root as a
+  narrow read-only runtime path, and candidate-event commands invoke the exact
+  controller Python executable instead of relying on a `python` PATH alias.
 - Canonical-transition schema v2 requires explicit preconditions for every new
   record. A read-only compatibility adapter accepts pre-v1.1 schema-v1 records
   only when their exact legacy fields, snapshots, trusted-state binding,

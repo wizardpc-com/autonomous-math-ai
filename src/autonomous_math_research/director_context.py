@@ -9,10 +9,12 @@ from typing import Any
 DIRECTOR_PROMPT_TARGET_BYTES = 4 * 1024
 DIRECTOR_PROMPT_HARD_LIMIT_BYTES = 10 * 1024
 COMPACT_SNAPSHOT_HARD_LIMIT_BYTES = 128 * 1024
+DIRECTOR_CONTEXT_SCHEMA_VERSION = 3
 
 _CHECKPOINT_SECTIONS = frozenset({
     "candidate_audit_frontier",
     "pending_research",
+    "next_epoch_pending_research",
     "deferred_research_continuation_ids",
     "research_continuation_checkpoints",
     "pending_audits",
@@ -204,7 +206,7 @@ def build_compact_snapshot(
 ) -> dict[str, Any]:
     """Build a bounded, non-recursive Director view of current state."""
     compact: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": DIRECTOR_CONTEXT_SCHEMA_VERSION,
         "kind": "bounded_current_state_summary",
         "full_context_archive": dict(full_context_reference),
         "history_archive": dict(history_archive),
@@ -267,6 +269,7 @@ def build_compact_snapshot(
             "recent_changes",
             "candidate_audit_frontier",
             "pending_research",
+            "next_epoch_pending_research",
             "pending_audits",
             "route_state",
         )
@@ -277,7 +280,7 @@ def build_compact_snapshot(
         # highest-value scheduling counters. The full state remains available
         # through the verified archive reference.
         compact = {
-            "schema_version": 2,
+            "schema_version": DIRECTOR_CONTEXT_SCHEMA_VERSION,
             "kind": "bounded_current_state_summary",
             "reduced_to_hard_bound": True,
             "full_context_archive": dict(full_context_reference),
@@ -305,6 +308,7 @@ def build_compact_snapshot(
                     "recent_changes",
                     "candidate_audit_frontier",
                     "pending_research",
+                    "next_epoch_pending_research",
                     "pending_audits",
                     "route_state",
                 )
@@ -333,7 +337,7 @@ def load_full_context_archive(
     compact_path: Path,
     compact: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Load and authenticate a v2 external context, or accept a v1 snapshot."""
+    """Load and authenticate an external context, or accept a legacy snapshot."""
     value = compact
     if value is None:
         value = json.loads(compact_path.read_text(encoding="utf-8"))

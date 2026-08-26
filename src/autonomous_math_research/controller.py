@@ -9,7 +9,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
+import subprocess
+import sys
 import time
 from typing import Any, Iterable
 from uuid import uuid4
@@ -39,6 +42,7 @@ from .contracts import (
 )
 from .eventing import CandidateInbox
 from .director_context import (
+    DIRECTOR_CONTEXT_SCHEMA_VERSION,
     DIRECTOR_PROMPT_HARD_LIMIT_BYTES,
     DIRECTOR_PROMPT_TARGET_BYTES,
     DirectorPromptTooLarge,
@@ -122,6 +126,7 @@ from .workspace import WorkspaceManager
 
 
 DEFAULT_RUN_HOURS = 5.0
+NEXT_EPOCH_FRONTIER_READY_REASON = "next epoch continuation frontier ready"
 CONTINUATION_CHECKPOINT_REASONS = frozenset({
     "bounded same-thread turn limit reached",
     "controller token budget reached",
@@ -131,6 +136,10 @@ _PYTHON_DELEGATION_CODE_RE = re.compile(
     r"(?is)(?:subprocess\.(?:run|popen|call)|os\.system)\s*\(.{0,500}?"
     r"(?:^|[\s\"'/\\])codex(?:\.cmd|\.exe)?(?:[\s\"']|$)"
 )
+
+
+def _render_shell_command(parts: list[str]) -> str:
+    return subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
 
 
 def _split_unquoted_shell_segments(command: str) -> list[str]:
@@ -4957,6 +4966,7 @@ class AutonomousController:
         imported_research = 0
         pending_ids = {item.task_id for item in self.pending_research}
         imported_continuation_ids: set[str] = set()
+        snapshot_schema_version = int(snapshot.get("schema_version", 0))
         continuation_ids_raw = snapshot.get("deferred_research_continuation_ids") or []
         if (
             not isinstance(continuation_ids_raw, list)
@@ -4980,7 +4990,37 @@ class AutonomousController:
             }
         if set(continuation_index) != continuation_ids:
             raise ValueError("previous epoch continuation indexes disagree")
-        for raw in snapshot.get("pending_research") or []:
+        current_pending_raw = snapshot.get("pending_research") or []
+        if not isinstance(current_pending_raw, list):
+            raise ValueError("previous epoch pending research frontier is invalid")
+        if snapshot_schema_version >= DIRECTOR_CONTEXT_SCHEMA_VERSION:
+            next_epoch_pending_raw = snapshot.get("next_epoch_pending_research") or []
+            if not isinstance(next_epoch_pending_raw, list):
+                raise ValueError("previous epoch next-epoch research frontier is invalid")
+            current_ids = [
+                str(item.get("task_id") or "")
+                for item in current_pending_raw if isinstance(item, dict)
+            ]
+            deferred_ids = [
+                str(item.get("task_id") or "")
+                for item in next_epoch_pending_raw if isinstance(item, dict)
+            ]
+            if (
+                len(current_ids) != len(current_pending_raw)
+                or len(deferred_ids) != len(next_epoch_pending_raw)
+                or not all(current_ids)
+                or not all(deferred_ids)
+                or len(current_ids) != len(set(current_ids))
+                or len(deferred_ids) != len(set(deferred_ids))
+                or set(current_ids) & set(deferred_ids)
+            ):
+                raise ValueError("previous epoch research frontiers are invalid")
+            if set(deferred_ids) != continuation_ids:
+                raise ValueError("previous epoch deferred frontier and id index disagree")
+            pending_research_raw = [*current_pending_raw, *next_epoch_pending_raw]
+        else:
+            pending_research_raw = current_pending_raw
+        for raw in pending_research_raw:
             if not isinstance(raw, dict):
                 raise ValueError("previous epoch pending research task is invalid")
             try:
@@ -5872,6 +5912,7 @@ class AutonomousController:
         snapshot = self.graph.compact_snapshot(
             active_tasks, self.governor.snapshot(), current_changes,
         )
+        snapshot["schema_version"] = DIRECTOR_CONTEXT_SCHEMA_VERSION
         graph_payload = self.graph.to_payload()
         graph_digest = (
             file_digest(self.layout.claim_graph_path)
@@ -6016,6 +6057,12 @@ class AutonomousController:
             if not state.terminal
         ]
         self._defer_nonretryable_pending_routes(source="checkpoint_preflight")
+        current_task_ids = [task.task_id for task in self.pending_research]
+        deferred_task_ids = [
+            task.task_id for task in self.deferred_research_continuations
+        ]
+        if set(current_task_ids) & set(deferred_task_ids):
+            raise ValueError("current and next-epoch research frontiers overlap")
         pending_for_next_epoch = [
             *self.pending_research, *self.deferred_research_continuations,
         ]
@@ -6023,11 +6070,12 @@ class AutonomousController:
         if len(pending_task_ids) != len(set(pending_task_ids)):
             raise ValueError("next-epoch research frontier contains duplicate task ids")
         snapshot["pending_research"] = [
-            task.to_dict() for task in pending_for_next_epoch
+            task.to_dict() for task in self.pending_research
         ]
-        snapshot["deferred_research_continuation_ids"] = [
-            task.task_id for task in self.deferred_research_continuations
+        snapshot["next_epoch_pending_research"] = [
+            task.to_dict() for task in self.deferred_research_continuations
         ]
+        snapshot["deferred_research_continuation_ids"] = deferred_task_ids
         continuation_checkpoints: list[dict[str, str]] = []
         checkpoint_prefix = (
             f"epoch://{self.epoch_id}/state/research_checkpoints/"
@@ -8426,12 +8474,13 @@ class AutonomousController:
                 },
                 "research_policy": self._policy_view(task.role),
             })
-            event_command = (
-                f'python "{Path(__file__).resolve().parent / "emit_event.py"}" '
-                f'--project "{self.config.project_root}" '
-                f'--file "{workspace / "candidate_event.json"}" '
-                f'--inbox-dir "{job_inbox}"'
-            )
+            event_command = _render_shell_command([
+                str(Path(sys.executable).resolve()),
+                str(Path(__file__).resolve().parent / "emit_event.py"),
+                "--project", str(self.config.project_root),
+                "--file", str(workspace / "candidate_event.json"),
+                "--inbox-dir", str(job_inbox),
+            ])
             prompt = worker_prompt(
                 self.config.project_root, task, packet, event_command,
                 self._policy_view(task.role),
@@ -8660,6 +8709,140 @@ class AutonomousController:
                     ),
                 })
 
+    def _apply_director_route_update(
+        self,
+        update: Any,
+        *,
+        accepted_tasks: list[ResearchTask],
+        stale: bool,
+    ) -> tuple[str, dict[str, Any] | None]:
+        if not isinstance(update, dict):
+            rejection = {
+                "reason_code": "invalid_update",
+                "reason": "route update must be an object",
+                "update": _bounded_value(update),
+            }
+            self.store.append("DIRECTOR_ROUTE_UPDATE_REJECTED", rejection)
+            return "rejected", rejection
+        route_id = str(update.get("route_id") or "")
+        action = str(update.get("action") or "")
+        requested_condition = update.get("retry_condition")
+        latest = self.route_ledger.latest(route_id) if route_id else None
+        payload = {
+            **update,
+            "route_id": route_id,
+            "action": action,
+            "snapshot_version": self._director_snapshot_version,
+            "rebased": stale,
+            "latest_status": latest.get("status") if latest else None,
+            "stored_retry_condition": latest.get("retry_condition") if latest else None,
+        }
+
+        def reject(reason_code: str, reason: str) -> tuple[str, dict[str, Any]]:
+            rejection = {**payload, "reason_code": reason_code, "reason_detail": reason}
+            self.store.append("DIRECTOR_ROUTE_UPDATE_REJECTED", rejection)
+            return "rejected", rejection
+
+        if not route_id or action not in {"OPEN", "PAUSE", "RESUME", "RETRY"}:
+            return reject("invalid_update", "route_id and action are invalid")
+        latest_status = str(latest.get("status") or "") if latest else None
+        if action == "OPEN":
+            if requested_condition is not None:
+                return reject("invalid_retry_condition", "OPEN requires retry_condition=null")
+            if latest is not None:
+                if latest_status == "ACTIVE":
+                    self.store.append("DIRECTOR_ROUTE_UPDATE_NOOP", payload)
+                    return "noop", None
+                return reject("invalid_transition", "an existing route cannot be reopened with OPEN")
+            route_status = "ACTIVE"
+            retry_condition = None
+        elif action == "PAUSE":
+            if latest_status in {"PAUSED", "PAUSE"}:
+                if requested_condition == latest.get("retry_condition"):
+                    self.store.append("DIRECTOR_ROUTE_UPDATE_NOOP", payload)
+                    return "noop", None
+                return reject(
+                    "condition_rewrite",
+                    "a paused route's retry condition cannot be replaced by the Director",
+                )
+            if latest is not None and latest_status != "ACTIVE":
+                return reject("invalid_transition", "only an active route can be paused")
+            route_status = "PAUSED"
+            retry_condition = requested_condition
+        else:
+            expected_status = "PAUSED" if action == "RESUME" else "FAILED"
+            if latest is None or latest_status not in {
+                expected_status, "PAUSE" if action == "RESUME" else expected_status,
+            }:
+                return reject(
+                    "invalid_transition",
+                    f"{action} requires a latest {expected_status} route record",
+                )
+            stored_condition = latest.get("retry_condition")
+            if not isinstance(stored_condition, str) or not stored_condition:
+                return reject(
+                    "missing_retry_condition",
+                    "the controller has no durable retry condition for this route",
+                )
+            if requested_condition != stored_condition:
+                return reject(
+                    "condition_mismatch",
+                    "the requested retry condition must exactly match the stored condition",
+                )
+            if stored_condition not in self.satisfied_route_conditions:
+                return reject(
+                    "condition_unsatisfied",
+                    "the stored retry condition has not been satisfied by controller-owned state",
+                )
+            route_status = "ACTIVE"
+            retry_condition = None
+
+        route_representation = (
+            str(latest.get("representation_id"))
+            if latest is not None
+            else next(
+                (
+                    task.representation_id for task in accepted_tasks
+                    if task.route_family == route_id
+                ),
+                RepresentationContract.legacy().representation_id,
+            )
+        )
+        self.store.append("DIRECTOR_ROUTE_UPDATE", {
+            **payload,
+            "authorization": "controller_state_machine",
+            "applied_status": route_status,
+        })
+        self.route_ledger.append(
+            route_id=route_id,
+            representation_id=route_representation,
+            method_tags=list(latest.get("method_tags") or []) if latest else [],
+            status=route_status,
+            failure_class=None,
+            retry_condition=retry_condition,
+            evidence_refs=list(latest.get("evidence_refs") or []) if latest else [],
+            source="controller:director-request",
+        )
+        return "applied", None
+
+    def _pause_for_next_epoch_frontier(self, selected_task_ids: list[str]) -> None:
+        self.director_needed = False
+        self._replan_after_wave = False
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(
+                LifecyclePhase.DRAINING_EPOCH,
+                reason=NEXT_EPOCH_FRONTIER_READY_REASON,
+            )
+        self.scheduler_stop_reason = NEXT_EPOCH_FRONTIER_READY_REASON
+        self.store.append("NEXT_EPOCH_FRONTIER_READY", {
+            "selected_task_ids": selected_task_ids,
+            "deferred_task_ids": [
+                task.task_id for task in self.deferred_research_continuations
+            ],
+            "action": "seal the current epoch and import the verified frontier in a fresh epoch",
+            "internal_failure": False,
+        })
+
     def _accept_director_result(self, outcome: JobOutcome) -> None:
         """Apply a v2 plan while rebasing every action against current state."""
         incremental = self._director_incremental
@@ -8719,9 +8902,28 @@ class AutonomousController:
             })
 
         accepted_tasks: list[ResearchTask] = []
-        rejected_tasks: list[dict[str, str]] = []
+        rejected_tasks: list[dict[str, Any]] = []
+        deferred_proposals: list[ResearchTask] = []
+        deferred_by_id = {
+            task.task_id: task for task in self.deferred_research_continuations
+        }
+        deferred_by_fingerprint = {
+            task.fingerprint: task for task in self.deferred_research_continuations
+        }
         provisional_task_bindings = dict(self.task_fingerprints_by_id)
         for task in plan.spawn:
+            deferred = deferred_by_id.get(task.task_id)
+            if deferred is None:
+                deferred = deferred_by_fingerprint.get(task.fingerprint)
+            if deferred is not None and deferred.fingerprint == task.fingerprint:
+                deferred_proposals.append(task)
+                self.store.append("TASK_DEFERRED_UNTIL_NEXT_EPOCH", {
+                    "task_id": task.task_id,
+                    "fingerprint": task.fingerprint,
+                    "checkpointed_task_id": deferred.task_id,
+                    "reason": "checkpointed continuation is unavailable in the current epoch",
+                })
+                continue
             task_error = self._validate_director_task(task)
             if task_error:
                 rejection = {
@@ -8787,35 +8989,16 @@ class AutonomousController:
             )
         )
 
+        route_updates_applied = 0
+        route_updates_rejected: list[dict[str, Any]] = []
         for update in plan.route_updates:
-            self.store.append("DIRECTOR_ROUTE_UPDATE", {
-                **update,
-                "snapshot_version": self._director_snapshot_version,
-                "rebased": stale,
-            })
-            route_representation = next(
-                (
-                    task.representation_id for task in accepted_tasks
-                    if task.route_family == str(update["route_id"])
-                ),
-                RepresentationContract.legacy().representation_id,
+            disposition, rejection = self._apply_director_route_update(
+                update, accepted_tasks=accepted_tasks, stale=stale,
             )
-            route_status = {
-                "OPEN": "ACTIVE",
-                "PAUSE": "PAUSED",
-                "RESUME": "ACTIVE",
-                "RETRY": "ACTIVE",
-            }[str(update["action"])]
-            self.route_ledger.append(
-                route_id=str(update["route_id"]),
-                representation_id=route_representation,
-                method_tags=[],
-                status=route_status,
-                failure_class=None,
-                retry_condition=update.get("retry_condition"),
-                evidence_refs=[],
-                source="director",
-            )
+            if disposition == "applied":
+                route_updates_applied += 1
+            elif rejection is not None:
+                route_updates_rejected.append(rejection)
 
         for task in accepted_tasks:
             self.representation_contracts.setdefault(
@@ -8843,6 +9026,9 @@ class AutonomousController:
             "accepted_tasks": len(accepted_tasks),
             "audit_priorities_applied": prioritized,
             "route_updates": len(plan.route_updates),
+            "route_updates_proposed": len(plan.route_updates),
+            "route_updates_applied": route_updates_applied,
+            "route_updates_rejected": len(route_updates_rejected),
             "snapshot_version": self._director_snapshot_version,
             "requested_version": self._director_requested_version,
             "short_rationale": plan.short_rationale,
@@ -8859,7 +9045,18 @@ class AutonomousController:
             any(task.task_id in pending_ids_after_route_updates for task in accepted_tasks)
             or prioritized
         )
-        if not runnable:
+        healthy_work = bool(
+            self.pending_research
+            or self.pending_audits
+            or any(item.kind in {"research", "audit"} for item in self.active.values())
+        )
+        deferred_only_selection = bool(
+            plan.spawn
+            and len(deferred_proposals) == len(plan.spawn)
+            and self.deferred_research_continuations
+            and not healthy_work
+        )
+        if not runnable and not deferred_only_selection:
             repair_constraint: dict[str, Any] = {
                 "action": "REPAIR_PLAN",
                 "claim_id": self.final_conjecture_claim_id or "FRONTIER",
@@ -8868,7 +9065,8 @@ class AutonomousController:
                     "route updates were recorded but do not keep the execution queue alive"
                 ),
                 "source": "director_no_runnable_work",
-                "route_updates_applied": len(plan.route_updates),
+                "route_updates_applied": route_updates_applied,
+                "route_updates_rejected": route_updates_rejected,
                 "rejected_tasks": rejected_tasks,
             }
             self.director_constraints.append(repair_constraint)
@@ -8882,6 +9080,10 @@ class AutonomousController:
                 meaningful_change=False,
                 immediate=False,
             )
+        elif deferred_only_selection:
+            self._pause_for_next_epoch_frontier([
+                task.task_id for task in deferred_proposals
+            ])
         elif not runnable:
             self._queue_director_retry(
                 "director_no_runnable_work",

@@ -26,8 +26,13 @@ The selected project's manifest points to its single persistent
 `autonomous/config.yaml`. Before dry-run, mock, or real execution, the launcher
 shows a redacted summary. Common numbered edits and allowed
 `dotted.path=JSON-value` inputs create a temporary profile; they never rewrite
-the project. A real run requires the exact phrase `RUN <project_id>`. Each run
-action also opens a separate monitor window pinned to the newly allocated run ID.
+the project. If a real or mock campaign is unfinished and still has budget, the
+menu shows the newest one as `Continue previous`. It uses pinned resume for an
+unsealed epoch and checkpoint continuation for a sealed epoch. A real run
+requires `RUN <project_id>` and a real continuation requires
+`CONTINUE <campaign_id>`. Each run action opens a separate monitor window pinned
+to the exact resumed or newly allocated run ID. The same detection is available
+directly as `amr launcher continue --project PATH`.
 
 ## 2. Create a neutral research target
 

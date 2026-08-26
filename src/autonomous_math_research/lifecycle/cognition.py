@@ -126,11 +126,14 @@ class RouteLedger:
     def records(self) -> list[dict[str, Any]]:
         return read_jsonl(self.path)
 
-    def route_is_retryable(self, route_id: str, satisfied_conditions: set[str]) -> bool:
+    def latest(self, route_id: str) -> dict[str, Any] | None:
         records = [item for item in self.records() if item.get("route_id") == route_id]
-        if not records:
+        return records[-1] if records else None
+
+    def route_is_retryable(self, route_id: str, satisfied_conditions: set[str]) -> bool:
+        latest = self.latest(route_id)
+        if latest is None:
             return True
-        latest = records[-1]
         condition = latest.get("retry_condition")
         if latest.get("status") not in {"FAILED", "PAUSED", "PAUSE"}:
             return True

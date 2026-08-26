@@ -30,8 +30,11 @@ amr init ./study-target --domain empirical-research
 
 项目 manifest 指向唯一持久配置 `autonomous/config.yaml`。dry-run、mock、real 前会
 展示脱敏摘要；常用编号修改或 `dotted.path=JSON值` 高级输入只生成临时 profile，绝不
-写回项目。真实运行必须准确输入 `RUN <project_id>`。每种 run 操作还会同步打开一个精确
-绑定新 run ID 的独立监视窗口。
+写回项目。若存在仍有预算的未完成 real/mock campaign，菜单会显示最近一项并提供
+`8. Continue previous`：未封存 epoch 走原地 resume，已封存 epoch 从 checkpoint
+新建下一 epoch。真实运行必须准确输入 `RUN <project_id>`，继续真实 campaign 必须输入
+`CONTINUE <campaign_id>`。每种 run 操作还会同步打开一个精确绑定恢复中或新分配 run ID
+的独立监视窗口。也可直接运行 `amr launcher continue --project PATH` 执行相同检测。
 
 `amr init` 会创建 README、AGENTS、初始化检查清单、claims、state、proofs、
 tasks、experiments、certificates、audit、sources、conversations、artifacts 和

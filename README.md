@@ -142,6 +142,10 @@ launch rescans Git-visible `autonomous/project.json` manifests.
 
 After choosing a project, the menu offers validation, strict validation,
 redacted configuration, dry-run, mock, and a separately confirmed real run.
+When the selected project has an unfinished real or mock campaign with remaining
+budget, the menu also identifies the newest one and offers `Continue previous`.
+The launcher resumes an unsealed epoch in place or creates a new epoch from a
+sealed checkpoint as required; real continuation requires an exact confirmation.
 Persistent settings belong only in the manifest-selected
 `autonomous/config.yaml`. Menu edits are validated temporary overrides and are
 removed after the command. Starting dry-run, mock, or real also opens a separate

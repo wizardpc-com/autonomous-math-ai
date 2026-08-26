@@ -183,6 +183,15 @@ def app_server_environment(
     return environment
 
 
+def runtime_python_read_roots(executable: Path | None = None) -> tuple[Path, ...]:
+    runtime = (executable or Path(sys.executable)).resolve()
+    roots = [runtime.parent]
+    virtual_environment = runtime.parent.parent
+    if (virtual_environment / "pyvenv.cfg").is_file():
+        roots.append(virtual_environment)
+    return tuple(dict.fromkeys(roots))
+
+
 def _toml_inline_string_map(values: dict[str, str]) -> str:
     return "{ " + ", ".join(
         f"{json.dumps(key)} = {json.dumps(value)}"
@@ -873,7 +882,7 @@ class AppServerClient:
                 mcp_server_names=mcp_server_names,
                 model_shell_path=str(environment.get(path_key) or ""),
                 runtime_read_roots=tuple(dict.fromkeys((
-                    Path(sys.executable).resolve().parent,
+                    *runtime_python_read_roots(),
                     Path(__file__).resolve().parent,
                     *self.read_roots,
                 ))),

@@ -18,7 +18,9 @@ from ..catalog import rebuild_catalog
 from ..capabilities import inspect_generated_schema
 from ..config import CONFIG_SCHEMA_VERSION, default_max_audit, load_config
 from ..controller import (
-    AutonomousController, build_mock_full_cycle_backend,
+    NEXT_EPOCH_FRONTIER_READY_REASON,
+    AutonomousController,
+    build_mock_full_cycle_backend,
 )
 from ..eventing import CandidateInbox
 from ..experiment import ExperimentManifest, ExperimentRunner
@@ -223,7 +225,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launcher.add_argument(
         "action", nargs="?",
-        choices=("validate", "strict", "config", "dry-run", "mock", "real"),
+        choices=(
+            "validate", "strict", "config", "dry-run", "mock", "real", "continue",
+        ),
     )
     launcher.add_argument("--workspace-root", type=Path)
     launcher.add_argument("--project", type=Path)
@@ -257,6 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     campaign_continue.add_argument("--project", type=Path, required=True)
     campaign_continue.add_argument("--campaign", required=True)
+    campaign_continue.add_argument("--run-id", help=argparse.SUPPRESS)
     campaign_continue.add_argument("--workspace-root", type=Path)
     campaign_continue.add_argument("--profile", type=Path)
     campaign_continue.add_argument("--mock", action="store_true")
@@ -663,7 +668,9 @@ def _auto_epoch_allowed(result, checkpoint) -> bool:
         and result.artifacts_finalized
         and result.run_mode not in {"dry-run"}
         and result.campaign_status == "PAUSED"
-        and result.stopped_reason == "epoch time limit reached"
+        and result.stopped_reason in {
+            "epoch time limit reached", NEXT_EPOCH_FRONTIER_READY_REASON,
+        }
         and checkpoint.remaining_seconds > 0
     )
 
@@ -763,7 +770,7 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         max_audit=None, max_mechanical_subworkers=None, budget=None, config=None,
         profile=args.profile, dry_run=args.dry_run, mock=args.mock, resume=None,
         auto_epochs=args.auto_epochs,
-        run_id=None, recover_candidates_from=None, campaign_id=args.campaign,
+        run_id=args.run_id, recover_candidates_from=None, campaign_id=args.campaign,
         previous_epoch_id=previous_epoch_id,
     )
     return await _run_command(forwarded)

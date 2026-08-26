@@ -284,11 +284,15 @@ class StandalonePackageTests(unittest.TestCase):
         ) as run_command:
             code = cli_main([
                 "campaign", "continue", "--project", str(self.project),
-                "--campaign", first["campaign_id"], "--auto-epochs",
+                "--campaign", first["campaign_id"],
+                "--run-id", "launcher-reserved-epoch", "--auto-epochs",
             ])
 
         self.assertEqual(code, 0)
         self.assertTrue(run_command.await_args.args[0].auto_epochs)
+        self.assertEqual(
+            run_command.await_args.args[0].run_id, "launcher-reserved-epoch",
+        )
 
     def test_run_uses_project_campaign_defaults_and_cli_overrides_them(self) -> None:
         self._init()

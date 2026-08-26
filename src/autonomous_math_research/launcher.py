@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterator, Sequence
 from uuid import uuid4
 
 from .config import HarnessConfig, deep_merge, load_config
+from .lifecycle.campaign import CampaignStore
 from .profiles import BUILTIN_PROFILE_NAME, PROFILE_SCHEMA_VERSION, load_user_profile
 from .project import ProjectManifest
 from .provider_config import redact_config
@@ -117,6 +118,17 @@ class LauncherProject:
     final_claim_id: str
     root: Path
     config_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class LauncherContinuation:
+    campaign_id: str
+    created_at: str
+    status: str
+    epoch_id: str
+    mode: str
+    continuation_kind: str
+    remaining_seconds: float
 
 
 def default_launcher_state_path() -> Path:
@@ -243,6 +255,74 @@ def scan_workspace(workspace_root: Path) -> tuple[list[LauncherProject], list[st
             issues.append(f"duplicate project_id {project_id!r}: {matches}")
         projects = [item for item in projects if item.project_id not in duplicates]
     return sorted(projects, key=lambda item: (item.project_id, str(item.root))), issues
+
+
+def find_unfinished_campaigns(
+    project: LauncherProject,
+) -> tuple[list[LauncherContinuation], list[str]]:
+    manifest = ProjectManifest.load(project.root)
+    runtime_root = manifest.resolve(manifest.runtime_root, must_exist=True)
+    campaigns_root = runtime_root / "campaigns"
+    if not campaigns_root.is_dir():
+        return [], []
+    candidates: list[LauncherContinuation] = []
+    issues: list[str] = []
+    try:
+        campaign_paths = sorted(campaigns_root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        return [], [f"{campaigns_root}: {exc}"]
+    for path in campaign_paths:
+        if not path.is_dir() or not (path / "CAMPAIGN.json").is_file():
+            continue
+        try:
+            store = CampaignStore(runtime_root, path.name)
+            checkpoint = store.load()
+            if checkpoint.project_id != project.project_id:
+                raise ValueError("campaign belongs to a different project")
+            if (
+                checkpoint.status not in {"ACTIVE", "PAUSED"}
+                or checkpoint.remaining_seconds <= 0
+            ):
+                continue
+            unsealed_epoch = store.unsealed_epoch()
+            if unsealed_epoch is not None:
+                epoch_id = unsealed_epoch
+                continuation_kind = "resume"
+            else:
+                epoch_id = store.latest_continuable_epoch()
+                if epoch_id is None:
+                    continue
+                continuation_kind = "continue"
+            start_record = next(
+                (
+                    record for record in reversed(store.events())
+                    if record.get("kind") == "EPOCH_STARTED"
+                    and record.get("epoch_id") == epoch_id
+                ),
+                None,
+            )
+            mode = str((start_record or {}).get("mode") or "")
+            if mode == "dry-run":
+                continue
+            if mode not in {"real", "mock"}:
+                raise ValueError(f"campaign epoch execution mode is invalid: {epoch_id}")
+            if not checkpoint.created_at:
+                raise ValueError("campaign created_at is empty")
+            candidates.append(LauncherContinuation(
+                campaign_id=checkpoint.campaign_id,
+                created_at=checkpoint.created_at,
+                status=checkpoint.status,
+                epoch_id=epoch_id,
+                mode=mode,
+                continuation_kind=continuation_kind,
+                remaining_seconds=checkpoint.remaining_seconds,
+            ))
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            issues.append(f"{path}: {exc}")
+    candidates.sort(
+        key=lambda item: (item.created_at, item.campaign_id), reverse=True,
+    )
+    return candidates, issues
 
 
 def _dotted_value(raw: dict[str, Any], dotted_path: str) -> Any:
@@ -379,6 +459,60 @@ def _run_amr(arguments: Sequence[str]) -> int:
 
 def _new_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+
+
+def _format_continuation(continuation: LauncherContinuation) -> str:
+    operation = (
+        "恢复未封存 epoch"
+        if continuation.continuation_kind == "resume"
+        else "从最近封存 checkpoint 创建下一 epoch"
+    )
+    return (
+        f"  campaign: {continuation.campaign_id}\n"
+        f"  状态: {continuation.status}  模式: {continuation.mode}\n"
+        f"  最近 epoch: {continuation.epoch_id}\n"
+        f"  恢复方式: {operation}\n"
+        f"  剩余 campaign 预算: {continuation.remaining_seconds / 3600.0:.2f}h"
+    )
+
+
+def _continue_previous_campaign(
+    project: LauncherProject,
+    continuation: LauncherContinuation,
+    profile_path: Path | None,
+    input_fn: Callable[[str], str],
+    output: Callable[[str], None],
+    command_runner: Callable[[Sequence[str]], int],
+) -> int:
+    if continuation.mode == "real":
+        confirmation = input_fn(
+            f"输入 CONTINUE {continuation.campaign_id} 继续真实 campaign: "
+        ).strip()
+        if confirmation != f"CONTINUE {continuation.campaign_id}":
+            output("已取消继续上一轮。")
+            return 0
+    if continuation.continuation_kind == "resume":
+        run_id = continuation.epoch_id
+        arguments = [
+            "run", "--project", str(project.root),
+            "--resume", continuation.epoch_id,
+            "--auto-epochs",
+        ]
+    else:
+        run_id = _new_run_id()
+        arguments = [
+            "campaign", "continue", "--project", str(project.root),
+            "--campaign", continuation.campaign_id,
+            "--run-id", run_id,
+            "--auto-epochs",
+        ]
+        if profile_path is not None:
+            arguments.extend(["--profile", str(profile_path)])
+    if continuation.mode == "mock":
+        arguments.append("--mock")
+    if command_runner is _run_amr:
+        _open_monitor_window(project.root, run_id, output)
+    return command_runner(arguments)
 
 
 def _monitor_command(project: Path, run_id: str) -> list[str]:
@@ -616,16 +750,44 @@ def run_launcher(
     save_launcher_state(selected_workspace, project.project_id, state_path)
 
     normalized_action = action.lower() if action else None
-    direct_actions = {"validate", "strict", "config", "dry-run", "mock", "real"}
+    direct_actions = {
+        "validate", "strict", "config", "dry-run", "mock", "real", "continue",
+    }
     if normalized_action is not None and normalized_action not in direct_actions:
         raise ValueError(f"unsupported launcher action: {action}")
+    if normalized_action == "continue":
+        continuations, issues = find_unfinished_campaigns(project)
+        for issue in issues:
+            output(f"恢复扫描警告: {issue}")
+        if not continuations:
+            output("当前项目没有可继续的未完成 campaign。")
+            return 2
+        output("\n检测到上一轮未完成 campaign，可继续：")
+        output(_format_continuation(continuations[0]))
+        if len(continuations) > 1:
+            output(f"  另有 {len(continuations) - 1} 个较早的未完成 campaign。")
+        return _continue_previous_campaign(
+            project, continuations[0], profile_path, input_fn, output, command_runner,
+        )
     while True:
         if normalized_action is None:
             output(f"\n当前项目: {project.project_id}\n  {project.root}")
-            output(
+            continuations, issues = find_unfinished_campaigns(project)
+            for issue in issues:
+                output(f"恢复扫描警告: {issue}")
+            latest_continuation = continuations[0] if continuations else None
+            if latest_continuation is not None:
+                output("\n检测到上一轮未完成 campaign，可继续：")
+                output(_format_continuation(latest_continuation))
+                if len(continuations) > 1:
+                    output(f"  另有 {len(continuations) - 1} 个较早的未完成 campaign。")
+            menu = (
                 "1.Validate  2.Strict  3.Config  4.Dry-run  5.Mock  "
-                "6.Real  7.Switch project  0.Exit"
+                "6.Real  7.Switch project"
             )
+            if latest_continuation is not None:
+                menu += "  8.Continue previous"
+            output(menu + "  0.Exit")
             selected = input_fn("选择: ").strip()
             mapping = {
                 "1": "validate", "2": "strict", "3": "config",
@@ -639,6 +801,13 @@ def run_launcher(
                     state_path=state_path, input_fn=input_fn, output=output,
                     command_runner=command_runner,
                 )
+            if selected == "8" and latest_continuation is not None:
+                result = _continue_previous_campaign(
+                    project, latest_continuation, profile_path,
+                    input_fn, output, command_runner,
+                )
+                input_fn("按 Enter 返回菜单: ")
+                continue
             selected_action = mapping.get(selected)
             if selected_action is None:
                 output("未知选择。")
