@@ -117,8 +117,8 @@ outcome, and summary generation finish.
 
 The `engine` section also controls controller-owned research continuation:
 
-- `research_max_turns.prover`, `.falsifier`, and `.explorer` (each defaulting
-  to `12`) independently bound turns in one logical research job;
+- `research_max_turns.prover` defaults to `4`; `.falsifier` and `.explorer`
+  default to `3`. Each independently bounds ordinary turns in one logical job;
 - `reasoning_health_short_tokens` (default `600`) is a diagnostic threshold;
 - `reasoning_health_repeated_token_tolerance` (default `2`) detects repeated
   counts;
@@ -126,15 +126,20 @@ The `engine` section also controls controller-owned research continuation:
 
 These settings never relax audit or canonical gates. App Server goals are not
 armed; per-thread token limits remain controller-enforced from telemetry.
-The first model-reported `BLOCKED` result always receives a controller-owned
-repair turn. Only a structurally actionable blocker repeated after repair may
-end the logical job, and that verification is scheduling-only: it has no
-mathematical, trust, or evidence effect. Reaching a turn or controller token
-boundary without verified progress creates a controller-owned, noncanonical
-checkpoint for the next epoch instead of marking the route failed or resetting
-stagnation. The checkpoint records the current canonical obligation, completed
-evidence bindings, and next obligation; the checkpoint and full continuation
-task are digest-bound and revalidated before fresh-epoch dispatch.
+The first model-reported `BLOCKED` result always receives one controller-owned
+repair turn. A second `BLOCKED` result ends the logical job as a persistent
+execution blocker, regardless of the free-text `status`; this has no
+mathematical, trust, or evidence effect. A candidate rejected before the
+Auditor queue likewise receives at most one targeted repair turn with the exact
+sanitized rejection reason.
+
+`budgets.per_thread_limit_action` accepts `observe` (record only, the compatible
+default), `stop_after_turn` (finish the current turn but forbid another), and
+`interrupt` (request immediate cancellation). A turn or token boundary creates
+a noncanonical next-epoch checkpoint only when the final turn produced a new
+persisted artifact, recorded an explicit next question, and did not end in
+`BLOCKED` or `TOOL_ERROR`. Otherwise the route is paused until new evidence or
+controller repair; no next-epoch task is copied.
 
 ## Role routes
 

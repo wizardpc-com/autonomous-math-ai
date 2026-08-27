@@ -462,8 +462,10 @@ def _validate_config(raw: dict[str, Any]) -> None:
     per_thread_limit_action = str(
         raw["budgets"].get("per_thread_limit_action", "observe")
     )
-    if per_thread_limit_action not in {"observe", "interrupt"}:
-        raise ValueError("per_thread_limit_action must be observe or interrupt")
+    if per_thread_limit_action not in {"observe", "stop_after_turn", "interrupt"}:
+        raise ValueError(
+            "per_thread_limit_action must be observe, stop_after_turn, or interrupt"
+        )
     rate = raw.get("rate_limits", {})
     reduce_at = float(rate.get("reduce_exploration_percent", 75))
     drain_at = float(rate.get("drain_percent", 90))

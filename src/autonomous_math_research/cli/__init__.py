@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from .. import __version__
 from ..app_server import AppServerClient
 from ..catalog import rebuild_catalog
 from ..capabilities import inspect_generated_schema
@@ -120,6 +121,7 @@ class ResumeContext:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="amr")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create a neutral standalone research project")

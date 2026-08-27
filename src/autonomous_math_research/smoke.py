@@ -890,7 +890,10 @@ async def run_real_smoke(
             elif audit_result.verdict == "REJECT":
                 store.append("CANDIDATE_REJECTED", {
                     "claim_id": event.claim_id, "fingerprint": event.fingerprint,
+                    "candidate_fingerprint": event.fingerprint,
+                    "producer_task_id": event.producer_task_id,
                     "reason": "; ".join(audit_result.gaps) or audit_result.verdict,
+                    "auditor_queue_entered": True,
                     "scope": "SMOKE_ONLY",
                 })
             else:

@@ -331,9 +331,12 @@ class DomainSemantics:
             raise ValueError(f"unsupported event type for {self.domain}: {event_type}")
         return event_type
 
-    def transition_for(self, event_type: str, verified_evidence_level: str) -> dict[str, Any]:
+    def event_transition(self, event_type: str) -> dict[str, Any]:
         self.validate_event_type(event_type)
-        transition = self.event_transitions[event_type]
+        return dict(self.event_transitions[event_type])
+
+    def transition_for(self, event_type: str, verified_evidence_level: str) -> dict[str, Any]:
+        transition = self.event_transition(event_type)
         if (
             not isinstance(verified_evidence_level, str)
             or verified_evidence_level not in _EVIDENCE_RANK
@@ -344,7 +347,7 @@ class DomainSemantics:
             raise ValueError(
                 f"{event_type} requires at least {minimum} evidence for {self.domain}"
             )
-        return dict(transition)
+        return transition
 
     def is_frontier(self, status: str) -> bool:
         self.validate_status(status)

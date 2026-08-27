@@ -947,6 +947,8 @@ class AutonomousController:
         self._director_incremental = False
         self._bound_jobs: dict[str, tuple[str, str]] = {}
         self._blocker_repair_jobs: set[str] = set()
+        self._candidate_repair_jobs: set[str] = set()
+        self._candidate_dispositions: dict[str, dict[str, Any]] = {}
         self.scheduler_stop_reason: str | None = None
         self._isolated_director_failure_reason: str | None = None
         self._provider_transport_lost: dict[str, Any] | None = None
@@ -3075,9 +3077,20 @@ class AutonomousController:
             thread_id = str(params.get("threadId") or "")
             identity = self._live_identity(thread_id)
             job_id = str(identity.get("job_id") or "")
+            receivers = params.get("receiverThreadIds")
+            actual_child_thread_activity = bool(
+                params.get("targetThreadExists")
+                or params.get("agentThreadId")
+                or (isinstance(receivers, list) and receivers)
+                or params.get("itemType") == "subAgentActivity"
+            )
             reason = (
-                "top-level role attempted direct or recursive delegation outside the "
-                "controller mechanical broker"
+                "actual child thread activity detected outside the controller mechanical broker"
+                if actual_child_thread_activity
+                else (
+                    "forbidden collaboration tool call was blocked outside the controller "
+                    "mechanical broker; no child thread was created"
+                )
             )
             self._internal_failure = True
             self.stop_for_review = reason
@@ -3091,7 +3104,13 @@ class AutonomousController:
                 "tool": params.get("tool"),
                 "agent_thread_id": params.get("agentThreadId"),
                 "receiver_thread_ids": params.get("receiverThreadIds"),
-                "action": "interrupt parent turn and fail closed",
+                "target_thread_exists": actual_child_thread_activity,
+                "diagnostic": params.get("diagnostic") or reason,
+                "action": (
+                    "interrupt parent turn and fail closed after child activity"
+                    if actual_child_thread_activity
+                    else "interrupt parent turn and fail closed; no child thread created"
+                ),
             })
             if job_id:
                 self._schedule_backend_cancel(job_id, reason)
@@ -3137,9 +3156,27 @@ class AutonomousController:
                 thread_id = str(params.get("threadId") or "")
                 identity = self._live_identity(thread_id)
                 job_id = str(identity.get("job_id") or "")
+                receivers = item.get("receiverThreadIds")
+                receiver_thread_ids = (
+                    [
+                        str(value) for value in receivers
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    if isinstance(receivers, list) else []
+                )
+                agent_thread_id = str(item.get("agentThreadId") or "").strip()
+                actual_child_thread_activity = bool(
+                    item_type == "subAgentActivity"
+                    or agent_thread_id
+                    or receiver_thread_ids
+                )
                 reason = (
-                    "top-level role attempted direct or recursive delegation outside the "
-                    "controller mechanical broker"
+                    "actual child thread activity detected outside the controller mechanical broker"
+                    if actual_child_thread_activity
+                    else (
+                        "forbidden collaboration tool call was blocked outside the controller "
+                        "mechanical broker; no child thread was created"
+                    )
                 )
                 self._internal_failure = True
                 self.stop_for_review = reason
@@ -3149,8 +3186,16 @@ class AutonomousController:
                     "thread_id": thread_id or None,
                     "turn_id": params.get("turnId"),
                     "item_type": item_type,
+                    "tool": item.get("tool"),
+                    "agent_thread_id": agent_thread_id or None,
+                    "receiver_thread_ids": receiver_thread_ids,
+                    "target_thread_exists": actual_child_thread_activity,
                     "command": command[:500] if command else None,
-                    "action": "interrupt parent turn and fail closed",
+                    "action": (
+                        "interrupt parent turn and fail closed after child activity"
+                        if actual_child_thread_activity
+                        else "interrupt parent turn and fail closed; no child thread created"
+                    ),
                 })
                 if job_id:
                     self._schedule_backend_cancel(job_id, reason)
@@ -3423,12 +3468,15 @@ class AutonomousController:
                 "source_run_id": source_run_id,
                 "event_id": event.event_id,
                 "candidate_fingerprint": event.fingerprint,
+                "producer_task_id": event.producer_task_id,
                 "claim_id": event.claim_id,
                 "parent_claim_id": event.parent_claim_id,
                 "action": "registered as an untrusted candidate for a fresh audit",
             })
             self.store.append("CANDIDATE_PROCESSED", {
                 "event_id": event.event_id, "fingerprint": event.fingerprint,
+                "candidate_fingerprint": event.fingerprint,
+                "producer_task_id": event.producer_task_id,
                 "claim_id": event.claim_id, "parent_claim_id": event.parent_claim_id,
                 "impact": event.impact,
                 "proposed_evidence_level": event.proposed_evidence_level,
@@ -3439,6 +3487,7 @@ class AutonomousController:
                     item["receipt_fingerprint"] for item in verified_receipts
                 ],
             })
+            self._record_candidate_disposition(event, status="ACCEPTED")
             self.satisfied_route_conditions.update({
                 event.fingerprint, f"new_evidence:{event.claim_id}",
             })
@@ -3464,9 +3513,10 @@ class AutonomousController:
         return self.config.role_token_limit(role)
 
     def _server_thread_budget(self, role: str) -> int | None:
-        # In observe mode the number is telemetry guidance only. Do not send it
-        # as a server-side goal that could make the turn end early.
-        if self.config.per_thread_limit_action != "interrupt":
+        # Observe remains compatibility-only telemetry. stop_after_turn and
+        # interrupt both give the App Server backend the deterministic bound;
+        # only interrupt requests cancellation while a turn is still running.
+        if self.config.per_thread_limit_action == "observe":
             return None
         return self._thread_budget(role)
 
@@ -3508,6 +3558,57 @@ class AutonomousController:
             if candidate.producer_task_id == task_id:
                 return True
         return False
+
+    def _record_candidate_disposition(
+        self,
+        event: CandidateEvent,
+        *,
+        status: str,
+        reason: str | None = None,
+        auditor_queue_entered: bool | None = None,
+    ) -> dict[str, Any]:
+        disposition = {
+            "producer_task_id": event.producer_task_id,
+            "event_id": event.event_id,
+            "candidate_fingerprint": event.fingerprint,
+            "claim_id": event.claim_id,
+            "status": status,
+            "reason": reason,
+            "auditor_queue_entered": (
+                status == "ACCEPTED"
+                if auditor_queue_entered is None else auditor_queue_entered
+            ),
+        }
+        self._candidate_dispositions[event.producer_task_id] = disposition
+        return disposition
+
+    def _latest_candidate_disposition(self, task_id: str) -> dict[str, Any] | None:
+        cached = self._candidate_dispositions.get(task_id)
+        if cached is not None:
+            return dict(cached)
+        for item in reversed(self.store.replay()):
+            if item.get("kind") not in {"CANDIDATE_PROCESSED", "CANDIDATE_REJECTED"}:
+                continue
+            payload = item.get("payload") or {}
+            if str(payload.get("producer_task_id") or "") != task_id:
+                continue
+            status = "ACCEPTED" if item["kind"] == "CANDIDATE_PROCESSED" else "REJECTED"
+            disposition = {
+                "producer_task_id": task_id,
+                "event_id": payload.get("event_id"),
+                "candidate_fingerprint": (
+                    payload.get("candidate_fingerprint") or payload.get("fingerprint")
+                ),
+                "claim_id": payload.get("claim_id"),
+                "status": status,
+                "reason": payload.get("reason"),
+                "auditor_queue_entered": bool(
+                    payload.get("auditor_queue_entered", status == "ACCEPTED")
+                ),
+            }
+            self._candidate_dispositions[task_id] = disposition
+            return dict(disposition)
+        return None
 
     def _max_effort_supported(self, role: str) -> bool:
         provider = self.config.provider_for(role)
@@ -3569,15 +3670,8 @@ class AutonomousController:
         )
         blocker_reported = str(outcome.result.get("result_type") or "") == "BLOCKED"
         blocker_repair_attempted = job_id in self._blocker_repair_jobs
-        blocker_verified = bool(
-            blocker_repair_attempted
-            and blocker_reported
-            and str(outcome.result.get("status") or "").strip().upper() == "BLOCKED"
-            and len(str(outcome.result.get("main_finding") or "").strip()) >= 16
-            and len(
-                str(outcome.result.get("next_suggested_question") or "").strip()
-            ) >= 8
-        )
+        candidate_disposition = self._latest_candidate_disposition(task.task_id)
+        candidate_repair_attempted = job_id in self._candidate_repair_jobs
         directive = self.research_turn_policy.decide(
             result=outcome.result,
             role=task.role,
@@ -3587,10 +3681,13 @@ class AutonomousController:
             health_signal=health,
             budget_stop_reason=outcome.continuation_budget_stop_reason,
             blocker_repair_attempted=blocker_repair_attempted,
-            blocker_verified=blocker_verified,
+            candidate_disposition=candidate_disposition,
+            candidate_repair_attempted=candidate_repair_attempted,
         )
         if blocker_reported and directive.continue_same_thread:
             self._blocker_repair_jobs.add(job_id)
+        if directive.reason == "controller-required candidate rejection repair turn":
+            self._candidate_repair_jobs.add(job_id)
         self.store.append("RESEARCH_TURN_COMPLETED", {
             "job_id": job_id,
             "task_id": task.task_id,
@@ -3605,7 +3702,10 @@ class AutonomousController:
             "canonical_progress": canonical_progress,
             "blocker_reported": blocker_reported,
             "blocker_repair_attempted": blocker_repair_attempted,
-            "blocker_controller_verified": blocker_verified,
+            "persistent_execution_blocker": bool(
+                blocker_reported and blocker_repair_attempted
+            ),
+            "blocker_controller_verified": False,
             "blocker_verification_scope": (
                 "execution scheduling only; no mathematical or trust effect"
                 if self.domain_semantics.domain == "math-research"
@@ -3617,6 +3717,8 @@ class AutonomousController:
             ),
             "controller_reason": directive.reason,
             "next_effort": directive.effort_override,
+            "candidate_disposition": candidate_disposition,
+            "candidate_repair_attempted": candidate_repair_attempted,
             "token_usage": outcome.token_usage.to_dict(),
             "token_telemetry": outcome.token_telemetry,
         })
@@ -6603,7 +6705,7 @@ class AutonomousController:
             self.research_turn_policy.max_turns_for(task.role)
             if same_thread_research else 1
         )
-        logical_timeout = timeout * max_turns
+        logical_timeout = timeout * (max_turns + (1 if same_thread_research else 0))
         canonical_before = self._canonical_progress_marker(task.target_claim)
         broker_client_sha256: str | None = None
         broker_config_sha256: str | None = None
@@ -6692,6 +6794,8 @@ class AutonomousController:
             "timeout": logical_timeout, "per_turn_timeout": timeout,
             "same_thread_multi_turn": same_thread_research,
             "max_turns": max_turns,
+            "per_thread_token_budget": self._thread_budget(task.role),
+            "per_thread_limit_action": self.config.per_thread_limit_action,
             "start_time": started_at, "workspace_metadata": workspace_metadata,
             "estimated_token_reservation": estimated_tokens,
             "model": selected_model, "reasoning_effort": selected_effort,
@@ -7672,7 +7776,7 @@ class AutonomousController:
             if event.semantic_bridge_ids:
                 raise ValueError("legacy candidates cannot claim semantic bridge verification")
             return
-        transition_status = self.domain_semantics.event_transitions[event.type].get(
+        transition_status = self.domain_semantics.event_transition(event.type).get(
             "status"
         )
         required_now = transition_status in self.domain_semantics.terminal_positive
@@ -7695,8 +7799,7 @@ class AutonomousController:
 
     def _validate_candidate_evidence(self, event: CandidateEvent) -> None:
         level = event.proposed_evidence_level
-        self.domain_semantics.validate_event_type(event.type)
-        transition = self.domain_semantics.event_transitions[event.type]
+        transition = self.domain_semantics.event_transition(event.type)
         minimum = str(transition["min_evidence"])
         independently_upgradable = (
             level == EvidenceLevel.E2_EXACT_TESTED
@@ -7929,10 +8032,17 @@ class AutonomousController:
                 self.candidate_artifact_hashes.pop(event.fingerprint, None)
                 self.candidate_semantic_evidence_hashes.pop(event.fingerprint, None)
                 self.domain_evidence_receipts.pop(event.fingerprint, None)
+                reason = _sanitize_live_text(exc)
                 self.store.append("CANDIDATE_REJECTED", {
                     "event_id": event.event_id, "fingerprint": event.fingerprint,
-                    "claim_id": event.claim_id, "reason": _sanitize_live_text(exc),
+                    "candidate_fingerprint": event.fingerprint,
+                    "producer_task_id": event.producer_task_id,
+                    "claim_id": event.claim_id, "reason": reason,
+                    "auditor_queue_entered": False,
                 })
+                self._record_candidate_disposition(
+                    event, status="REJECTED", reason=reason,
+                )
                 self.inbox.mark_processed(event, self.run_id)
                 continue
             self.inbox.persist(event)
@@ -7949,6 +8059,8 @@ class AutonomousController:
             )
             self.store.append("CANDIDATE_PROCESSED", {
                 "event_id": event.event_id, "fingerprint": event.fingerprint,
+                "candidate_fingerprint": event.fingerprint,
+                "producer_task_id": event.producer_task_id,
                 "claim_id": event.claim_id, "parent_claim_id": event.parent_claim_id,
                 "impact": event.impact,
                 "proposed_evidence_level": event.proposed_evidence_level,
@@ -7958,6 +8070,7 @@ class AutonomousController:
                     item["receipt_fingerprint"] for item in verified_receipts
                 ],
             })
+            self._record_candidate_disposition(event, status="ACCEPTED")
             self._request_director(
                 f"candidate {event.fingerprint} entered the audit frontier",
                 meaningful_change=True,
@@ -8499,6 +8612,10 @@ class AutonomousController:
                 ).to_dict(),
                 "required_file_access": required_file_access,
                 "candidate_protocol": {
+                    "domain": self.domain_semantics.domain,
+                    "allowed_event_types": sorted(
+                        self.domain_semantics.event_transitions
+                    ),
                     "assigned_claim_id": task.target_claim,
                     "semantic_binding": (
                         {
@@ -8732,6 +8849,7 @@ class AutonomousController:
             else:
                 self._accept_research_result(outcome, active.task, record)
             self._blocker_repair_jobs.discard(job_id)
+            self._candidate_repair_jobs.discard(job_id)
 
     async def _collect_terminal_envelopes_before_shutdown(self) -> None:
         """Persist futures that won the race with controller shutdown.
@@ -9678,13 +9796,23 @@ class AutonomousController:
         })
         event = state.event
         if trust == TrustStatus.REJECTED:
+            reason = _sanitize_live_text("; ".join(result.gaps) or result.verdict)
             self.store.append("CANDIDATE_REJECTED", {
                 "event_id": event.event_id, "fingerprint": fingerprint,
-                "claim_id": event.claim_id, "reason": "; ".join(result.gaps) or result.verdict,
+                "candidate_fingerprint": fingerprint,
+                "producer_task_id": event.producer_task_id,
+                "claim_id": event.claim_id, "reason": reason,
+                "auditor_queue_entered": True,
             })
+            self._record_candidate_disposition(
+                event, status="REJECTED", reason=reason,
+                auditor_queue_entered=True,
+            )
             self._record_recent_change({
                 "kind": "CANDIDATE_REJECTED", "claim_id": event.claim_id,
                 "fingerprint": fingerprint,
+                "producer_task_id": event.producer_task_id,
+                "reason": reason,
             })
             self._request_director(
                 "candidate audit rejected the candidate",
@@ -9949,7 +10077,7 @@ class AutonomousController:
         }
         if not trusted:
             return None
-        transition = self.domain_semantics.event_transitions[event.type]
+        transition = self.domain_semantics.event_transition(event.type)
         next_status = transition["status"]
         if next_status is None:
             return None
@@ -10009,6 +10137,62 @@ class AutonomousController:
             relative = path.relative_to(self.run_dir.resolve()).as_posix()
             artifact_refs[f"epoch://{self.epoch_id}/{relative}"] = observed
         return artifact_refs
+
+    def _continuation_checkpoint_eligibility(
+        self,
+        outcome: JobOutcome,
+        job_record: dict[str, Any] | None,
+    ) -> tuple[bool, str]:
+        result_type = str(outcome.result.get("result_type") or "NO_PROGRESS")
+        if result_type in {"BLOCKED", "TOOL_ERROR"}:
+            return False, f"last result was {result_type}"
+        if not self._research_checkpoint_artifacts(job_record):
+            return False, "no new persisted artifact was produced"
+        if not str(outcome.result.get("next_suggested_question") or "").strip():
+            return False, "no explicit next research question was recorded"
+        return True, "new persisted artifact and explicit next question"
+
+    def _pause_research_without_continuation(
+        self,
+        outcome: JobOutcome,
+        task: ResearchTask,
+        *,
+        reason: str,
+        director_reason: str,
+    ) -> None:
+        retry_condition = f"new_evidence:{task.target_claim}"
+        self.route_ledger.append(
+            route_id=task.route_family,
+            representation_id=task.representation_id,
+            method_tags=[task.role, "controller-paused"],
+            status="PAUSED",
+            failure_class=None,
+            retry_condition=retry_condition,
+            evidence_refs=list(outcome.artifact_paths),
+            source=f"job:{outcome.job_id}",
+        )
+        self.store.append("RESEARCH_CONTINUATION_PAUSED", {
+            "job_id": outcome.job_id,
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "role": task.role,
+            "result_type": outcome.result.get("result_type"),
+            "logical_stop_reason": outcome.logical_stop_reason,
+            "reason": reason,
+            "retry_condition": retry_condition,
+            "checkpoint_created": False,
+            "next_epoch_task_created": False,
+            "trust_effect": "none",
+            "action": "pause route until new evidence or controller repair",
+        })
+        self._record_recent_change({
+            "kind": "RESEARCH_CONTINUATION_PAUSED",
+            "task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "reason": reason,
+        })
+        self._request_director(director_reason, meaningful_change=False)
+        self._replan_after_wave = True
 
     def _checkpoint_research_continuation(
         self,
@@ -10271,17 +10455,45 @@ class AutonomousController:
             not meaningful
             and outcome.logical_stop_reason in CONTINUATION_CHECKPOINT_REASONS
         ):
-            self._checkpoint_research_continuation(outcome, task, job_record)
+            eligible, eligibility_reason = self._continuation_checkpoint_eligibility(
+                outcome, job_record,
+            )
+            if eligible:
+                self._checkpoint_research_continuation(outcome, task, job_record)
+            else:
+                self._pause_research_without_continuation(
+                    outcome,
+                    task,
+                    reason=eligibility_reason,
+                    director_reason=(
+                        "bounded research route paused without a continuation checkpoint; "
+                        "choose a repaired or independent route"
+                    ),
+                )
             self._replan_after_wave = True
             return
         if (
             not meaningful
-            and outcome.logical_stop_reason == "controller-verified execution blocker"
+            and outcome.logical_stop_reason
+            == "candidate repair did not enter the Auditor queue"
+        ):
+            self._pause_research_without_continuation(
+                outcome,
+                task,
+                reason="targeted candidate repair did not produce an acceptable candidate",
+                director_reason=(
+                    "candidate repair did not enter the Auditor queue; change research route"
+                ),
+            )
+            return
+        if (
+            not meaningful
+            and outcome.logical_stop_reason == "persistent execution blocker"
         ):
             self.route_ledger.append(
                 route_id=task.route_family,
                 representation_id=task.representation_id,
-                method_tags=[task.role, "controller-verified-blocker"],
+                method_tags=[task.role, "persistent-execution-blocker"],
                 status="PAUSED",
                 failure_class=None,
                 retry_condition=f"new_evidence:{task.target_claim}",
@@ -10297,12 +10509,15 @@ class AutonomousController:
                 "next_obligation": _bounded_value(
                     outcome.result.get("next_suggested_question")
                 ),
+                "classification": "persistent execution blocker",
+                "mathematical_status_effect": "none",
+                "trust_status_effect": "none",
                 **self._research_failure_payload(),
                 "stagnation_effect": "none",
                 "retry_condition": f"new_evidence:{task.target_claim}",
             })
             self._request_director(
-                "controller-verified execution blocker requires a different route",
+                "persistent execution blocker requires a different route",
                 meaningful_change=False,
             )
             self._replan_after_wave = True
@@ -10390,12 +10605,21 @@ class AutonomousController:
                 "role": active.task.role, "claim_id": active.task.target_claim,
                 "observed_tokens": observed, "token_budget": limit,
                 "action": action,
+                "next_turn_forbidden": action in {"stop_after_turn", "interrupt"},
+                "current_turn_cancel_requested": action == "interrupt",
             })
             if action == "observe":
                 self.live_store.append("AGENT_JOB_BUDGET_OBSERVED", {
                     "job_id": job_id, "role": active.task.role,
                     "task_id": active.task.task_id, "claim_id": active.task.target_claim,
                     "reason": reason,
+                })
+            elif action == "stop_after_turn":
+                self.live_store.append("AGENT_JOB_STOP_AFTER_TURN_REQUESTED", {
+                    "job_id": job_id, "role": active.task.role,
+                    "task_id": active.task.task_id, "claim_id": active.task.target_claim,
+                    "reason": reason,
+                    "action": "finish current turn and forbid the next turn",
                 })
             elif await self._cancel_backend_job(job_id, reason):
                 self.live_store.append("AGENT_JOB_CANCEL_REQUESTED", {

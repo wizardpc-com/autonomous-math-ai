@@ -34,7 +34,9 @@ from autonomous_math_research.mechanical import (
 from autonomous_math_research.models import (
     LifecyclePhase, ResearchTask, TokenUsage, stable_hash,
 )
-from autonomous_math_research.monitor import _MonitorDashboardState, build_status
+from autonomous_math_research.monitor import (
+    _MonitorDashboardState, build_status, format_status,
+)
 from autonomous_math_research.policy import pin_policy_manifest
 from autonomous_math_research.reporting import render_nightly_report
 from autonomous_math_research.schema import (
@@ -2112,6 +2114,38 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
         )
         self.assertEqual(violation["item_type"], "subAgentActivity")
         self.assertEqual(violation["agent_thread_id"], "child-thread")
+        self.assertTrue(violation["target_thread_exists"])
+        self.assertIn("actual child thread activity", violation["diagnostic"])
+
+        blocked_wait = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        await blocked_wait._trace_notification({
+            "method": "amr/unauthorizedDelegation",
+            "params": {
+                "threadId": "thread-wait",
+                "turnId": "turn-wait",
+                "itemId": "wait-1",
+                "itemType": "collabToolCall",
+                "tool": "wait",
+                "receiverThreadIds": [],
+                "targetThreadExists": False,
+                "diagnostic": (
+                    "forbidden collaboration tool call blocked; no child thread created"
+                ),
+            },
+        })
+        wait_violation = next(
+            item["payload"] for item in blocked_wait.store.replay()
+            if item["kind"] == "UNAUTHORIZED_DELEGATION_ATTEMPT"
+        )
+        self.assertEqual(wait_violation["tool"], "wait")
+        self.assertEqual(wait_violation["item_type"], "collabToolCall")
+        self.assertFalse(wait_violation["target_thread_exists"])
+        self.assertIn("no child thread", wait_violation["diagnostic"])
 
         second = AutonomousController(
             self.config,
@@ -2247,6 +2281,60 @@ class MechanicalControllerTests(TempProjectMixin, unittest.IsolatedAsyncioTestCa
             "MECHANICAL_BROKER_INTEGRITY_FAILURE",
             {problem["kind"] for problem in status["problems"]},
         )
+
+    def test_monitor_reports_turn_candidate_budget_and_observable_age(self) -> None:
+        controller = AutonomousController(
+            self.config,
+            backend=MockCodexBackend(),
+            mock=True,
+            mechanical_runner=SequenceMechanicalRunner([]),
+        )
+        task = parent_task("monitor-task", "falsifier")
+        controller.store.append("JOB_STARTED", {
+            "job_id": "monitor-job", "task_id": task.task_id,
+            "role": task.role, "claim_id": task.target_claim,
+            "max_turns": 3, "per_thread_token_budget": 120000,
+            "per_thread_limit_action": "stop_after_turn",
+        })
+        controller.store.append("JOB_BOUND", {
+            "job_id": "monitor-job", "thread_id": "monitor-thread",
+        })
+        controller.store.append("RESEARCH_TURN_COMPLETED", {
+            "job_id": "monitor-job", "task_id": task.task_id,
+            "claim_id": task.target_claim, "turn_index": 1,
+            "controller_directive": "CONTINUE",
+            "controller_reason": "controller-required blocker repair turn",
+        })
+        controller.store.append("CANDIDATE_REJECTED", {
+            "producer_task_id": task.task_id,
+            "candidate_fingerprint": "f" * 64,
+            "fingerprint": "f" * 64,
+            "claim_id": task.target_claim,
+            "reason": "missing exact structural field",
+            "auditor_queue_entered": False,
+        })
+        controller.store.append("THREAD_TOKEN_BUDGET_REACHED", {
+            "job_id": "monitor-job", "task_id": task.task_id,
+            "role": task.role, "claim_id": task.target_claim,
+            "observed_tokens": 120000, "token_budget": 120000,
+            "action": "stop_after_turn", "next_turn_forbidden": True,
+            "current_turn_cancel_requested": False,
+        })
+
+        status = build_status(controller.run_dir, controller.store.replay())
+        active = status["active_jobs"][0]
+        self.assertEqual(active["current_turn"], 2)
+        self.assertEqual(active["max_turns"], 3)
+        self.assertEqual(active["continuation_reason"], "controller-required blocker repair turn")
+        self.assertEqual(active["per_thread_limit_action"], "stop_after_turn")
+        self.assertTrue(active["next_turn_forbidden"])
+        self.assertEqual(active["candidate_disposition"]["status"], "REJECTED")
+        self.assertIsNotNone(status["telemetry_age_seconds"])
+        self.assertGreaterEqual(status["telemetry_age_seconds"], 0)
+        rendered = format_status(status)
+        self.assertIn("turn=2/3", rendered)
+        self.assertIn("next_turn_forbidden=True", rendered)
+        self.assertIn("observable events only", rendered)
 
     async def test_duplicate_task_job_instances_keep_broker_configs_isolated(self) -> None:
         controller = AutonomousController(

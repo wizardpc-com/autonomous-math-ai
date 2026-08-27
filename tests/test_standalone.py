@@ -50,6 +50,13 @@ class StandalonePackageTests(unittest.TestCase):
         code, payload = self._cli(["init", str(self.project)])
         self.assertEqual(code, 0, payload)
 
+    def test_global_version_option(self) -> None:
+        output = StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
+            build_parser().parse_args(["--version"])
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), "amr 0.2.14")
+
     def test_init_and_validate_arbitrary_external_project(self) -> None:
         self._init()
         code, result = self._cli(["validate", "--project", str(self.project)])

@@ -187,9 +187,9 @@ def builtin_profile(project_id: str, final_claim_id: str) -> dict[str, Any]:
             "director_max_retries": 1,
             "director_debounce_seconds": 2.0,
             "research_max_turns": {
-                "prover": 12,
-                "falsifier": 12,
-                "explorer": 12,
+                "prover": 4,
+                "falsifier": 3,
+                "explorer": 3,
             },
             "reasoning_health_short_tokens": 600,
             "reasoning_health_repeated_token_tolerance": 2,

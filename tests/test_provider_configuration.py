@@ -78,9 +78,9 @@ class ProviderConfigurationTests(unittest.TestCase):
             config.raw["policy"]["one_shot_compute_worker"]["fallback_condition"],
             "provider_execution_failure",
         )
-        self.assertEqual(config.research_max_turns("prover"), 12)
-        self.assertEqual(config.research_max_turns("falsifier"), 12)
-        self.assertEqual(config.research_max_turns("explorer"), 12)
+        self.assertEqual(config.research_max_turns("prover"), 4)
+        self.assertEqual(config.research_max_turns("falsifier"), 3)
+        self.assertEqual(config.research_max_turns("explorer"), 3)
         self.assertIn(
             "uncached_input_tokens",
             config.raw["providers"]["codex"]["capabilities"]["usage_mapping"],

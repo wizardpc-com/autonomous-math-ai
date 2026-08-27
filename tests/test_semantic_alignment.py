@@ -21,6 +21,7 @@ from autonomous_math_research.controller import (
     AutonomousController,
     build_mock_full_cycle_backend,
 )
+from autonomous_math_research.director_context import load_full_context_archive
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.models import (
     CandidateEvent,
@@ -43,7 +44,7 @@ from autonomous_math_research.semantic_alignment import (
     build_validation_authority_head,
     text_sha256,
 )
-from autonomous_math_research.storage import append_jsonl, file_digest
+from autonomous_math_research.storage import EventStore, append_jsonl, file_digest
 from autonomous_math_research.validation import validate_project
 
 
@@ -1165,6 +1166,129 @@ class SemanticAlignmentTests(unittest.TestCase):
                 "C_ROOT", trust_state=controller.semantic_trust, claim_statement=GOAL,
             ).status,
             SemanticStatus.BRIDGE_OPEN,
+        )
+
+    def test_cross_domain_candidate_is_rejected_without_controller_failure(self) -> None:
+        project = self.opted_project()
+        controller = self.persistent_controller(project)
+        cross_domain = candidate(candidate_type="CERTIFICATE")
+        target = controller._task_inbox(cross_domain.producer_task_id)
+        source = controller.inbox.submit(cross_domain, target_root=target)
+
+        asyncio.run(controller._poll_filesystem_candidates())
+        with patch.object(
+            controller, "_validate_candidate_provenance", return_value=None,
+        ):
+            asyncio.run(controller._process_candidate_queue())
+
+        rejected = [
+            item for item in controller.store.replay()
+            if item["kind"] == "CANDIDATE_REJECTED"
+            and item["payload"].get("event_id") == cross_domain.event_id
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn(
+            "unsupported event type for math-research: CERTIFICATE",
+            rejected[0]["payload"]["reason"],
+        )
+        self.assertFalse(source.exists())
+        self.assertTrue(
+            controller.inbox.processed_root.joinpath(
+                f"{cross_domain.event_id}.{cross_domain.fingerprint[:12]}.json"
+            ).is_file()
+        )
+        self.assertEqual(controller.graph.claims["C_ROOT"].math_status, MathStatus.OPEN)
+
+    def test_cross_domain_candidate_recovery_scan_fails_closed(self) -> None:
+        project = self.opted_project()
+        controller = self.persistent_controller(project)
+        source_run_id = f"recovery-source-{uuid4().hex}"
+        source_store = EventStore(
+            controller.layout.run_dir(source_run_id) / "EVENTS.jsonl",
+            source_run_id,
+        )
+        cross_domain = candidate(candidate_type="CERTIFICATE")
+        controller.inbox.submit(cross_domain)
+        controller.inbox.mark_processed(cross_domain, source_run_id)
+        source_store.append("CANDIDATE_REJECTED", {
+            "event_id": cross_domain.event_id,
+            "fingerprint": cross_domain.fingerprint,
+            "producer_task_id": cross_domain.producer_task_id,
+            "claim_id": cross_domain.claim_id,
+            "reason": "candidate statement does not match existing claim",
+        })
+        source_store.append("RUN_STOPPED", {"reason": "fixture terminal run"})
+
+        with self.assertRaisesRegex(
+            ValueError, "unsupported event type for math-research: CERTIFICATE",
+        ):
+            controller._load_recoverable_candidates(source_run_id)
+        self.assertEqual(
+            controller.graph.claims["C_ROOT"].math_status, MathStatus.OPEN,
+        )
+
+    def test_cross_domain_candidate_previous_epoch_import_fails_closed(self) -> None:
+        project = self.opted_project()
+        first = self.persistent_controller(project)
+        original_queue = first._queue_next_audit
+
+        def stop_after_first_pass(event: CandidateEvent) -> None:
+            if first.audit_gate.pass_count(event.fingerprint) == 1:
+                first.lifecycle.transition(
+                    LifecyclePhase.DRAINING_EPOCH,
+                    reason="test checkpoint before corrupted import",
+                )
+                first.scheduler_stop_reason = (
+                    "test checkpoint before corrupted import"
+                )
+                return
+            original_queue(event)
+
+        first._queue_next_audit = stop_after_first_pass
+        first_result = self.run_controller(first)
+        self.assertFalse(first_result.internal_failure, first_result.stopped_reason)
+        checkpoint_path = first.run_dir / "state" / "compact_snapshot.json"
+        compact = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        corrupted = load_full_context_archive(checkpoint_path, compact)
+        frontier = corrupted["candidate_audit_frontier"]
+        self.assertEqual(len(frontier), 1)
+        event_payload = dict(frontier[0]["event"])
+        event_payload.pop("fingerprint", None)
+        event_payload["type"] = "CERTIFICATE"
+        cross_domain = CandidateEvent.from_dict(event_payload)
+        frontier[0]["event"] = cross_domain.to_dict()
+
+        second = AutonomousController(
+            load_config(project),
+            backend=build_mock_full_cycle_backend(
+                statement=GOAL,
+                evidence_path=str(project / EVIDENCE),
+                semantic_bridge_ids=BRIDGES,
+            ),
+            mock=False,
+            run_id=f"corrupted-import-{uuid4().hex}",
+            campaign_id=first.campaign_id,
+            previous_epoch_id=first.run_id,
+            campaign_hours=first.campaign_hours,
+            epoch_hours=first.epoch_hours,
+        )
+        with patch(
+            "autonomous_math_research.controller.load_full_context_archive",
+            return_value=corrupted,
+        ):
+            second_result = self.run_controller(second)
+
+        self.assertTrue(second_result.internal_failure)
+        self.assertIn(
+            "unsupported event type for math-research: CERTIFICATE",
+            second_result.stopped_reason,
+        )
+        self.assertFalse(any(
+            item["kind"] == "EPOCH_CHECKPOINT_IMPORTED"
+            for item in second.store.replay()
+        ))
+        self.assertEqual(
+            second.graph.claims["C_ROOT"].math_status, MathStatus.OPEN,
         )
 
     def test_dynamic_subclaim_can_close_but_cannot_support_final_unreviewed(self) -> None:

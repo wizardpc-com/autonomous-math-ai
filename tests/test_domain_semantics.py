@@ -113,6 +113,16 @@ class DomainContractTests(unittest.TestCase):
         self.assertIsNone(math.final_outcome("OPEN"))
         self.assertEqual(math.required_independent_audits("HIGH", True), 0)
         self.assertEqual(math.required_independent_audits("CRITICAL", True), 2)
+        transition = math.event_transition("THEOREM_CANDIDATE")
+        self.assertEqual(transition["status"], "PROVED")
+        transition["status"] = "FAILED"
+        self.assertEqual(
+            math.event_transition("THEOREM_CANDIDATE")["status"], "PROVED",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "unsupported event type for math-research: CERTIFICATE",
+        ):
+            math.event_transition("CERTIFICATE")
 
         certified = domain_semantics_from_contract(
             builtin_domain_contract("certified-computational-research")
@@ -144,6 +154,14 @@ class DomainContractTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_audit_recovery_rejects_cross_domain_candidate(self) -> None:
+        gate = AuditGate(semantics=domain_semantics_from_contract(None))
+        with self.assertRaisesRegex(
+            ValueError, "unsupported event type for math-research: CERTIFICATE",
+        ):
+            gate.register(event("CERTIFICATE"))
+        self.assertEqual(gate.states, {})
 
     def test_insufficient_auditor_evidence_cannot_terminalize_domain_gate(self) -> None:
         cases = (

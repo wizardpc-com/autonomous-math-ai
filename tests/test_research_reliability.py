@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from autonomous_math_research.app_server import (
@@ -283,11 +283,12 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         controller._pin_run_inputs(0.01, True)
         task = research_task()
         canonical_before = controller._canonical_progress_marker(task.target_claim)
+        claim_before = controller.graph.claims[task.target_claim].to_dict()
 
         first = JobOutcome(
             job_id="job-blocker", task_id=task.task_id, role=task.role,
             claim_id=task.target_claim, status="completed",
-            result=worker_result("BLOCKED", status="BLOCKED"),
+            result=worker_result("BLOCKED", status="OPEN"),
             thread_id="thread-blocker", turn_id="turn-1",
         )
         first_directive = await controller._control_research_turn(
@@ -299,7 +300,7 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         second = JobOutcome(
             job_id="job-blocker", task_id=task.task_id, role=task.role,
             claim_id=task.target_claim, status="completed",
-            result=worker_result("BLOCKED", status="BLOCKED"),
+            result=worker_result("BLOCKED", status="OPEN"),
             thread_id="thread-blocker", turn_id="turn-2",
         )
         second_directive = await controller._control_research_turn(
@@ -308,17 +309,95 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(second_directive.continue_same_thread)
         self.assertEqual(
-            second_directive.reason, "controller-verified execution blocker",
+            second_directive.reason, "persistent execution blocker",
         )
         turn_events = [
             item["payload"] for item in controller.store.replay()
             if item["kind"] == "RESEARCH_TURN_COMPLETED"
         ]
         self.assertFalse(turn_events[0]["blocker_controller_verified"])
-        self.assertTrue(turn_events[1]["blocker_controller_verified"])
+        self.assertFalse(turn_events[1]["blocker_controller_verified"])
+        self.assertTrue(turn_events[1]["persistent_execution_blocker"])
         self.assertEqual(
             turn_events[1]["blocker_verification_scope"],
             "execution scheduling only; no mathematical or trust effect",
+        )
+        self.assertEqual(
+            controller.graph.claims[task.target_claim].to_dict(), claim_before,
+        )
+        second.logical_stop_reason = second_directive.reason
+        second.turn_history = [{"turn_index": 1}, {"turn_index": 2}]
+        controller._accept_research_result(second, task)
+        self.assertEqual(controller.deferred_research_continuations, [])
+        self.assertEqual(controller.route_ledger.records()[-1]["status"], "PAUSED")
+
+    async def test_candidate_rejection_reason_gets_exactly_one_repair_turn(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="candidate-repair", campaign_id="candidate-repair",
+        )
+        controller._pin_run_inputs(0.01, True)
+        task = research_task()
+        rejected = event("CERTIFICATE")
+        source = controller.inbox.submit(
+            rejected, target_root=controller._task_inbox(task.task_id),
+        )
+        canonical_before = controller._canonical_progress_marker(task.target_claim)
+        first = JobOutcome(
+            job_id="job-candidate", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed",
+            result=worker_result("NO_PROGRESS"),
+            thread_id="thread-candidate", turn_id="turn-1",
+        )
+        with patch.object(
+            controller, "_validate_candidate_provenance", return_value=None,
+        ):
+            directive = await controller._control_research_turn(
+                job_id=first.job_id, task=task, canonical_before=canonical_before,
+                outcome=first, turn_index=1,
+            )
+
+        self.assertTrue(directive.continue_same_thread)
+        self.assertEqual(
+            directive.reason, "controller-required candidate rejection repair turn",
+        )
+        self.assertIn("has not entered the Auditor queue", directive.next_prompt or "")
+        self.assertIn(
+            "unsupported event type for math-research: CERTIFICATE",
+            directive.next_prompt or "",
+        )
+        self.assertFalse(source.exists())
+        rejection = next(
+            item["payload"] for item in controller.store.replay()
+            if item["kind"] == "CANDIDATE_REJECTED"
+        )
+        self.assertEqual(rejection["producer_task_id"], task.task_id)
+        self.assertEqual(rejection["candidate_fingerprint"], rejected.fingerprint)
+        self.assertFalse(rejection["auditor_queue_entered"])
+
+        second = JobOutcome(
+            job_id=first.job_id, task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed",
+            result=worker_result("NO_PROGRESS"),
+            thread_id="thread-candidate", turn_id="turn-2",
+        )
+        second_directive = await controller._control_research_turn(
+            job_id=second.job_id, task=task, canonical_before=canonical_before,
+            outcome=second, turn_index=2,
+        )
+        self.assertFalse(second_directive.continue_same_thread)
+        self.assertEqual(
+            second_directive.reason,
+            "candidate repair did not enter the Auditor queue",
+        )
+        second.logical_stop_reason = second_directive.reason
+        second.turn_history = [{"turn_index": 1}, {"turn_index": 2}]
+        controller._accept_research_result(second, task)
+        self.assertEqual(controller.deferred_research_continuations, [])
+        self.assertEqual(controller.route_ledger.records()[-1]["status"], "PAUSED")
+        self.assertIn(
+            "RESEARCH_CONTINUATION_PAUSED",
+            [item["kind"] for item in controller.store.replay()],
         )
 
     async def test_health_escalation_changes_only_the_next_owned_turn(self) -> None:
@@ -371,7 +450,7 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ["xhigh", "max"],
         )
 
-    async def test_backend_enforces_budget_even_if_callback_requests_more(self) -> None:
+    async def test_stop_after_turn_budget_never_starts_the_requested_next_turn(self) -> None:
         client = SequenceAppServerClient([(worker_result("NO_PROGRESS"), 900)])
         self.backend.client = client  # type: ignore[assignment]
 
@@ -396,6 +475,60 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(client.turn_calls), 1)
         self.assertEqual(outcome.logical_stop_reason, "controller token budget reached")
+
+    async def test_per_thread_limit_actions_preserve_observe_stop_and_interrupt(self) -> None:
+        for action, sends_budget, cancel_count in (
+            ("observe", False, 0),
+            ("stop_after_turn", True, 0),
+            ("interrupt", True, 1),
+        ):
+            with self.subTest(action=action):
+                config = load_config(self.project)
+                config.raw["budgets"]["per_thread_limit_action"] = action
+                controller = AutonomousController(
+                    config, backend=MockCodexBackend(), mock=True,
+                    run_id=f"thread-budget-{action}",
+                    campaign_id=f"thread-budget-{action}",
+                )
+                limit = controller._thread_budget("prover")
+                self.assertIsNotNone(limit)
+                self.assertEqual(
+                    controller._server_thread_budget("prover"),
+                    limit if sends_budget else None,
+                )
+                future = asyncio.create_task(asyncio.sleep(60))
+                controller.active["job-budget"] = ActiveJob(
+                    logical_job_id="job-budget",
+                    task=research_task(),
+                    future=future,  # type: ignore[arg-type]
+                    started_monotonic=0.0,
+                    timeout=120.0,
+                    kind="research",
+                )
+                controller.governor.record(
+                    "job-budget", "prover", TokenUsage(total_tokens=int(limit)), None,
+                )
+                cancel = AsyncMock(return_value=True)
+                try:
+                    with patch.object(controller, "_cancel_backend_job", cancel):
+                        await controller._handle_per_thread_budget_limits()
+                finally:
+                    future.cancel()
+                    await asyncio.gather(future, return_exceptions=True)
+                self.assertEqual(cancel.await_count, cancel_count)
+                event_payload = next(
+                    item["payload"] for item in controller.store.replay()
+                    if item["kind"] == "THREAD_TOKEN_BUDGET_REACHED"
+                )
+                self.assertEqual(event_payload["action"], action)
+                self.assertEqual(
+                    event_payload["next_turn_forbidden"],
+                    action in {"stop_after_turn", "interrupt"},
+                )
+                self.assertEqual(
+                    event_payload["current_turn_cancel_requested"],
+                    action == "interrupt",
+                )
 
     async def test_shutdown_reaps_cancelled_job_before_backend_close(self) -> None:
         order: list[str] = []
@@ -751,6 +884,17 @@ class _RequestTimeoutClient(AppServerClient):
 
 
 class AppServerLaunchIsolationTests(unittest.TestCase):
+    @staticmethod
+    def _create_fake_windows_python(base: Path, version: str = "3.14.2") -> Path:
+        base.mkdir(parents=True)
+        executable = base / "python.exe"
+        executable.touch()
+        (base / "Lib").mkdir()
+        (base / "Lib" / "os.py").touch()
+        major, minor, *_ = version.split(".")
+        (base / f"python{major}{minor}.dll").touch()
+        return executable
+
     def test_launch_disables_ambient_agent_features(self) -> None:
         project = Path.cwd().resolve()
         command = app_server_command(
@@ -871,16 +1015,165 @@ class AppServerLaunchIsolationTests(unittest.TestCase):
 
     def test_runtime_python_read_roots_include_a_detected_virtual_environment(self) -> None:
         root = TEST_RUNTIME / f"venv-roots-{uuid4().hex}"
-        executable = root / "Scripts" / "python.exe"
+        virtual_environment = root / "venv"
+        base = root / "python-base"
+        executable = virtual_environment / "Scripts" / "python.exe"
         executable.parent.mkdir(parents=True)
         executable.touch()
-        (root / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+        base_executable = self._create_fake_windows_python(base)
+        (virtual_environment / "pyvenv.cfg").write_text(
+            "\n".join((
+                f"home = {base}",
+                "include-system-site-packages = false",
+                "version = 3.14.2",
+                f"executable = {base_executable}",
+            )) + "\n",
+            encoding="utf-8",
+        )
         try:
-            roots = runtime_python_read_roots(executable)
+            roots = runtime_python_read_roots(executable, platform_name="nt")
         finally:
             shutil.rmtree(root)
 
-        self.assertEqual(roots, (executable.parent.resolve(), root.resolve()))
+        self.assertEqual(roots, (
+            executable.parent.resolve(), virtual_environment.resolve(), base.resolve(),
+        ))
+
+        command = app_server_command(
+            "codex", project_root=Path.cwd(), permission_profile="amr-role-test",
+            runtime_read_roots=roots,
+        )
+        filesystem = next(
+            command[index + 1]
+            for index, item in enumerate(command[:-1])
+            if item == "-c" and command[index + 1].startswith(
+                "permissions.amr-role-test.filesystem={"
+            )
+        )
+        self.assertIn(f'{json.dumps(str(base.resolve()))} = "read"', filesystem)
+
+    def test_runtime_python_read_roots_reject_missing_base_interpreter(self) -> None:
+        root = TEST_RUNTIME / f"venv-missing-base-{uuid4().hex}"
+        executable = root / "venv" / "Scripts" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        missing = root / "missing"
+        (root / "venv" / "pyvenv.cfg").write_text(
+            f"home = {missing}\nversion = 3.14.2\n"
+            f"executable = {missing / 'python.exe'}\n",
+            encoding="utf-8",
+        )
+        try:
+            with self.assertRaisesRegex(AppServerError, "does not exist"):
+                runtime_python_read_roots(executable, platform_name="nt")
+        finally:
+            shutil.rmtree(root)
+
+    def test_runtime_python_read_roots_reject_executable_outside_home(self) -> None:
+        root = TEST_RUNTIME / f"venv-escaped-base-{uuid4().hex}"
+        executable = root / "venv" / "Scripts" / "python.exe"
+        base = root / "python-base"
+        escaped = root / "other-base"
+        executable.parent.mkdir(parents=True)
+        base.mkdir(parents=True)
+        escaped.mkdir()
+        executable.touch()
+        escaped_executable = escaped / "python.exe"
+        escaped_executable.touch()
+        (root / "venv" / "pyvenv.cfg").write_text(
+            f"home = {base}\nversion = 3.14.2\n"
+            f"executable = {escaped_executable}\n",
+            encoding="utf-8",
+        )
+        try:
+            with self.assertRaisesRegex(AppServerError, "escapes its declared home"):
+                runtime_python_read_roots(executable, platform_name="nt")
+        finally:
+            shutil.rmtree(root)
+
+    def test_runtime_python_read_roots_reject_broad_base_root(self) -> None:
+        root = TEST_RUNTIME / f"venv-broad-base-{uuid4().hex}"
+        virtual_environment = root / "venv"
+        executable = virtual_environment / "Scripts" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        base_executable = root / "python.exe"
+        base_executable.touch()
+        (virtual_environment / "pyvenv.cfg").write_text(
+            f"home = {root}\nversion = 3.14.2\n"
+            f"executable = {base_executable}\n",
+            encoding="utf-8",
+        )
+        try:
+            with patch.dict(os.environ, {"LOCALAPPDATA": str(root)}):
+                with self.assertRaisesRegex(AppServerError, "too broad"):
+                    runtime_python_read_roots(executable, platform_name="nt")
+        finally:
+            shutil.rmtree(root)
+
+    def test_runtime_python_read_roots_reject_credential_shaped_base_root(self) -> None:
+        root = TEST_RUNTIME / f"venv-sensitive-base-{uuid4().hex}"
+        virtual_environment = root / "venv"
+        base = root / "credentials" / "python-base"
+        executable = virtual_environment / "Scripts" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        base.mkdir(parents=True)
+        executable.touch()
+        base_executable = base / "python.exe"
+        base_executable.touch()
+        (virtual_environment / "pyvenv.cfg").write_text(
+            f"home = {base}\nversion = 3.14.2\n"
+            f"executable = {base_executable}\n",
+            encoding="utf-8",
+        )
+        try:
+            with self.assertRaisesRegex(AppServerError, "credential-shaped"):
+                runtime_python_read_roots(executable, platform_name="nt")
+        finally:
+            shutil.rmtree(root)
+
+    def test_runtime_python_read_roots_reject_noncanonical_base_root(self) -> None:
+        root = TEST_RUNTIME / f"venv-noncanonical-base-{uuid4().hex}"
+        virtual_environment = root / "venv"
+        base = root / "python-base"
+        executable = virtual_environment / "Scripts" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        base.mkdir(parents=True)
+        executable.touch()
+        base_executable = base / "python.exe"
+        base_executable.touch()
+        ambiguous = base / ".." / base.name
+        (virtual_environment / "pyvenv.cfg").write_text(
+            f"home = {ambiguous}\nversion = 3.14.2\n"
+            f"executable = {base_executable}\n",
+            encoding="utf-8",
+        )
+        try:
+            with self.assertRaisesRegex(AppServerError, "ambiguous"):
+                runtime_python_read_roots(executable, platform_name="nt")
+        finally:
+            shutil.rmtree(root)
+
+    def test_runtime_python_read_roots_reject_fake_narrow_python_directory(self) -> None:
+        root = TEST_RUNTIME / f"venv-fake-python-base-{uuid4().hex}"
+        virtual_environment = root / "venv"
+        base = root / "python-base"
+        executable = virtual_environment / "Scripts" / "python.exe"
+        executable.parent.mkdir(parents=True)
+        base.mkdir(parents=True)
+        executable.touch()
+        base_executable = base / "python.exe"
+        base_executable.touch()
+        (virtual_environment / "pyvenv.cfg").write_text(
+            f"home = {base}\nversion = 3.14.2\n"
+            f"executable = {base_executable}\n",
+            encoding="utf-8",
+        )
+        try:
+            with self.assertRaisesRegex(AppServerError, "installation markers"):
+                runtime_python_read_roots(executable, platform_name="nt")
+        finally:
+            shutil.rmtree(root)
 
     def test_runtime_python_read_roots_do_not_widen_a_non_venv_runtime(self) -> None:
         root = TEST_RUNTIME / f"plain-runtime-{uuid4().hex}"
@@ -1200,6 +1493,32 @@ class AppServerTurnCorrelationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     client.traced[0]["params"]["itemType"], item["type"],
                 )
+                self.assertTrue(client.traced[0]["params"]["targetThreadExists"])
+
+    async def test_wait_without_targets_is_blocked_without_claiming_child_creation(self) -> None:
+        client = _DelegationContainmentClient()
+        client._handle_notification({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "wait-1",
+                    "type": "collabToolCall",
+                    "tool": "wait",
+                    "receiverThreadIds": [],
+                },
+            },
+        })
+        await asyncio.sleep(0)
+
+        self.assertEqual(client.interrupt_calls, [("thread-1", "turn-1")])
+        params = client.traced[0]["params"]
+        self.assertEqual(params["tool"], "wait")
+        self.assertEqual(params["itemType"], "collabToolCall")
+        self.assertFalse(params["targetThreadExists"])
+        self.assertEqual(params["receiverThreadIds"], [])
+        self.assertIn("no child thread created", params["diagnostic"])
 
     async def test_mismatched_response_and_stream_ids_remain_correlated(self) -> None:
         client = _CorrelatedTurnClient(
@@ -1545,47 +1864,44 @@ class ResearchTerminationAndStagnationTests(unittest.TestCase):
         finally:
             shutil.rmtree(root)
 
-    def test_blocked_requires_one_repair_turn_and_controller_verification(self) -> None:
+    def test_blocked_open_stops_after_one_controller_repair_turn(self) -> None:
         policy = ResearchTurnPolicy(
             max_turns={"prover": 12, "falsifier": 8, "explorer": 6},
         )
         first = policy.decide(
-            result=worker_result("BLOCKED", status="BLOCKED"),
+            result=worker_result("BLOCKED", status="OPEN"),
             role="prover",
             turn_index=1,
             candidate_accepted=False,
             canonical_progress=False,
             health_signal=None,
             blocker_repair_attempted=False,
-            blocker_verified=False,
         )
         self.assertTrue(first.continue_same_thread)
         self.assertIn("repair", first.reason)
 
-        unverified = policy.decide(
-            result=worker_result("BLOCKED", status="BLOCKED"),
+        persistent = policy.decide(
+            result=worker_result("BLOCKED", status="OPEN", finding="x"),
             role="prover",
             turn_index=2,
             candidate_accepted=False,
             canonical_progress=False,
             health_signal=None,
             blocker_repair_attempted=True,
-            blocker_verified=False,
         )
-        self.assertTrue(unverified.continue_same_thread)
+        self.assertFalse(persistent.continue_same_thread)
+        self.assertEqual(persistent.reason, "persistent execution blocker")
 
-        verified = policy.decide(
-            result=worker_result("BLOCKED", status="BLOCKED"),
-            role="prover",
-            turn_index=2,
-            candidate_accepted=False,
-            canonical_progress=False,
+    def test_tool_error_is_terminal_before_ordinary_turn_limit(self) -> None:
+        policy = ResearchTurnPolicy(max_turns=3)
+        directive = policy.decide(
+            result=worker_result("TOOL_ERROR", status="OPEN"),
+            role="falsifier", turn_index=3,
+            candidate_accepted=False, canonical_progress=False,
             health_signal=None,
-            blocker_repair_attempted=True,
-            blocker_verified=True,
         )
-        self.assertFalse(verified.continue_same_thread)
-        self.assertEqual(verified.reason, "controller-verified execution blocker")
+        self.assertFalse(directive.continue_same_thread)
+        self.assertEqual(directive.reason, "explicit execution terminal: TOOL_ERROR")
 
     def test_turn_limits_are_selected_per_research_role(self) -> None:
         policy = ResearchTurnPolicy(

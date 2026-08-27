@@ -52,7 +52,8 @@ class ResearchTurnPolicy:
         health_signal: ReasoningHealthSignal | None,
         budget_stop_reason: str | None = None,
         blocker_repair_attempted: bool = False,
-        blocker_verified: bool = False,
+        candidate_disposition: dict[str, Any] | None = None,
+        candidate_repair_attempted: bool = False,
     ) -> TurnDirective:
         if canonical_progress:
             return TurnDirective.stop("controller-verified canonical progress")
@@ -61,19 +62,25 @@ class ResearchTurnPolicy:
         if budget_stop_reason:
             return TurnDirective.stop(budget_stop_reason)
         result_type = str(result.get("result_type") or "NO_PROGRESS")
-        if result_type == "BLOCKED":
-            if blocker_repair_attempted and blocker_verified:
-                return TurnDirective.stop("controller-verified execution blocker")
-            if not blocker_repair_attempted:
-                return TurnDirective.continue_with(
-                    self._continuation_prompt(result, "an unverified blocker report"),
-                    reason="controller-required blocker repair turn",
-                )
-            if turn_index >= self.max_turns_for(role):
-                return TurnDirective.stop("bounded same-thread turn limit reached")
+        if result_type == "TOOL_ERROR":
+            return TurnDirective.stop(f"explicit execution terminal: {result_type}")
+        if candidate_repair_attempted:
+            return TurnDirective.stop("candidate repair did not enter the Auditor queue")
+        if (
+            candidate_disposition
+            and candidate_disposition.get("status") == "REJECTED"
+            and not candidate_disposition.get("auditor_queue_entered")
+        ):
             return TurnDirective.continue_with(
-                self._continuation_prompt(result, "the blocker remains unverified"),
-                reason="unverified blocker requires another bounded repair turn",
+                self._candidate_repair_prompt(candidate_disposition),
+                reason="controller-required candidate rejection repair turn",
+            )
+        if result_type == "BLOCKED":
+            if blocker_repair_attempted:
+                return TurnDirective.stop("persistent execution blocker")
+            return TurnDirective.continue_with(
+                self._blocker_repair_prompt(result),
+                reason="controller-required blocker repair turn",
             )
         if turn_index >= self.max_turns_for(role):
             return TurnDirective.stop("bounded same-thread turn limit reached")
@@ -83,8 +90,6 @@ class ResearchTurnPolicy:
                 reason=f"reasoning health diagnostic: {health_signal.diagnostic}",
                 effort_override=health_signal.recommended_effort,
             )
-        if result_type == "TOOL_ERROR":
-            return TurnDirective.stop(f"explicit execution terminal: {result_type}")
         # A model's claimed result is not controller-verified
         # progress and cannot terminate the job without a validated candidate.
         return TurnDirective.continue_with(
@@ -113,4 +118,31 @@ class ResearchTurnPolicy:
         return (
             instruction
             + (f"Next recorded question: {next_question}" if next_question else "")
+        )
+
+    def _blocker_repair_prompt(self, result: dict[str, Any]) -> str:
+        next_question = str(result.get("next_suggested_question") or "").strip()
+        return (
+            "This is the single controller-owned repair turn for the same logical task. "
+            "The previous result_type=BLOCKED report did not end the mathematical claim or "
+            "change trusted state. Provide a concrete executable alternative that stays within "
+            "the supplied tools and files, or return result_type=BLOCKED again to confirm a "
+            "persistent execution blocker. Do not wait for a subagent or use collaboration tools. "
+            + (f"Next recorded question: {next_question}" if next_question else "")
+        )
+
+    @staticmethod
+    def _candidate_repair_prompt(disposition: dict[str, Any]) -> str:
+        fingerprint = str(
+            disposition.get("candidate_fingerprint")
+            or disposition.get("fingerprint")
+            or "unknown"
+        )
+        reason = str(disposition.get("reason") or "candidate structure was rejected").strip()
+        return (
+            "This is the single controller-owned candidate repair turn for the same logical "
+            f"task. Candidate {fingerprint} has not entered the Auditor queue. Exact rejection "
+            f"reason: {reason} Correct that structural error and submit a new candidate through "
+            "the installed helper. If no acceptable candidate can be submitted in this turn, "
+            "finish with the precise remaining gap; do not wait for an audit that does not exist."
         )

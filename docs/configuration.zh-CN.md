@@ -102,19 +102,23 @@ epoch 时，`amr campaign continue` 会返回准确的 resume 命令。
 索引、OUTCOME 和 run summary 已完整提交。监视器会在这一阶段显示成果归档进度，不会
 提前报告 run 已结束。
 
-`engine` 还声明同线程研究 continuation：`research_max_turns.prover`、
-`.falsifier`、`.explorer` 分别配置，内置默认均为 12；
+`engine` 还声明同线程研究 continuation：`research_max_turns.prover` 默认 4，
+`.falsifier`、`.explorer` 默认 3；
 `reasoning_health_short_tokens` 默认 600；
 `reasoning_health_repeated_token_tolerance` 默认 2；
 `reasoning_health_retry_limit` 默认 2。它们只控制诊断、有限重试和 provider 明确支持时的
 `xhigh -> max` 升级，不能改变数学状态、trust、evidence 或 audit 结论。harness 不设置
 App Server active goal；per-thread token 限额继续由 controller 根据 telemetry 执行。
-模型首次返回 `BLOCKED` 时必须先进行一次 controller 管理的同线程修复 turn。只有修复后
-再次给出结构完整、可供调度的 blocker，才允许结束逻辑任务；这一验证只影响执行调度，
-不改变数学、trust 或 evidence 状态。达到 turn 或 controller token 边界但没有验证进展时，
-harness 会生成仅供研究续接的非 canonical 检查点，记录当前 obligation、已绑定证据和下一
-obligation，并延后到下一 epoch；不会把路线记为失败，也不会重置 stagnation。下一 epoch
-调度前会重新校验检查点摘要和完整 continuation 任务包。
+模型首次返回 `BLOCKED` 时只允许一次 controller 管理的同线程修复 turn；第二次
+`BLOCKED` 直接作为持续执行阻塞结束逻辑任务，不读取自由文本 `status`，也不改变数学、
+trust 或 evidence 状态。候选在进入 Auditor 队列前被拒绝时，同样只允许一次携带精确清理后
+拒绝原因的定向修复 turn。
+
+`budgets.per_thread_limit_action` 支持 `observe`（仅记录，兼容默认值）、
+`stop_after_turn`（让当前 turn 完整结束但禁止下一 turn）和 `interrupt`（立即请求取消）。
+达到 turn 或 token 边界时，只有最后一轮新增了持久化 artifact、明确记录下一问题，且结果
+不是 `BLOCKED`/`TOOL_ERROR`，才创建非 canonical 的下一 epoch 检查点；否则路线进入
+`PAUSED`，等待新证据或 controller 修复，不复制下一 epoch 任务。
 
 新项目主角色默认额度为 5 亿 token；机械子工独立额度为 15 亿。机械席位上限默认
 `null`，只表示没有静态数量上限，broker 仍受预算、系统资源、rate limit、队列、

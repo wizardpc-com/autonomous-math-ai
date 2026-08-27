@@ -90,6 +90,10 @@ def build_status(
     completed_telemetry_by_job: dict[str, str] = {}
     mechanical_usage: list[dict[str, Any]] = []
     mechanical_telemetry: list[str] = []
+    research_turn_by_job: dict[str, dict[str, Any]] = {}
+    thread_budget_by_job: dict[str, dict[str, Any]] = {}
+    candidate_disposition_by_task: dict[str, dict[str, Any]] = {}
+    latest_candidate_disposition: dict[str, Any] | None = None
     stop_reason: str | None = None
     execution_mode: str | None = None
     run_outcome: str | None = None
@@ -138,6 +142,33 @@ def build_status(
             )
         elif kind == "JOB_BOUND" and payload.get("thread_id") and payload.get("job_id"):
             thread_to_job[str(payload["thread_id"])] = str(payload["job_id"])
+        elif kind == "RESEARCH_TURN_COMPLETED" and payload.get("job_id"):
+            research_turn_by_job[str(payload["job_id"])] = {
+                **dict(payload),
+                "completed_at": event.get("timestamp"),
+            }
+        elif kind == "THREAD_TOKEN_BUDGET_REACHED" and payload.get("job_id"):
+            thread_budget_by_job[str(payload["job_id"])] = {
+                **dict(payload),
+                "reached_at": event.get("timestamp"),
+            }
+        elif kind in {"CANDIDATE_PROCESSED", "CANDIDATE_REJECTED"}:
+            producer_task_id = str(payload.get("producer_task_id") or "")
+            disposition = {
+                "status": "ACCEPTED" if kind == "CANDIDATE_PROCESSED" else "REJECTED",
+                "producer_task_id": producer_task_id or None,
+                "candidate_fingerprint": (
+                    payload.get("candidate_fingerprint") or payload.get("fingerprint")
+                ),
+                "reason": payload.get("reason"),
+                "auditor_queue_entered": bool(
+                    payload.get("auditor_queue_entered", kind == "CANDIDATE_PROCESSED")
+                ),
+                "timestamp": event.get("timestamp"),
+            }
+            latest_candidate_disposition = disposition
+            if producer_task_id:
+                candidate_disposition_by_task[producer_task_id] = disposition
         elif kind in {"MECHANICAL_SUBTASK_COMPLETED", "MECHANICAL_SUBTASK_FAILED"}:
             if not payload.get("cache_reused"):
                 mechanical_usage.append(dict(payload.get("token_usage") or {}))
@@ -209,14 +240,38 @@ def build_status(
     for job_id, payload in started.items():
         if job_id in terminal:
             continue
+        thread_id = next(
+            (thread for thread, bound_job in thread_to_job.items() if bound_job == job_id), None
+        )
+        latest_turn = research_turn_by_job.get(job_id) or {}
+        completed_turn = int(latest_turn.get("turn_index") or 0)
+        current_turn = max(1, completed_turn + (
+            1 if latest_turn.get("controller_directive") == "CONTINUE" else 0
+        ))
+        budget_state = thread_budget_by_job.get(job_id) or {}
         active_jobs.append({
             "job_id": job_id,
             "task_id": payload.get("task_id"),
             "role": payload.get("role"),
             "claim_id": payload.get("claim_id"),
             "start_time": payload.get("start_time"),
-            "thread_id": next(
-                (thread for thread, bound_job in thread_to_job.items() if bound_job == job_id), None
+            "thread_id": thread_id,
+            "current_turn": current_turn,
+            "max_turns": payload.get("max_turns"),
+            "last_turn_completed_at": latest_turn.get("completed_at"),
+            "continuation_reason": latest_turn.get("controller_reason"),
+            "per_thread_token_budget": payload.get("per_thread_token_budget"),
+            "per_thread_limit_action": payload.get("per_thread_limit_action"),
+            "observed_tokens": (
+                (token_by_thread.get(str(thread_id)) or {}).get("totalTokens")
+                if thread_id else None
+            ),
+            "next_turn_forbidden": bool(budget_state.get("next_turn_forbidden")),
+            "current_turn_cancel_requested": bool(
+                budget_state.get("current_turn_cancel_requested")
+            ),
+            "candidate_disposition": candidate_disposition_by_task.get(
+                str(payload.get("task_id") or "")
             ),
         })
     active_jobs.sort(key=lambda item: str(item.get("start_time") or ""))
@@ -261,6 +316,24 @@ def build_status(
         load_events(live_path) if include_live and live_path.is_file() else []
     )
     last_live = live_records[-1] if live_records else {}
+    activity_candidates = [
+        candidate for candidate in (
+            _parse_timestamp(last.get("timestamp")),
+            _parse_timestamp(last_live.get("timestamp")),
+        )
+        if candidate is not None
+    ]
+    latest_activity = max(activity_candidates) if activity_candidates else None
+    telemetry_age_seconds = None
+    if latest_activity is not None:
+        now = datetime.now().astimezone()
+        comparable_now = (
+            now.astimezone(latest_activity.tzinfo)
+            if latest_activity.tzinfo else now.replace(tzinfo=None)
+        )
+        telemetry_age_seconds = max(
+            0, int((comparable_now - latest_activity).total_seconds())
+        )
     return {
         "run_id": run_dir.name,
         "campaign_id": campaign_id or run_dir.name,
@@ -314,6 +387,21 @@ def build_status(
         "live_event_count": len(live_records),
         "last_live_event": last_live.get("kind"),
         "last_live_timestamp": last_live.get("timestamp"),
+        "telemetry_timestamp": (
+            latest_activity.isoformat() if latest_activity is not None else None
+        ),
+        "telemetry_age_seconds": telemetry_age_seconds,
+        "telemetry_age_semantics": (
+            "age of the latest observable event or token update; not inferred model progress"
+        ),
+        "latest_research_turn": (
+            max(
+                research_turn_by_job.values(),
+                key=lambda item: str(item.get("completed_at") or ""),
+            )
+            if research_turn_by_job else None
+        ),
+        "latest_candidate_disposition": latest_candidate_disposition,
     }
 
 
@@ -500,6 +588,11 @@ def format_status(status: dict[str, Any]) -> str:
             f"unknown={status.get('token_telemetry', {}).get('unknown', 0)}"
         ),
         (
+            "telemetry age: "
+            f"{status.get('telemetry_age_seconds') if status.get('telemetry_age_seconds') is not None else '-'}s "
+            "(observable events only; not inferred model progress)"
+        ),
+        (
             f"jobs: started={status['jobs_started']} terminal={status['jobs_terminal']} "
             f"completed={status['jobs_completed']} cancelled={status['jobs_cancelled']} "
             f"active={len(status['active_jobs'])}"
@@ -512,11 +605,42 @@ def format_status(status: dict[str, Any]) -> str:
             f"active={len(status.get('mechanical_subtasks', {}).get('active_subtasks', []))}"
         ),
     ]
+    latest_turn = status.get("latest_research_turn") or {}
+    if latest_turn:
+        lines.append(
+            "latest research turn: "
+            f"{latest_turn.get('turn_index') or '-'} completed at "
+            f"{latest_turn.get('completed_at') or '-'}; "
+            f"continuation={latest_turn.get('controller_directive') or '-'} "
+            f"reason={_compact(latest_turn.get('controller_reason'), 180)}"
+        )
+    latest_candidate = status.get("latest_candidate_disposition") or {}
+    if latest_candidate:
+        lines.append(
+            "latest candidate: "
+            f"{latest_candidate.get('status') or '-'} "
+            f"fingerprint={latest_candidate.get('candidate_fingerprint') or '-'} "
+            f"reason={_compact(latest_candidate.get('reason'), 180)}"
+        )
     for job in status["active_jobs"]:
+        turn_text = ""
+        if job.get("role") in {"prover", "falsifier", "explorer"}:
+            turn_text = (
+                f" turn={job.get('current_turn') or 1}/{job.get('max_turns') or '-'}"
+                f" last={job.get('last_turn_completed_at') or '-'}"
+                f" continuation={_compact(job.get('continuation_reason'), 100)}"
+            )
+        budget_text = (
+            f" tokens={job.get('observed_tokens') or 0}/"
+            f"{job.get('per_thread_token_budget') or '-'}"
+            f" policy={job.get('per_thread_limit_action') or '-'}"
+            f" next_turn_forbidden={bool(job.get('next_turn_forbidden'))}"
+        )
         lines.append(
             "  - "
             f"{job.get('role') or '-'} task={job.get('task_id') or '-'} "
             f"claim={job.get('claim_id') or '-'} thread={job.get('thread_id') or 'binding-pending'}"
+            f"{turn_text}{budget_text}"
         )
     rates = status.get("rate_limits") or {}
     primary = rates.get("primary") or {}
@@ -821,6 +945,11 @@ def format_live_event(event: dict[str, Any]) -> str | None:
             f"{_message_prefix(event, label, '预算')} "
             "本任务已达到单任务参考额度；继续运行至自然完成"
         )
+    if kind == "AGENT_JOB_STOP_AFTER_TURN_REQUESTED":
+        return (
+            f"{_message_prefix(event, label, '预算')} "
+            "本任务已达到单任务 token 上限；当前轮继续完成，下一轮已禁止"
+        )
     if kind == "AGENT_JOB_CANCEL_FAILED":
         return (
             f"{_message_prefix(event, label, '错误')} 无法安全停止当前任务；"
@@ -969,15 +1098,32 @@ def format_chat_lifecycle_event(event: dict[str, Any]) -> str | None:
     if kind == "AUDIT_PAUSED":
         return f"{prefix('预算')} 审计 {_compact(payload.get('task_id'), 50)} 因预算不足暂停"
     if kind == "THREAD_TOKEN_BUDGET_REACHED":
-        action_text = (
-            "继续运行至自然完成"
-            if payload.get("action") == "observe"
-            else "正在安全停止"
-        )
+        action_text = {
+            "observe": "仅记录；不禁止续轮",
+            "stop_after_turn": "当前轮继续完成；已经禁止下一轮",
+            "interrupt": "已请求立即取消；已经禁止下一轮",
+        }.get(str(payload.get("action") or ""), "按未知策略 fail closed")
         return (
             f"{prefix('预算')} {_compact(payload.get('task_id'), 50)} 已达到单任务 token 上限 "
             f"({_token_text(payload.get('observed_tokens'))}/{_token_text(payload.get('token_budget'))})，"
             f"{action_text}"
+        )
+    if kind == "RESEARCH_TURN_COMPLETED":
+        return (
+            f"{prefix('研究轮次')} {_compact(payload.get('task_id'), 50)} 第 "
+            f"{payload.get('turn_index') or '-'} 轮完成；"
+            f"{payload.get('controller_directive') or '-'}："
+            f"{_compact(payload.get('controller_reason'), 180)}"
+        )
+    if kind == "UNAUTHORIZED_DELEGATION_ATTEMPT":
+        diagnostic = payload.get("diagnostic") or (
+            "检测到实际子线程活动"
+            if payload.get("target_thread_exists")
+            else "协作工具调用已拦截，未创建子线程"
+        )
+        return (
+            f"{prefix('隔离拦截')} tool={_compact(payload.get('tool'), 50)}，"
+            f"item={_compact(payload.get('item_type'), 50)}：{_compact(diagnostic, 180)}"
         )
     if kind == "TOKEN_BUDGET_DRAIN_STARTED":
         return (
@@ -1850,6 +1996,44 @@ class _MonitorDashboardState:
             active = self.active_jobs.get(str(payload["job_id"]))
             if active is not None:
                 active["thread_id"] = payload["thread_id"]
+        elif kind == "RESEARCH_TURN_COMPLETED" and payload.get("job_id"):
+            job_id = str(payload["job_id"])
+            record = self.job_records.setdefault(job_id, {})
+            completed_turn = int(payload.get("turn_index") or 0)
+            record.update({
+                "current_turn": completed_turn + (
+                    1 if payload.get("controller_directive") == "CONTINUE" else 0
+                ),
+                "last_turn_completed_at": event.get("timestamp"),
+                "continuation_reason": payload.get("controller_reason"),
+                "candidate_disposition": payload.get("candidate_disposition"),
+            })
+        elif kind == "THREAD_TOKEN_BUDGET_REACHED" and payload.get("job_id"):
+            job_id = str(payload["job_id"])
+            self.job_records.setdefault(job_id, {}).update({
+                "observed_tokens": payload.get("observed_tokens"),
+                "per_thread_token_budget": payload.get("token_budget"),
+                "per_thread_limit_action": payload.get("action"),
+                "next_turn_forbidden": payload.get("next_turn_forbidden"),
+                "current_turn_cancel_requested": payload.get(
+                    "current_turn_cancel_requested"
+                ),
+            })
+        elif kind in {"CANDIDATE_PROCESSED", "CANDIDATE_REJECTED"}:
+            producer_task_id = str(payload.get("producer_task_id") or "")
+            if producer_task_id:
+                disposition = {
+                    "status": (
+                        "ACCEPTED" if kind == "CANDIDATE_PROCESSED" else "REJECTED"
+                    ),
+                    "candidate_fingerprint": (
+                        payload.get("candidate_fingerprint") or payload.get("fingerprint")
+                    ),
+                    "reason": payload.get("reason"),
+                }
+                for record in self.job_records.values():
+                    if str(record.get("task_id") or "") == producer_task_id:
+                        record["candidate_disposition"] = disposition
         elif kind in {"JOB_COMPLETED", "JOB_CANCELLED"} and payload.get("job_id"):
             job_id = str(payload["job_id"])
             self.terminal_jobs.add(job_id)
@@ -1962,6 +2146,11 @@ class _MonitorDashboardState:
             self.job_records.setdefault(job_id, {}).update(payload)
             self.job_records[job_id].setdefault("end_time", event.get("timestamp"))
             self.active_jobs.pop(job_id, None)
+        elif kind == "AGENT_JOB_STOP_AFTER_TURN_REQUESTED" and job_id:
+            self.job_records.setdefault(job_id, {}).update({
+                "next_turn_forbidden": True,
+                "per_thread_limit_action": "stop_after_turn",
+            })
 
     @property
     def total_tokens(self) -> int:
@@ -2041,7 +2230,12 @@ class _MonitorDashboardState:
             else:
                 current = now.astimezone(started.tzinfo) if started.tzinfo else now.replace(tzinfo=None)
                 elapsed_minutes = max(0, int((current - started).total_seconds()) // 60)
-                elapsed = f"{elapsed_minutes}min"
+            elapsed = f"{elapsed_minutes}min"
+            if role in {"prover", "falsifier", "explorer"}:
+                current_turn = int(payload.get("current_turn") or 1)
+                max_turns = payload.get("max_turns") or "-"
+                next_turn_state = "·续轮已禁" if payload.get("next_turn_forbidden") else ""
+                name += f"（第{current_turn}/{max_turns}轮{next_turn_state}）"
             card = f"{subtype}·{name}｜{elapsed}"
             grouped[self._thread_group(role)].append((name.casefold(), card))
         return {
@@ -2233,6 +2427,30 @@ class _MonitorDashboardState:
             total_tokens = self.thread_tokens.get(thread_id, 0)
         if total_tokens > 0:
             details.append(f"{_token_text(total_tokens)} tokens")
+        if str(payload.get("role") or "") in {"prover", "falsifier", "explorer"}:
+            details.append(
+                f"轮次 {payload.get('current_turn') or 1}/{payload.get('max_turns') or '-'}"
+            )
+            if payload.get("last_turn_completed_at"):
+                details.append(
+                    f"上轮完成 {_local_clock(payload.get('last_turn_completed_at'))}"
+                )
+            if payload.get("continuation_reason"):
+                details.append(
+                    f"续轮原因 {_compact(payload.get('continuation_reason'), 100)}"
+                )
+        policy = str(payload.get("per_thread_limit_action") or "")
+        if policy:
+            details.append(
+                f"token策略 {policy}"
+                + ("（下一轮已禁止）" if payload.get("next_turn_forbidden") else "")
+            )
+        disposition = payload.get("candidate_disposition") or {}
+        if disposition:
+            candidate_detail = str(disposition.get("status") or "-")
+            if disposition.get("reason"):
+                candidate_detail += f"：{_compact(disposition.get('reason'), 100)}"
+            details.append(f"候选 {candidate_detail}")
         model = str(payload.get("model") or "")
         if model:
             effort = str(payload.get("reasoning_effort") or "-")
@@ -2308,7 +2526,10 @@ class _MonitorDashboardState:
         )
         if not detail_lines:
             detail_lines.append("活动线程｜无")
-        details: list[str] = [f"静默 {quiet_seconds} 秒", f"事件 {self.event_count}+{self.live_event_count}"]
+        details: list[str] = [
+            f"遥测年龄 {quiet_seconds} 秒（仅表示可观测活动）",
+            f"事件 {self.event_count}+{self.live_event_count}",
+        ]
         if folded_summary:
             details.append(f"已折叠 {folded_summary}")
         return [first, second, third, *detail_lines, "｜".join(details)]

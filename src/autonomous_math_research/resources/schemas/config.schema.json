@@ -137,7 +137,7 @@
         "mechanical_cost_usd": {"$ref": "#/$defs/nullablePositiveNumber"},
         "soft_fraction": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
         "hard_fraction": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
-        "per_thread_limit_action": {"enum": ["observe", "interrupt"]},
+        "per_thread_limit_action": {"enum": ["observe", "stop_after_turn", "interrupt"]},
         "per_thread_default": {"$ref": "#/$defs/nullablePositiveInteger"},
         "per_thread": {"$ref": "#/$defs/integerBudgetMap"},
         "per_role": {"$ref": "#/$defs/integerBudgetMap"},

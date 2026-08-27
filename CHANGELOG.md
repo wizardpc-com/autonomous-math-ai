@@ -16,6 +16,25 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Research jobs now distinguish persistent execution blockers from mathematical
+  claim state, stop after one blocker repair, and cap ordinary Prover,
+  Falsifier, and Explorer turns at 4/3/3 by default. Candidate validation
+  rejections carry controller-bound producer identity, fingerprint, and exact
+  sanitized feedback into at most one targeted repair turn.
+- Per-thread limits now support `stop_after_turn`: the active model turn may
+  finish, but no successor turn is started. Turn/token boundaries create a
+  noncanonical next-epoch checkpoint only with a new persisted artifact and an
+  explicit next question; otherwise the route pauses without copying work.
+- Isolation diagnostics now distinguish a blocked collaboration tool call with
+  no child thread from actual child-thread activity. Monitor status reports
+  research turn bounds, continuation/candidate disposition, token-limit policy,
+  next-turn suppression, and observable telemetry age without inferring hidden
+  model progress.
+- Cross-domain candidate event types now fail closed as ordinary candidate
+  rejections instead of escaping the controller as mapping `KeyError`s. Domain
+  transition lookup validates before indexing across live processing, audit
+  recovery, and trusted-claim conflict checks, while research task packets list
+  the active domain's allowed event types for worker submissions.
 - Director plans can now explicitly mark genuinely differentiated tasks as
   `metadata.independent_exploration=true`, matching the scheduler's reserved
   independent-slot contract. If bounded Director repair still ends without a
@@ -33,9 +52,13 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next-epoch continuations. Selecting only deferred work now seals a clean epoch
   boundary that `--auto-epochs` can continue, while legacy combined frontiers
   remain readable without rewriting historical checkpoints.
-- Windows App Server roles receive the detected virtual-environment root as a
-  narrow read-only runtime path, and candidate-event commands invoke the exact
-  controller Python executable instead of relying on a `python` PATH alias.
+- Windows App Server roles strictly validate `pyvenv.cfg` and, when its base
+  interpreter is external, receive only that interpreter installation root as
+  an additional read-only runtime path. Broad, missing, noncanonical,
+  out-of-home, and credential-shaped paths fail closed. Candidate-event
+  commands continue to invoke the exact controller Python executable instead
+  of relying on a `python` PATH alias. The CLI now also supports `amr
+  --version` for launcher provenance checks.
 - Canonical-transition schema v2 requires explicit preconditions for every new
   record. A read-only compatibility adapter accepts pre-v1.1 schema-v1 records
   only when their exact legacy fields, snapshots, trusted-state binding,

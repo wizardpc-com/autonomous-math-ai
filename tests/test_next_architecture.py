@@ -123,6 +123,18 @@ class NextArchitectureTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.root)
 
+    def _durable_research_job_record(
+        self,
+        controller: AutonomousController,
+        outcome: JobOutcome,
+    ) -> dict[str, object]:
+        artifact = controller.run_dir / "jobs" / outcome.job_id / "progress.txt"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("new durable intermediate result\n", encoding="utf-8")
+        outcome.artifact_paths = [str(artifact)]
+        outcome.result["artifact_paths"] = [str(artifact)]
+        return {"artifact_hashes": {str(artifact.resolve()): file_digest(artifact)}}
+
     def _resume_args(self, run_id: str, *, auto_epochs: bool = False) -> argparse.Namespace:
         return argparse.Namespace(
             project=self.project, workspace_root=None, hours=None, epoch_hours=None,
@@ -609,7 +621,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.11")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.14")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -921,7 +933,7 @@ class NextArchitectureTests(unittest.TestCase):
             self.assertEqual(started[0]["payload"]["max_turns"], 6)
             self.assertEqual(
                 started[0]["payload"]["timeout"],
-                started[0]["payload"]["per_turn_timeout"] * 6,
+                started[0]["payload"]["per_turn_timeout"] * 7,
             )
             await asyncio.gather(*(
                 active.future for active in controller.active.values()
@@ -1860,7 +1872,7 @@ class NextArchitectureTests(unittest.TestCase):
     def test_turn_limit_checkpoints_task_for_next_epoch_without_stagnation(self) -> None:
         config = load_config(self.project)
         self.assertEqual(config.raw["engine"]["research_max_turns"], {
-            "prover": 12, "falsifier": 12, "explorer": 12,
+            "prover": 4, "falsifier": 3, "explorer": 3,
         })
         first = AutonomousController(
             config, backend=MockCodexBackend(), mock=True,
@@ -1882,11 +1894,12 @@ class NextArchitectureTests(unittest.TestCase):
                 "artifact_paths": [],
                 "evidence_level": "E0_SPECULATIVE",
             },
-            turn_history=[{"turn_index": index} for index in range(1, 13)],
+            turn_history=[{"turn_index": index} for index in range(1, 5)],
             logical_stop_reason="bounded same-thread turn limit reached",
         )
 
-        first._accept_research_result(outcome, task)
+        job_record = self._durable_research_job_record(first, outcome)
+        first._accept_research_result(outcome, task, job_record)
 
         self.assertEqual(first.pending_research, [])
         self.assertEqual(len(first.deferred_research_continuations), 1)
@@ -1903,7 +1916,7 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(payload["trust_effect"], "none")
         self.assertEqual(payload["source_task_id"], task.task_id)
         self.assertEqual(payload["continuation_task_id"], continued.task_id)
-        self.assertEqual(payload["turn_count"], 12)
+        self.assertEqual(payload["turn_count"], 4)
         self.assertEqual(
             payload["proof_frontier"], first.graph.proof_frontier("C_ROOT"),
         )
@@ -1915,11 +1928,13 @@ class NextArchitectureTests(unittest.TestCase):
             payload["next_obligation"],
             outcome.result["next_suggested_question"],
         )
-        self.assertEqual(payload["completed_evidence"], {
-            "candidate_accepted": False,
-            "canonical_progress": False,
-            "artifact_hashes": {},
-        })
+        self.assertFalse(payload["completed_evidence"]["candidate_accepted"])
+        self.assertFalse(payload["completed_evidence"]["canonical_progress"])
+        self.assertEqual(
+            payload["completed_evidence"]["artifact_hashes"],
+            payload["artifact_hashes"],
+        )
+        self.assertEqual(len(payload["artifact_hashes"]), 1)
         self.assertEqual(first.stagnation.attempts, {})
         latest_route = first.route_ledger.records()[-1]
         self.assertEqual(latest_route["status"], "PAUSED")
@@ -1940,7 +1955,7 @@ class NextArchitectureTests(unittest.TestCase):
             [continued.task_id],
         )
 
-    def test_controller_token_boundary_checkpoints_without_route_failure(self) -> None:
+    def test_controller_token_boundary_without_artifact_pauses_without_next_epoch(self) -> None:
         config = load_config(self.project)
         controller = AutonomousController(
             config, backend=MockCodexBackend(), mock=True,
@@ -1968,11 +1983,18 @@ class NextArchitectureTests(unittest.TestCase):
 
         controller._accept_research_result(outcome, task)
 
-        self.assertEqual(len(controller.deferred_research_continuations), 1)
+        self.assertEqual(controller.deferred_research_continuations, [])
         self.assertEqual(controller.stagnation.attempts, {})
         route = controller.route_ledger.records()[-1]
         self.assertEqual(route["status"], "PAUSED")
         self.assertIsNone(route["failure_class"])
+        paused = next(
+            item["payload"] for item in controller.store.replay()
+            if item["kind"] == "RESEARCH_CONTINUATION_PAUSED"
+        )
+        self.assertEqual(paused["reason"], "no new persisted artifact was produced")
+        self.assertFalse(paused["checkpoint_created"])
+        self.assertFalse(paused["next_epoch_task_created"])
 
     def test_provider_quota_exact_task_survives_fresh_epoch_import(self) -> None:
         config = load_config(self.project)
@@ -2028,10 +2050,11 @@ class NextArchitectureTests(unittest.TestCase):
                 "artifact_paths": [],
                 "evidence_level": "E0_SPECULATIVE",
             },
-            turn_history=[{"turn_index": index} for index in range(1, 13)],
+            turn_history=[{"turn_index": index} for index in range(1, 5)],
             logical_stop_reason="bounded same-thread turn limit reached",
         )
-        first._accept_research_result(outcome, task)
+        job_record = self._durable_research_job_record(first, outcome)
+        first._accept_research_result(outcome, task, job_record)
         continued = first.deferred_research_continuations[0]
         self.assertNotIn("independent_exploration", continued.metadata)
         first._write_compact_snapshot()
@@ -2069,7 +2092,7 @@ class NextArchitectureTests(unittest.TestCase):
         )
         first._pin_run_inputs(0.01, True)
         task = research_task("legacy-long-proof-task")
-        first._accept_research_result(JobOutcome(
+        outcome = JobOutcome(
             job_id="legacy-job", task_id=task.task_id, role=task.role,
             claim_id=task.target_claim, status="completed",
             result={
@@ -2078,9 +2101,11 @@ class NextArchitectureTests(unittest.TestCase):
                 "next_suggested_question": "Continue the exact same task.",
                 "artifact_paths": [], "evidence_level": "E0_SPECULATIVE",
             },
-            turn_history=[{"turn_index": index} for index in range(1, 13)],
+            turn_history=[{"turn_index": index} for index in range(1, 5)],
             logical_stop_reason="bounded same-thread turn limit reached",
-        ), task)
+        )
+        job_record = self._durable_research_job_record(first, outcome)
+        first._accept_research_result(outcome, task, job_record)
         continued = first.deferred_research_continuations[0]
         compact_path = first._write_compact_snapshot()
         compact = json.loads(compact_path.read_text(encoding="utf-8"))
@@ -2141,10 +2166,11 @@ class NextArchitectureTests(unittest.TestCase):
                 "artifact_paths": [],
                 "evidence_level": "E0_SPECULATIVE",
             },
-            turn_history=[{"turn_index": index} for index in range(1, 13)],
+            turn_history=[{"turn_index": index} for index in range(1, 5)],
             logical_stop_reason="bounded same-thread turn limit reached",
         )
-        first._accept_research_result(outcome, task)
+        job_record = self._durable_research_job_record(first, outcome)
+        first._accept_research_result(outcome, task, job_record)
         continued = first.deferred_research_continuations[0]
         first._write_compact_snapshot()
         checkpoint_uri = next(
@@ -2190,10 +2216,11 @@ class NextArchitectureTests(unittest.TestCase):
                 "artifact_paths": [],
                 "evidence_level": "E0_SPECULATIVE",
             },
-            turn_history=[{"turn_index": index} for index in range(1, 13)],
+            turn_history=[{"turn_index": index} for index in range(1, 5)],
             logical_stop_reason="bounded same-thread turn limit reached",
         )
-        first._accept_research_result(outcome, task)
+        job_record = self._durable_research_job_record(first, outcome)
+        first._accept_research_result(outcome, task, job_record)
         snapshot_path = first._write_compact_snapshot()
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
         snapshot["next_epoch_pending_research"][0]["why_now"] = "tampered rationale"
@@ -2608,6 +2635,14 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(len(packet_paths), 1)
         packet = json.loads(packet_paths[0].read_text(encoding="utf-8"))
         self.assertEqual(packet["task"]["required_files"], ["project://claims/CLAIMS.md"])
+        self.assertEqual(packet["candidate_protocol"]["domain"], "math-research")
+        self.assertEqual(
+            packet["candidate_protocol"]["allowed_event_types"],
+            sorted(controller.domain_semantics.event_transitions),
+        )
+        self.assertNotIn(
+            "CERTIFICATE", packet["candidate_protocol"]["allowed_event_types"],
+        )
         self.assertEqual(len(packet["required_file_access"]), 1)
         access = packet["required_file_access"][0]
         self.assertEqual(access["reference"], "project://claims/CLAIMS.md")

@@ -41,6 +41,7 @@ class AuditGate:
         return max(configured, packed)
 
     def register(self, event: CandidateEvent) -> CandidateAuditState:
+        self.semantics.validate_event_type(event.type)
         state = self.states.get(event.fingerprint)
         if state:
             return state

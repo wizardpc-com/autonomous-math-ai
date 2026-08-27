@@ -84,6 +84,16 @@ _AUTH_SECRET_KEY_MARKERS = (
     "secret", "password", "passwd", "credential", "authorization", "cookie",
     "apikey", "accesskey", "privatekey",
 )
+_PYVENV_CFG_MAX_BYTES = 64 * 1024
+_SENSITIVE_RUNTIME_PATH_PARTS = frozenset({
+    ".aws", ".azure", ".codex", ".git", ".gnupg", ".ssh",
+    "auth", "authentication", "credential", "credentials", "private-key",
+    "private-keys", "secret", "secrets", "token", "tokens",
+})
+_SENSITIVE_RUNTIME_PATH_MARKERS = (
+    "apikey", "accesskey", "authorization", "cookie", "credential", "keyring",
+    "oauth", "password", "passwd", "privatekey", "secret",
+)
 
 
 def redact_auth_material(value: Any) -> Any:
@@ -183,12 +193,227 @@ def app_server_environment(
     return environment
 
 
-def runtime_python_read_roots(executable: Path | None = None) -> tuple[Path, ...]:
-    runtime = (executable or Path(sys.executable)).resolve()
+def _read_pyvenv_config(path: Path) -> dict[str, str]:
+    try:
+        if path.is_symlink():
+            raise AppServerError("pyvenv.cfg must not be a symbolic link")
+        size = path.stat().st_size
+        if size > _PYVENV_CFG_MAX_BYTES:
+            raise AppServerError("pyvenv.cfg exceeds the bounded parser size")
+        text = path.read_bytes().decode("utf-8-sig")
+    except AppServerError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise AppServerError("pyvenv.cfg is unreadable or is not UTF-8") from exc
+    if "\x00" in text:
+        raise AppServerError("pyvenv.cfg contains a NUL byte")
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise AppServerError(f"pyvenv.cfg line {line_number} is malformed")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip().lower()
+        value = raw_value.strip()
+        if re.fullmatch(r"[a-z][a-z0-9-]*", key) is None or not value:
+            raise AppServerError(f"pyvenv.cfg line {line_number} is malformed")
+        if key in values:
+            raise AppServerError(f"pyvenv.cfg contains duplicate key {key!r}")
+        values[key] = value
+    return values
+
+
+def _resolve_pyvenv_path(
+    raw_value: str,
+    *,
+    path_type: type[Path],
+    label: str,
+    platform_name: str,
+) -> Path:
+    if (
+        len(raw_value) > 4096
+        or raw_value != raw_value.strip()
+        or any(character in raw_value for character in ('"', "'", "\x00", "*", "?"))
+        or any(part in {".", ".."} for part in raw_value.replace("\\", "/").split("/"))
+        or (platform_name == "nt" and raw_value.startswith(("\\\\", "//")))
+    ):
+        raise AppServerError(f"pyvenv.cfg {label} path is ambiguous")
+    candidate = path_type(raw_value)
+    if not candidate.is_absolute():
+        raise AppServerError(f"pyvenv.cfg {label} path is not absolute")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AppServerError(f"pyvenv.cfg {label} path does not exist") from exc
+    if os.path.normcase(os.path.normpath(str(candidate))) != os.path.normcase(
+        os.path.normpath(str(resolved))
+    ):
+        raise AppServerError(f"pyvenv.cfg {label} path is not canonical")
+    return resolved
+
+
+def _known_broad_runtime_roots(path_type: type[Path]) -> set[str]:
+    roots: set[Path] = set()
+    for key in (
+        "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA",
+        "PROGRAMFILES", "PROGRAMFILES(X86)", "SYSTEMROOT",
+    ):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        try:
+            root = path_type(value).resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        roots.add(root)
+        if key == "USERPROFILE":
+            roots.add(root.parent)
+        elif key in {"LOCALAPPDATA", "APPDATA"}:
+            roots.add(root.parent)
+    return {
+        os.path.normcase(os.path.normpath(str(root)))
+        for root in roots
+    }
+
+
+def _validate_external_python_root(
+    root: Path,
+    *,
+    path_type: type[Path],
+    platform_name: str,
+) -> None:
+    normalized = os.path.normcase(os.path.normpath(str(root)))
+    anchor = path_type(root.anchor).resolve() if root.anchor else None
+    parts = [part.casefold().strip("\\/") for part in root.parts[1:]]
+    structurally_broad = False
+    if platform_name == "nt" and parts:
+        structurally_broad = (
+            (parts[0] in {"program files", "program files (x86)", "programdata"} and len(parts) == 1)
+            or (parts[0] == "windows" and len(parts) <= 2)
+            or (
+                parts[0] == "users"
+                and (
+                    len(parts) <= 2
+                    or (len(parts) == 3 and parts[2] == "appdata")
+                    or (
+                        len(parts) == 4
+                        and parts[2:4] in (
+                            ["appdata", "local"],
+                            ["appdata", "locallow"],
+                            ["appdata", "roaming"],
+                        )
+                    )
+                    or (
+                        len(parts) == 5
+                        and parts[2:4] == ["appdata", "local"]
+                        and parts[4] in {"programs", "python"}
+                    )
+                )
+            )
+        )
+    if (
+        root.parent == root
+        or (anchor is not None and normalized == os.path.normcase(str(anchor)))
+        or normalized in _known_broad_runtime_roots(path_type)
+        or structurally_broad
+    ):
+        raise AppServerError("pyvenv.cfg base interpreter path is too broad")
+    for part in root.parts:
+        lowered = part.casefold().strip(". ")
+        compact = re.sub(r"[^a-z0-9]", "", lowered)
+        if (
+            lowered in _SENSITIVE_RUNTIME_PATH_PARTS
+            or any(marker in compact for marker in _SENSITIVE_RUNTIME_PATH_MARKERS)
+        ):
+            raise AppServerError(
+                "pyvenv.cfg base interpreter path has a credential-shaped component"
+            )
+
+
+def _validate_windows_python_installation(
+    home: Path,
+    base_executable: Path,
+    version: str,
+) -> None:
+    major, minor, *_ = version.split(".")
+    runtime_dll = home / f"python{major}{minor}.dll"
+    stdlib_marker = home / "Lib" / "os.py"
+    if (
+        base_executable.is_symlink()
+        or not runtime_dll.is_file()
+        or runtime_dll.is_symlink()
+        or not stdlib_marker.is_file()
+        or stdlib_marker.is_symlink()
+    ):
+        raise AppServerError(
+            "pyvenv.cfg home lacks matching Windows Python installation markers"
+        )
+
+
+def _external_pyvenv_python_root(
+    virtual_environment: Path,
+    *,
+    platform_name: str,
+) -> Path | None:
+    config = _read_pyvenv_config(virtual_environment / "pyvenv.cfg")
+    missing = [key for key in ("home", "executable", "version") if key not in config]
+    if missing:
+        raise AppServerError(
+            "pyvenv.cfg is missing required keys: " + ", ".join(missing)
+        )
+    if re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", config["version"]) is None:
+        raise AppServerError("pyvenv.cfg version is invalid")
+    path_type = type(virtual_environment)
+    home = _resolve_pyvenv_path(
+        config["home"], path_type=path_type, label="home",
+        platform_name=platform_name,
+    )
+    base_executable = _resolve_pyvenv_path(
+        config["executable"], path_type=path_type, label="executable",
+        platform_name=platform_name,
+    )
+    if not home.is_dir() or not base_executable.is_file():
+        raise AppServerError("pyvenv.cfg base interpreter is not a file-backed runtime")
+    if base_executable.parent != home:
+        raise AppServerError("pyvenv.cfg executable escapes its declared home")
+    if platform_name == "nt" and (
+        base_executable.suffix.casefold() != ".exe"
+        or re.fullmatch(r"python(?:w)?\.exe", base_executable.name, re.IGNORECASE) is None
+    ):
+        raise AppServerError("pyvenv.cfg executable is not a Windows Python launcher")
+    if home == virtual_environment or home.is_relative_to(virtual_environment):
+        return None
+    _validate_external_python_root(
+        home, path_type=path_type, platform_name=platform_name,
+    )
+    if virtual_environment.is_relative_to(home):
+        raise AppServerError("pyvenv.cfg base interpreter path contains the virtual environment")
+    if platform_name == "nt":
+        _validate_windows_python_installation(
+            home, base_executable, config["version"],
+        )
+    return home
+
+
+def runtime_python_read_roots(
+    executable: Path | None = None,
+    *,
+    platform_name: str | None = None,
+) -> tuple[Path, ...]:
+    runtime = (executable or Path(sys.executable)).resolve(strict=True)
     roots = [runtime.parent]
     virtual_environment = runtime.parent.parent
     if (virtual_environment / "pyvenv.cfg").is_file():
         roots.append(virtual_environment)
+        platform = platform_name or os.name
+        if platform == "nt":
+            external_root = _external_pyvenv_python_root(
+                virtual_environment, platform_name=platform,
+            )
+            if external_root is not None:
+                roots.append(external_root)
     return tuple(dict.fromkeys(roots))
 
 
@@ -808,6 +1033,16 @@ class AppServerClient:
         receiver_thread_ids = item.get("receiverThreadIds")
         if not isinstance(receiver_thread_ids, list):
             receiver_thread_ids = []
+        receiver_thread_ids = [
+            str(value) for value in receiver_thread_ids
+            if isinstance(value, str) and value.strip()
+        ]
+        agent_thread_id = str(item.get("agentThreadId") or "").strip()
+        actual_child_thread_activity = bool(
+            str(item.get("type") or "") == "subAgentActivity"
+            or agent_thread_id
+            or receiver_thread_ids
+        )
         if thread_id and turn_id and self.transport_available:
             self._track_background(
                 self._interrupt_forbidden_delegation(thread_id, turn_id)
@@ -821,8 +1056,14 @@ class AppServerClient:
                     "itemId": item.get("id"),
                     "itemType": item.get("type"),
                     "tool": item.get("tool"),
-                    "agentThreadId": item.get("agentThreadId"),
+                    "agentThreadId": agent_thread_id or None,
                     "receiverThreadIds": receiver_thread_ids[:20],
+                    "targetThreadExists": actual_child_thread_activity,
+                    "diagnostic": (
+                        "actual child thread activity detected"
+                        if actual_child_thread_activity
+                        else "forbidden collaboration tool call blocked; no child thread created"
+                    ),
                     "action": "interrupt_parent_and_fail_closed",
                 }),
             })
