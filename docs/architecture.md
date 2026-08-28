@@ -407,12 +407,31 @@ admission rejects every proposed task and no audit priority is applicable, the
 controller supplies the rejection reasons to one bounded repair turn; retry
 exhaustion pauses the epoch instead of falling through to idle queue failure.
 
+Before research dispatch, the controller derives an input closure from the
+claim's canonical object, RepresentationContract, ordered semantic bridges, and
+any declared source/localizer bindings. Every referenced source and bridge
+artifact must resolve through `required_files`; otherwise the task emits
+`TASK_REJECTED_BEFORE_MODEL` with exact missing ids. Confirmed reconciliation
+drift applies the same admission gate only to its affected claim.
+
+Mechanical capability is attested during validation and controller bootstrap.
+On Windows, production one-shot mechanical delegation is unavailable when the
+split filesystem sandbox cannot be enforced; the controller does not weaken the
+sandbox or expose the broker. Fixed finite exact algorithms should use a frozen
+Experiment Runner manifest in that case.
+
 ## Durable storage
 
 Events and route records are append-only. Candidate artifacts are copied into
 content-addressed bundles before audit. Durable references use `project://`,
 `campaign://`, or `epoch://` URIs, so evidence does not depend on a machine's
 absolute path.
+
+Historical reconciliation adds an append-only staging ledger and a canonical
+applied marker. The marker is valid only when exactly one verified committed
+transaction binds its bundle digest, fresh audit, semantic receipt, ClaimGraph,
+and trusted-state update. This makes application idempotent and crash-replayable
+without granting the import command direct ClaimGraph mutation authority.
 
 New `RUN_MANIFEST` records use schema v13 and pin the AMR version and source
 digest, Python version, Git revision when available, Codex CLI version, and App

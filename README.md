@@ -132,6 +132,18 @@ provider and reuses the operator's Codex login. APIs are optional and require an
 explicit OpenAI-compatible or plugin provider selection.
 See [the quickstart](docs/quickstart.md) before enabling live execution.
 
+Reviewed historical proof and audit artifacts can be staged without changing
+ClaimGraph, inspected, and then sent through one fresh controller audit:
+
+```console
+amr reconcile stage --project ./research-target --bundle reconciliation.json
+amr reconcile inspect --project ./research-target
+amr reconcile apply --project ./research-target --id reconciliation-...
+```
+
+The second successful `apply` is a zero-model no-op. See
+[Semantic Alignment](docs/semantic-alignment.md) for the bundle and trust gates.
+
 ### Windows one-file launcher
 
 Double-click [`amr-launcher.cmd`](amr-launcher.cmd), or run `amr launcher` after

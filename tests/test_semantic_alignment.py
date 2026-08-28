@@ -11,6 +11,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from autonomous_math_research.claim_graph import ClaimGraph
+from autonomous_math_research.backend import MockCodexBackend
 from autonomous_math_research.canonical_transition import (
     CanonicalTransitionStore,
     bytes_sha256,
@@ -30,11 +31,13 @@ from autonomous_math_research.models import (
     LifecyclePhase,
     MathStatus,
     TrustStatus,
+    ResearchTask,
     derived_claim_id,
     stable_hash,
 )
 from autonomous_math_research.policy import build_policy_manifest
 from autonomous_math_research.representation import RepresentationContract
+from autonomous_math_research.reconciliation import ReconciliationStore
 from autonomous_math_research.semantic_alignment import (
     SEMANTIC_AUDIT_AUTHORITY_CONTEXT_SCHEMA_VERSION,
     SemanticAlignment,
@@ -1886,6 +1889,210 @@ class SemanticAlignmentTests(unittest.TestCase):
         )
         self.assertTrue(validate_project(project)["valid"])
 
+    def test_historical_reconciliation_is_atomic_claim_local_and_idempotent(self) -> None:
+        project = self.opted_project()
+        child_id = "C_COMPONENT"
+        child_statement = "The audited component holds under the frozen assumptions."
+        child_bridges = [
+            "bridge:component-object-to-representation",
+            "bridge:component-representation-to-evidence",
+            "bridge:component-evidence-to-validator",
+            "bridge:component-validator-to-claim",
+        ]
+        graph = ClaimGraph.load(project / "autonomous" / "state" / "claim_graph.json")
+        child = CandidateEvent.from_dict({
+            "event_id": "historical-component",
+            "producer_thread_id": None,
+            "producer_task_id": "historical-reconciliation",
+            "claim_id": child_id,
+            "type": "THEOREM_CANDIDATE",
+            "impact": "HIGH",
+            "concise_summary": "historically proved component",
+            "exact_statement": child_statement,
+            "artifact_paths": [f"project://{EVIDENCE}"],
+            "reproduction_commands": [],
+            "dependency_impact": [],
+            "parent_claim_id": "C_ROOT",
+            "assumptions": [],
+            "dependencies": [],
+            "representation": LEGACY_REPRESENTATION.to_dict(),
+            "bridge_representation_ids": [],
+            "semantic_bridge_ids": child_bridges,
+            "evidence_receipts": [],
+            "proposed_evidence_level": EvidenceLevel.E0_SPECULATIVE,
+        })
+        graph.mark_candidate(child)
+        graph.claims[child_id].math_status = MathStatus.OPEN
+        graph.claims[child_id].current_gaps = ["historical authority drift"]
+        graph.save()
+
+        document = semantic_document()
+        document["registry"]["entries"].append({
+            "id": "object:component",
+            "kind": "OBJECT",
+            "canonical_name": "component",
+            "definition": "The exact component in the frozen decomposition.",
+            "canonical_source": "claims/CLAIMS.md#C_ROOT",
+            "aliases": [],
+            "forbidden_confusions": ["the full root claim"],
+            "allowed_representations": ["representation:component-record"],
+        })
+        nodes = [
+            ("object:component", "representation:component-record"),
+            ("representation:component-record", "evidence:component-proof"),
+            ("evidence:component-proof", "validator:component-audit"),
+            ("validator:component-audit", f"claim:{child_id}"),
+        ]
+        document["bridges"].extend({
+            "id": bridge_id,
+            "source": source,
+            "target": target,
+            "justification": "The frozen component mapping preserves the exact statement.",
+            "evidence": [EVIDENCE],
+        } for bridge_id, (source, target) in zip(child_bridges, nodes))
+        document["claims"].append({
+            "claim_id": child_id,
+            "canonical_object": "object:component",
+            "core_terms": ["component"],
+            "required_bridges": child_bridges,
+            "representation_id": LEGACY_REPRESENTATION.representation_id,
+        })
+        semantic_path = project / "autonomous" / "semantics.json"
+        semantic_path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        historical_audit = project / "audit" / "historical-component-audit.md"
+        historical_audit.write_text(
+            "Independent historical audit: PASS for the exact component.\n",
+            encoding="utf-8",
+        )
+        alignment = SemanticAlignment.load_optional(project)
+        store = ReconciliationStore(
+            project_root=project, runtime_root=project / "autonomous",
+        )
+        stage, appended = store.stage({
+            "schema_version": 1,
+            "kind": "NARROW_DERIVED_SUBCLAIM",
+            "target_claim_id": "C_ROOT",
+            "target_obligation_id": None,
+            "candidate": child.to_dict(),
+            "historical_proof_paths": [EVIDENCE],
+            "historical_audit_paths": [
+                "audit/historical-component-audit.md"
+            ],
+        }, claim_graph=graph, semantic_alignment=alignment)
+        self.assertTrue(appended)
+
+        config = load_config(project)
+        controller = AutonomousController(
+            config,
+            backend=MockCodexBackend(),
+            reconciliation_id=stage.reconciliation_id,
+            mock=False,
+        )
+        pending = ResearchTask(
+            task_id="ordinary-component-research",
+            role="prover",
+            target_claim=child_id,
+            exact_objective="Re-prove the component.",
+            why_now="should be gated",
+            dependencies=[],
+            expected_information_gain="HIGH",
+            research_impact="HIGH",
+            estimated_cost_tier="LOW",
+            required_files=[],
+            stop_conditions=["return"],
+            metadata={
+                "allow_derived_claims": False,
+                "independent_exploration": False,
+            },
+        )
+        self.assertIn(
+            "authority drift",
+            controller._validate_director_task(pending),
+        )
+        self.assertEqual(controller._authority_sync_status("C_ROOT"), "IN_SYNC")
+        with patch.object(controller, "_queue_next_audit", return_value=None):
+            interrupted = self.run_controller(controller)
+        self.assertTrue(interrupted.internal_failure)
+        self.assertIsNone(store.applied_marker(stage.reconciliation_id))
+
+        controller = AutonomousController(
+            config,
+            backend=MockCodexBackend(),
+            reconciliation_id=stage.reconciliation_id,
+            mock=False,
+        )
+        result = self.run_controller(controller)
+        self.assertFalse(result.internal_failure, result.stopped_reason)
+        self.assertEqual(result.stopped_reason, "historical reconciliation applied")
+
+        committed = ClaimGraph.load(
+            project / "autonomous" / "state" / "claim_graph.json"
+        )
+        self.assertEqual(committed.claims[child_id].math_status, MathStatus.PROVED)
+        self.assertEqual(committed.claims["C_ROOT"].math_status, MathStatus.OPEN)
+        self.assertTrue(any(
+            item["claim_id"] == child_id
+            for item in controller.semantic_trust.terminal_bindings
+        ))
+        summary = store.summary(transition_store=controller.canonical_transitions)
+        self.assertNotIn(child_id, summary["claim_status"])
+        authorizations = controller.canonical_transitions.verified_committed_authorizations()
+        self.assertEqual(1, sum(
+            item.get("reconciliation_id") == stage.reconciliation_id
+            and item.get("kind") == "AUDITED_CLAIM_TRANSITION"
+            for item in authorizations
+        ))
+
+        second = AutonomousController(
+            config,
+            backend=MockCodexBackend(),
+            reconciliation_id=stage.reconciliation_id,
+            mock=False,
+        )
+        second_result = self.run_controller(second)
+        self.assertFalse(second_result.internal_failure, second_result.stopped_reason)
+        self.assertEqual(second_result.jobs_started, 0)
+        self.assertEqual(
+            second_result.stopped_reason,
+            "historical reconciliation already in sync",
+        )
+        self.assertIn(
+            "CLAIM_ALREADY_TERMINAL",
+            second._validate_director_task(pending),
+        )
+        latest_graph = ClaimGraph.load(
+            project / "autonomous" / "state" / "claim_graph.json"
+        )
+        terminal_stage, _ = store.stage({
+            "schema_version": 1,
+            "kind": "TERMINAL_CLAIM",
+            "target_claim_id": "C_ROOT",
+            "target_obligation_id": None,
+            "candidate": candidate().to_dict(),
+            "historical_proof_paths": [EVIDENCE],
+            "historical_audit_paths": [
+                "audit/historical-component-audit.md"
+            ],
+        }, claim_graph=latest_graph, semantic_alignment=alignment)
+        partial_stage, _ = store.stage({
+            "schema_version": 1,
+            "kind": "PARTIAL_OBLIGATION",
+            "target_claim_id": "C_ROOT",
+            "target_obligation_id": latest_graph.claims[
+                "C_ROOT"
+            ].proof_obligations[0].obligation_id,
+            "candidate": child.to_dict(),
+            "historical_proof_paths": [EVIDENCE],
+            "historical_audit_paths": [
+                "audit/historical-component-audit.md"
+            ],
+        }, claim_graph=latest_graph, semantic_alignment=alignment)
+        self.assertEqual(terminal_stage.reconciliation_kind, "TERMINAL_CLAIM")
+        self.assertEqual(partial_stage.reconciliation_kind, "PARTIAL_OBLIGATION")
+
     def test_validation_authority_change_invalidates_authoritative_receipt(self) -> None:
         project = self.opted_project()
         controller = self.persistent_controller(project)
@@ -1949,6 +2156,50 @@ class SemanticAlignmentTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertTrue(validate_project(project)["valid"])
+
+    def test_predispatch_input_closure_reports_exact_missing_ids(self) -> None:
+        project = self.opted_project()
+        controller = self.persistent_controller(project)
+        task = ResearchTask(
+            task_id="closure-check",
+            role="prover",
+            target_claim="C_ROOT",
+            exact_objective="Use the frozen canonical inputs.",
+            why_now="pre-dispatch regression",
+            dependencies=[],
+            expected_information_gain="HIGH",
+            research_impact="HIGH",
+            estimated_cost_tier="LOW",
+            required_files=[],
+            stop_conditions=["return"],
+            metadata={
+                "allow_derived_claims": False,
+                "independent_exploration": False,
+            },
+        )
+        self.assertEqual(
+            controller._input_closure_missing_ids(task),
+            sorted(["object:accepted-input", *BRIDGES]),
+        )
+        task.required_files = ["claims/CLAIMS.md", EVIDENCE]
+        self.assertEqual(controller._input_closure_missing_ids(task), [])
+        task.input_closure = {
+            "canonical_object_id": "object:accepted-input",
+            "target_representation_id": LEGACY_REPRESENTATION.representation_id,
+            "required_bridge_ids": BRIDGES,
+            "required_source_ids": ["source:branch", "source:localizer"],
+            "source_bindings": [
+                {"source_id": "source:branch", "path": EVIDENCE},
+                {
+                    "source_id": "source:localizer",
+                    "path": "sources/missing-localizer.json",
+                },
+            ],
+        }
+        self.assertEqual(
+            controller._input_closure_missing_ids(task),
+            ["source:localizer"],
+        )
 
 
 if __name__ == "__main__":

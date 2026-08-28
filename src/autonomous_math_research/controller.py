@@ -68,13 +68,14 @@ from .mechanical import (
     MechanicalRunner,
     MechanicalTaskRejected,
     SubprocessMechanicalRunner,
+    attest_mechanical_host_capability,
     build_mechanical_runner,
     validate_mechanical_request,
     validate_mechanical_response,
 )
 from .models import (
     AuditResult, CandidateEvent, DirectorPlan, EvidenceLevel, Impact, JobOutcome,
-    LifecyclePhase, ResearchTask, Role, TokenUsage, TrustStatus,
+    LifecyclePhase, ObligationStatus, ResearchTask, Role, TokenUsage, TrustStatus,
     derived_claim_id, evidence_rank,
     stable_hash, utc_now,
 )
@@ -96,6 +97,11 @@ from .provider_config import (
     validate_service_tier,
 )
 from .profiles import migrate_config
+from .reconciliation import (
+    AUTHORITY_SYNC_IN_SYNC,
+    ReconciliationStage,
+    ReconciliationStore,
+)
 from .reporting import write_report
 from .representation import RepresentationContract, require_compatible_representations
 from .reasoning_health import ReasoningHealthMonitor
@@ -603,6 +609,7 @@ class AutonomousController:
         mock: bool = False,
         resume: bool = False,
         recover_candidates_from: str | None = None,
+        reconciliation_id: str | None = None,
         campaign_id: str | None = None,
         previous_epoch_id: str | None = None,
         campaign_hours: float = DEFAULT_CAMPAIGN_HOURS,
@@ -657,6 +664,12 @@ class AutonomousController:
             project_root=config.project_root,
             runtime_root=self.layout.autonomous_root,
         )
+        self.reconciliation_id = reconciliation_id
+        self.reconciliations = ReconciliationStore(
+            project_root=config.project_root,
+            runtime_root=self.layout.autonomous_root,
+        )
+        self._reconciliation_candidates: dict[str, ReconciliationStage] = {}
         self.graph = ClaimGraph.load(
             self.layout.claim_graph_path, semantics=self.domain_semantics,
         )
@@ -805,8 +818,13 @@ class AutonomousController:
         selection_mode = str(
             (worker_policy.get("selection_policy") or {}).get("mode") or "preferred"
         )
+        self.mechanical_capability = attest_mechanical_host_capability(
+            declared=bool(worker_policy.get("enabled", False)),
+            selection_mode=selection_mode,
+            test_or_injected_runner=bool(mock or mechanical_runner is not None),
+        )
         self.mechanical_worker_enabled = bool(
-            worker_policy.get("enabled", False) and selection_mode != "disabled"
+            self.mechanical_capability["runtime_available"]
         )
         configured_mechanical = config.raw["scheduler"].get("max_mechanical_subworkers")
         selected_mechanical = (
@@ -1181,6 +1199,8 @@ class AutonomousController:
         immediate: bool = False,
     ) -> None:
         """Coalesce replans behind a monotone state-version watermark."""
+        if self.reconciliation_id is not None:
+            return
         if (
             self._finalization_started
             or self.scheduler_stop_reason
@@ -2176,6 +2196,7 @@ class AutonomousController:
         transition_kind: str,
         authorization: dict[str, Any],
         preconditions: dict[Path, str] | None = None,
+        additional_targets: dict[Path, bytes] | None = None,
     ) -> str | None:
         semantic_preconditions: dict[Path, str] = {}
         canonical_authorization = self._canonical_transition_authorization(
@@ -2228,6 +2249,13 @@ class AutonomousController:
                 if path.read_bytes() != payload
             },
         }
+        for path, payload in (additional_targets or {}).items():
+            resolved = path.resolve()
+            if not resolved.is_relative_to(self.config.project_root.resolve()):
+                raise ValueError("canonical transition target escapes the project")
+            if resolved in targets and targets[resolved] != payload:
+                raise ValueError(f"canonical transition targets disagree for {resolved}")
+            targets[resolved] = payload
         transition_id = self.canonical_transitions.commit(
             targets=targets,
             authorization=canonical_authorization,
@@ -5665,6 +5693,8 @@ class AutonomousController:
             "mechanical_budget": self.mechanical_governor.global_budget,
             "mechanical_cost_budget_usd": self.mechanical_governor.global_cost_budget,
             "mechanical_effective_resource_cap": self._mechanical_resource_capacity(),
+            "mechanical_capability": dict(self.mechanical_capability),
+            "reconciliation_id": self.reconciliation_id,
             "campaign_id": self.campaign_id,
             "epoch_id": self.epoch_id,
             "previous_epoch_id": self.previous_epoch_id,
@@ -5673,6 +5703,15 @@ class AutonomousController:
         }
         if not self.resume:
             self.store.append("RUN_STARTED", run_started_payload)
+        self.store.append("MECHANICAL_CAPABILITY_ATTESTED", {
+            **self.mechanical_capability,
+            "effective_enabled": self.mechanical_worker_enabled,
+            "action": (
+                "mechanical requests permitted"
+                if self.mechanical_worker_enabled
+                else "mechanical requests prohibited before model dispatch"
+            ),
+        })
         self.live_store.append("LIVE_MONITOR_READY", {
             "schema_version": 1, "resume": self.resume,
             "captures": [
@@ -5801,6 +5840,23 @@ class AutonomousController:
             self._register_recovered_candidates(
                 self.recover_candidates_from, recovered_candidates,
             )
+
+        if self.reconciliation_id is not None:
+            try:
+                await self._prepare_reconciliation()
+            except Exception as exc:
+                self.store.append("RECONCILIATION_PREFLIGHT_FAILED", {
+                    "reconciliation_id": self.reconciliation_id,
+                    "error": _sanitize_live_text(exc),
+                    "action": "stopped before backend start or model turn",
+                })
+                return self._finish(
+                    f"bootstrap failed: reconciliation preflight: "
+                    f"{_sanitize_live_text(exc)[:500]}",
+                    internal_failure=True,
+                )
+            if self.scheduler_stop_reason:
+                return self._finish(self.scheduler_stop_reason)
 
         if (
             self._begin_finalization_if_resolved("initial audited claim graph")
@@ -6167,6 +6223,7 @@ class AutonomousController:
         }
         snapshot["mechanical_subworkers"] = {
             "enabled": self.mechanical_worker_enabled,
+            "capability": dict(self.mechanical_capability),
             "max_concurrent": self.max_mechanical_subworkers,
             "pending": len(self.pending_mechanical),
             "active": [
@@ -6195,6 +6252,12 @@ class AutonomousController:
             ],
             "trust_boundary": "mechanical evidence only; never a proof or audit verdict",
         }
+        snapshot["authority_reconciliation"] = self.reconciliations.summary(
+            transition_store=(
+                self.canonical_transitions if self.persist_shared_state else None
+            ),
+            pending_reconciliation_id=self.reconciliation_id,
+        )
         snapshot["candidate_audit_frontier"] = [
             {
                 "event": state.event.to_dict(),
@@ -7670,7 +7733,61 @@ class AutonomousController:
         for error in self.inbox.poll_errors:
             self.store.append("CANDIDATE_QUARANTINED", error)
 
+    async def _prepare_reconciliation(self) -> None:
+        if self.reconciliation_id is None:
+            return
+        if not self.persist_shared_state:
+            raise ValueError("reconciliation requires persistent canonical state")
+        stage = self.reconciliations.get(self.reconciliation_id)
+        if self.reconciliations.applied_marker(stage.reconciliation_id) is not None:
+            self.scheduler_stop_reason = "historical reconciliation already in sync"
+            return
+        event = self.reconciliations.validate_stage(
+            stage,
+            claim_graph=self.graph,
+            semantic_alignment=self.semantic_alignment,
+        )
+        event.producer_task_id = f"reconcile-{stage.reconciliation_id}"
+        event.producer_thread_id = f"reconciliation:{stage.reconciliation_id}"
+        event.source_run_id = self.run_id
+        self.inbox.submit(event, target_root=self._task_inbox(event.producer_task_id))
+        self._reconciliation_candidates[event.fingerprint] = stage
+        self._candidate_producer_identities[event.fingerprint] = {
+            "run_id": self.run_id,
+            "job_id": stage.reconciliation_id,
+            "task_id": event.producer_task_id,
+            "thread_id": str(event.producer_thread_id),
+            "role": "reconciliation",
+        }
+        self.store.append("RECONCILIATION_PREFLIGHT_PASSED", {
+            **stage.to_dict(),
+            "candidate_fingerprint": event.fingerprint,
+            "fresh_audit_required": True,
+            "model_research_turns_allowed": False,
+        })
+        await self.candidate_queue.put(event)
+        self.director_needed = False
+
     def _validate_candidate_provenance(self, event: CandidateEvent) -> None:
+        stage = self._reconciliation_candidates.get(event.fingerprint)
+        if stage is not None:
+            source = self.inbox.sources.get(event.event_id)
+            expected_root = self._task_inbox(event.producer_task_id).resolve()
+            if source is None or source.parent.resolve() != expected_root:
+                raise ValueError("reconciliation candidate bypassed its isolated inbox")
+            expected = self.reconciliations.validate_stage(
+                stage,
+                claim_graph=self.graph,
+                semantic_alignment=self.semantic_alignment,
+            )
+            if (
+                event.claim_id != expected.claim_id
+                or event.exact_statement != expected.exact_statement
+                or event.representation_id != expected.representation_id
+                or event.semantic_bridge_ids != expected.semantic_bridge_ids
+            ):
+                raise ValueError("reconciliation candidate changed after controller preflight")
+            return
         source = self.inbox.sources.get(event.event_id)
         expected_root = self._task_inbox(event.producer_task_id).resolve()
         if source is None or source.parent.resolve() != expected_root:
@@ -8002,6 +8119,37 @@ class AutonomousController:
     async def _process_candidate_queue(self) -> None:
         while not self.candidate_queue.empty():
             event = await self.candidate_queue.get()
+            reconciliation_stage = self._reconciliation_candidates.get(
+                event.fingerprint
+            )
+            reconciliation_replay = False
+            reconciliation_registrations: list[dict[str, Any]] = []
+            if reconciliation_stage is not None:
+                reconciliation_registrations = [
+                    item for item in
+                    self.canonical_transitions.verified_committed_authorizations()
+                    if item.get("kind") == "CANDIDATE_REGISTERED"
+                    and item.get("candidate_fingerprint") == event.fingerprint
+                    and item.get("reconciliation_id")
+                    == reconciliation_stage.reconciliation_id
+                ]
+                if len(reconciliation_registrations) > 1:
+                    raise ValueError(
+                        "reconciliation has duplicate canonical candidate registrations"
+                    )
+                if reconciliation_registrations:
+                    producer_identity = reconciliation_registrations[0].get(
+                        "producer_identity"
+                    )
+                    if not isinstance(producer_identity, dict):
+                        raise ValueError(
+                            "reconciliation candidate registration lacks producer identity"
+                        )
+                    self._candidate_producer_identities[event.fingerprint] = {
+                        str(key): str(value)
+                        for key, value in producer_identity.items()
+                    }
+                    reconciliation_replay = True
             if event.fingerprint in self.inbox.processed:
                 self.inbox.mark_processed(event, self.run_id)
                 self.store.append("CANDIDATE_DEDUPLICATED", {
@@ -8010,12 +8158,22 @@ class AutonomousController:
                 })
                 continue
             if event.fingerprint in self.inbox.accepted:
-                self.inbox.mark_processed(event, self.run_id, accepted=True)
-                self.store.append("CANDIDATE_DEDUPLICATED", {
-                    "event_id": event.event_id, "fingerprint": event.fingerprint,
-                    "claim_id": event.claim_id,
+                if reconciliation_stage is None:
+                    self.inbox.mark_processed(event, self.run_id, accepted=True)
+                    self.store.append("CANDIDATE_DEDUPLICATED", {
+                        "event_id": event.event_id, "fingerprint": event.fingerprint,
+                        "claim_id": event.claim_id,
+                    })
+                    continue
+                if len(reconciliation_registrations) != 1:
+                    raise ValueError(
+                        "reconciliation replay lacks one canonical candidate registration"
+                    )
+                self.store.append("RECONCILIATION_CANDIDATE_REPLAYED", {
+                    **reconciliation_stage.to_dict(),
+                    "candidate_fingerprint": event.fingerprint,
+                    "action": "reuse canonical registration and request fresh audit",
                 })
-                continue
             try:
                 self._validate_candidate_provenance(event)
                 self._validate_final_target_candidate(event)
@@ -8047,16 +8205,26 @@ class AutonomousController:
                 continue
             self.inbox.persist(event)
             audit_state = self.audit_gate.register(event)
-            self._commit_claim_state_transition(
-                transition_kind="CANDIDATE_REGISTERED",
-                authorization={
-                    "controller_gate": "candidate provenance and schema validation",
-                    "candidate_fingerprint": event.fingerprint,
-                    "claim_id": event.claim_id,
-                    "producer_identity": self._producer_identity_for_candidate(event),
-                    "trust_upgrade": False,
-                },
+            reconciliation_authorization = (
+                {
+                    "reconciliation_id": reconciliation_stage.reconciliation_id,
+                    "reconciliation_kind": reconciliation_stage.reconciliation_kind,
+                    "reconciliation_bundle_sha256": reconciliation_stage.bundle_sha256,
+                }
+                if reconciliation_stage is not None else {}
             )
+            if not reconciliation_replay:
+                self._commit_claim_state_transition(
+                    transition_kind="CANDIDATE_REGISTERED",
+                    authorization={
+                        "controller_gate": "candidate provenance and schema validation",
+                        "candidate_fingerprint": event.fingerprint,
+                        "claim_id": event.claim_id,
+                        "producer_identity": self._producer_identity_for_candidate(event),
+                        "trust_upgrade": False,
+                        **reconciliation_authorization,
+                    },
+                )
             self.store.append("CANDIDATE_PROCESSED", {
                 "event_id": event.event_id, "fingerprint": event.fingerprint,
                 "candidate_fingerprint": event.fingerprint,
@@ -8532,6 +8700,36 @@ class AutonomousController:
                 ),
             )
             self.pending_research.remove(task)
+            authority_status = self._authority_sync_status(task.target_claim)
+            missing_input_ids = self._input_closure_missing_ids(task)
+            if authority_status != AUTHORITY_SYNC_IN_SYNC or missing_input_ids:
+                rejection = {
+                    "task_id": task.task_id,
+                    "claim_id": task.target_claim,
+                    "representation_id": task.representation_id,
+                    "reason": (
+                        "AUTHORITY_RECONCILIATION_REQUIRED"
+                        if authority_status != AUTHORITY_SYNC_IN_SYNC
+                        else "INPUT_CLOSURE_INCOMPLETE"
+                    ),
+                    "authority_sync_status": authority_status,
+                    "missing_input_ids": missing_input_ids,
+                    "phase": "dispatch",
+                }
+                self.store.append("TASK_REJECTED_BEFORE_MODEL", rejection)
+                self.director_constraints.append({
+                    "action": "REPAIR_TASK_INPUTS",
+                    "claim_id": task.target_claim,
+                    "task_id": task.task_id,
+                    **rejection,
+                    "source": "dispatch_input_closure",
+                })
+                self._request_director(
+                    "accepted task failed deterministic dispatch admission",
+                    meaningful_change=False,
+                    immediate=True,
+                )
+                continue
             try:
                 required_file_access = self._required_file_access(task)
             except ValueError as exc:
@@ -8611,6 +8809,8 @@ class AutonomousController:
                     check_parent_claim_id=task.target_claim in self.graph.claims,
                 ).to_dict(),
                 "required_file_access": required_file_access,
+                "input_closure": task.input_closure,
+                "mechanical_capability": dict(self.mechanical_capability),
                 "candidate_protocol": {
                     "domain": self.domain_semantics.domain,
                     "allowed_event_types": sorted(
@@ -9096,6 +9296,30 @@ class AutonomousController:
                     "reason": "checkpointed continuation is unavailable in the current epoch",
                 })
                 continue
+            authority_status = self._authority_sync_status(task.target_claim)
+            if authority_status != AUTHORITY_SYNC_IN_SYNC:
+                rejection = {
+                    "task_id": task.task_id,
+                    "claim_id": task.target_claim,
+                    "representation_id": task.representation_id,
+                    "reason": "AUTHORITY_RECONCILIATION_REQUIRED",
+                    "authority_sync_status": authority_status,
+                }
+                rejected_tasks.append(rejection)
+                self.store.append("TASK_REJECTED_BEFORE_MODEL", rejection)
+                continue
+            missing_input_ids = self._input_closure_missing_ids(task)
+            if missing_input_ids:
+                rejection = {
+                    "task_id": task.task_id,
+                    "claim_id": task.target_claim,
+                    "representation_id": task.representation_id,
+                    "reason": "INPUT_CLOSURE_INCOMPLETE",
+                    "missing_input_ids": missing_input_ids,
+                }
+                rejected_tasks.append(rejection)
+                self.store.append("TASK_REJECTED_BEFORE_MODEL", rejection)
+                continue
             task_error = self._validate_director_task(task)
             if task_error:
                 rejection = {
@@ -9358,6 +9582,26 @@ class AutonomousController:
     def _validate_director_task(
         self, task: ResearchTask, *, check_route: bool = True,
     ) -> str | None:
+        target = self.graph.claims.get(task.target_claim)
+        if target is None:
+            return f"unknown target claim: {task.target_claim}"
+        if target.research_status in (
+            self.domain_semantics.terminal_positive
+            | self.domain_semantics.terminal_negative
+        ):
+            return (
+                f"CLAIM_ALREADY_TERMINAL: {task.target_claim} "
+                f"{target.research_status}"
+            )
+        authority_status = self._authority_sync_status(task.target_claim)
+        if authority_status != AUTHORITY_SYNC_IN_SYNC:
+            return (
+                f"claim-local authority drift permits reconciliation only: "
+                f"{task.target_claim} {authority_status}"
+            )
+        missing_inputs = self._input_closure_missing_ids(task)
+        if missing_inputs:
+            return "INPUT_CLOSURE_INCOMPLETE: " + ", ".join(missing_inputs)
         if check_route and not self.route_ledger.route_is_retryable(
             task.route_family, self.satisfied_route_conditions,
         ):
@@ -9399,6 +9643,119 @@ class AutonomousController:
         except ValueError as exc:
             return _sanitize_live_text(exc)
         return None
+
+    def _authority_sync_status(self, claim_id: str) -> str:
+        summary = self.reconciliations.summary(
+            transition_store=(
+                self.canonical_transitions if self.persist_shared_state else None
+            ),
+            pending_reconciliation_id=self.reconciliation_id,
+        )
+        return str(summary["claim_status"].get(claim_id) or AUTHORITY_SYNC_IN_SYNC)
+
+    def _input_closure_missing_ids(self, task: ResearchTask) -> list[str]:
+        closure = task.input_closure
+        binding = self.semantic_alignment.claims.get(task.target_claim)
+        if closure is None:
+            if binding is None:
+                return []
+            closure = {
+                "canonical_object_id": binding.canonical_object,
+                "target_representation_id": task.representation_id,
+                "required_bridge_ids": list(binding.required_bridges),
+                "required_source_ids": [],
+                "source_bindings": [],
+            }
+        expected_keys = {
+            "canonical_object_id", "target_representation_id",
+            "required_bridge_ids", "required_source_ids", "source_bindings",
+        }
+        if not isinstance(closure, dict) or set(closure) != expected_keys:
+            return ["input_closure:schema"]
+        bridge_ids = closure.get("required_bridge_ids")
+        source_ids = closure.get("required_source_ids")
+        source_bindings = closure.get("source_bindings")
+        if (
+            not isinstance(bridge_ids, list)
+            or any(not isinstance(item, str) or not item for item in bridge_ids)
+            or len(bridge_ids) != len(set(bridge_ids))
+            or not isinstance(source_ids, list)
+            or any(not isinstance(item, str) or not item for item in source_ids)
+            or len(source_ids) != len(set(source_ids))
+            or not isinstance(source_bindings, list)
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"source_id", "path"}
+                or not isinstance(item["source_id"], str)
+                or not item["source_id"]
+                or not isinstance(item["path"], str)
+                or not item["path"]
+                for item in source_bindings
+            )
+        ):
+            return ["input_closure:schema"]
+        missing: list[str] = []
+        required_paths: set[Path] = set()
+        for raw in task.required_files:
+            try:
+                required_paths.add(self._resolve_required_file(raw))
+            except ValueError:
+                continue
+        if closure.get("target_representation_id") != task.representation_id:
+            missing.append(task.representation_id)
+        if binding is not None:
+            if closure.get("canonical_object_id") != binding.canonical_object:
+                missing.append(binding.canonical_object)
+            if task.representation_id != binding.representation_id:
+                missing.append(binding.representation_id)
+            if tuple(bridge_ids) != binding.required_bridges:
+                missing.extend(
+                    item for item in binding.required_bridges
+                    if item not in bridge_ids
+                )
+            canonical = self.semantic_alignment.entries.get(binding.canonical_object)
+            if canonical is None:
+                missing.append(binding.canonical_object)
+            else:
+                source_reference = canonical.canonical_source.split("#", 1)[0]
+                try:
+                    source_path = self._resolve_required_file(source_reference)
+                except ValueError:
+                    source_path = None
+                if source_path is None or source_path not in required_paths:
+                    missing.append(binding.canonical_object)
+            for bridge_id in binding.required_bridges:
+                bridge = self.semantic_alignment.bridges.get(bridge_id)
+                if bridge is None:
+                    missing.append(bridge_id)
+                    continue
+                for reference in bridge.evidence:
+                    try:
+                        path = self._resolve_required_file(reference)
+                    except ValueError:
+                        path = None
+                    if path is None or path not in required_paths:
+                        missing.append(bridge_id)
+                        break
+        elif closure.get("canonical_object_id") is not None:
+            missing.append(str(closure["canonical_object_id"]))
+        source_paths = {
+            item["source_id"]: item["path"] for item in source_bindings
+        }
+        if len(source_paths) != len(source_bindings):
+            return ["input_closure:schema"]
+        for source_id in source_ids:
+            reference = source_paths.get(source_id)
+            if reference is None:
+                missing.append(source_id)
+                continue
+            try:
+                path = self._resolve_required_file(reference)
+            except ValueError:
+                path = None
+            if path is None or path not in required_paths:
+                missing.append(source_id)
+        return sorted(set(missing))
 
     def _adapt_legacy_imported_task_metadata(
         self, task: ResearchTask, *, source: str,
@@ -9818,6 +10175,13 @@ class AutonomousController:
                 "candidate audit rejected the candidate",
                 meaningful_change=False,
             )
+            if fingerprint in self._reconciliation_candidates:
+                if self.lifecycle.phase is LifecyclePhase.RUNNING:
+                    self.lifecycle.transition(
+                        LifecyclePhase.DRAINING_EPOCH,
+                        reason="historical reconciliation audit rejected",
+                    )
+                self.scheduler_stop_reason = "historical reconciliation audit rejected"
             return
         if result.verdict == "UNRESOLVED":
             self.store.append("CANDIDATE_AUDIT_UNRESOLVED", {
@@ -9832,6 +10196,13 @@ class AutonomousController:
                 "candidate audit remained unresolved",
                 meaningful_change=False,
             )
+            if fingerprint in self._reconciliation_candidates:
+                if self.lifecycle.phase is LifecyclePhase.RUNNING:
+                    self.lifecycle.transition(
+                        LifecyclePhase.DRAINING_EPOCH,
+                        reason="historical reconciliation audit unresolved",
+                    )
+                self.scheduler_stop_reason = "historical reconciliation audit unresolved"
             return
         if trust == TrustStatus.AUDITED_NIGHTLY:
             verified_level = self.audit_gate.verified_evidence_level(fingerprint)
@@ -9858,6 +10229,7 @@ class AutonomousController:
             prior_semantic_trust = self.semantic_trust
             prior_semantic_dirty = self._semantic_trust_dirty
             authorization: dict[str, Any] = {}
+            reconciliation_stage = self._reconciliation_candidates.get(fingerprint)
             try:
                 self.semantic_alignment.assert_unchanged()
                 semantic_terminal = (
@@ -9933,6 +10305,20 @@ class AutonomousController:
                         if terminal_binding is not None else None
                     ),
                 }
+                if reconciliation_stage is not None:
+                    authorization.update({
+                        "reconciliation_id": reconciliation_stage.reconciliation_id,
+                        "reconciliation_kind": reconciliation_stage.reconciliation_kind,
+                        "reconciliation_bundle_sha256": reconciliation_stage.bundle_sha256,
+                        "reconciliation_target_claim_id": (
+                            reconciliation_stage.target_claim_id
+                        ),
+                        "reconciliation_target_obligation_id": (
+                            reconciliation_stage.target_obligation_id
+                        ),
+                        "historical_trust_upgrade": False,
+                        "fresh_reconciliation_audit": True,
+                    })
                 if terminal_binding is not None:
                     self._pending_semantic_authorization = (
                         self._canonical_transition_authorization(
@@ -9945,6 +10331,27 @@ class AutonomousController:
                     state.required,
                     verified_level,
                 )
+                if (
+                    reconciliation_stage is not None
+                    and reconciliation_stage.reconciliation_kind
+                    == "PARTIAL_OBLIGATION"
+                ):
+                    parent = self.graph.claims[reconciliation_stage.target_claim_id]
+                    obligation = next(
+                        item for item in parent.proof_obligations
+                        if item.obligation_id
+                        == reconciliation_stage.target_obligation_id
+                    )
+                    obligation.status = ObligationStatus.DISCHARGED
+                    obligation.evidence_paths = sorted(set(
+                        obligation.evidence_paths + event.artifact_paths
+                    ))
+                    obligation.updated_at = utc_now()
+                    parent.current_gaps = [
+                        gap for gap in parent.current_gaps
+                        if gap != reconciliation_stage.target_obligation_id
+                    ]
+                    parent.last_meaningful_progress = utc_now()
             except SemanticPromotionError as exc:
                 self.semantic_trust = prior_semantic_trust
                 self._semantic_trust_dirty = prior_semantic_dirty
@@ -9997,10 +10404,27 @@ class AutonomousController:
                 canonical_progress=True,
             )
             try:
+                additional_targets: dict[Path, bytes] = {}
+                if reconciliation_stage is not None:
+                    if receipt is None:
+                        raise ValueError(
+                            "reconciliation did not produce a semantic verification receipt"
+                        )
+                    additional_targets[
+                        self.reconciliations.applied_marker_path(
+                            reconciliation_stage.reconciliation_id
+                        )
+                    ] = self.reconciliations.applied_marker_bytes(
+                        reconciliation_stage,
+                        candidate_fingerprint=fingerprint,
+                        semantic_receipt_fingerprint=receipt["receipt_fingerprint"],
+                        fresh_audit_receipts=self._semantic_audit_receipts(event),
+                    )
                 transition_id = self._commit_claim_state_transition(
                     transition_kind="AUDITED_CLAIM_TRANSITION",
                     authorization=authorization,
                     preconditions=receipt_preconditions,
+                    additional_targets=additional_targets,
                 )
                 self._semantic_trust_dirty = False
             finally:
@@ -10013,6 +10437,21 @@ class AutonomousController:
                     "canonical_transition_id": transition_id,
                     "authoritative_terminal_transition": True,
                 })
+            if reconciliation_stage is not None:
+                self.store.append("RECONCILIATION_APPLIED", {
+                    **reconciliation_stage.to_dict(),
+                    "candidate_fingerprint": fingerprint,
+                    "semantic_receipt_fingerprint": receipt["receipt_fingerprint"],
+                    "canonical_transition_id": transition_id,
+                    "fresh_audit_receipts": self._semantic_audit_receipts(event),
+                    "authority_sync_status": AUTHORITY_SYNC_IN_SYNC,
+                })
+                if self.lifecycle.phase is LifecyclePhase.RUNNING:
+                    self.lifecycle.transition(
+                        LifecyclePhase.DRAINING_EPOCH,
+                        reason="historical reconciliation applied",
+                    )
+                self.scheduler_stop_reason = "historical reconciliation applied"
             if bridge is not None:
                 self.store.append("REPRESENTATION_BRIDGE_TRUSTED", {
                     "candidate_fingerprint": fingerprint,
@@ -11200,6 +11639,20 @@ def build_mock_full_cycle_backend(
         worker_result_type = "PROOF"
         worker_finding = "deterministic mock proof"
     is_math = domain == "math-research"
+    semantic_required_files = (
+        ["claims/CLAIMS.md", *([str(evidence_path)] if evidence_path else [])]
+        if semantic_bridge_ids else []
+    )
+    semantic_input_closure = (
+        {
+            "canonical_object_id": "object:accepted-input",
+            "target_representation_id": RepresentationContract.legacy().representation_id,
+            "required_bridge_ids": semantic_bridge_ids,
+            "required_source_ids": [],
+            "source_bindings": [],
+        }
+        if semantic_bridge_ids else None
+    )
     director_plan = {
         "assessment": (
             "Toy lifecycle should test concurrent proof and falsification."
@@ -11216,7 +11669,8 @@ def build_mock_full_cycle_backend(
                 ),
                 "why_now": "exercise candidate and audit lifecycle", "dependencies": [],
                 "expected_information_gain": "HIGH", "research_impact": "HIGH",
-                "estimated_cost_tier": "LOW", "required_files": [],
+                "estimated_cost_tier": "LOW", "required_files": semantic_required_files,
+                "input_closure": semantic_input_closure,
                 "stop_conditions": [
                     "produce a proof candidate or exact flaw"
                     if is_math else
@@ -11239,7 +11693,8 @@ def build_mock_full_cycle_backend(
                 ),
                 "why_now": "independent adversarial lane", "dependencies": [],
                 "expected_information_gain": "HIGH", "research_impact": "MEDIUM",
-                "estimated_cost_tier": "LOW", "required_files": [],
+                "estimated_cost_tier": "LOW", "required_files": semantic_required_files,
+                "input_closure": semantic_input_closure,
                 "stop_conditions": ["check n=0 through 20 exactly"],
                 "priority": 0.8,
                 "route_family": "independent", "modifies_code": False,

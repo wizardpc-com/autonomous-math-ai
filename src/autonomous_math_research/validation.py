@@ -9,8 +9,10 @@ from .claim_graph import ClaimGraph
 from .canonical_transition import CanonicalTransitionStore
 from .config import DEFAULT_PROTECTED, load_config
 from .models import TrustStatus
+from .mechanical import attest_mechanical_host_capability
 from .policy import build_policy_manifest
 from .project import ProjectManifest
+from .reconciliation import ReconciliationStore
 from .resources import schema_resource
 from .schema import preflight_output_schema_files
 from .semantic_alignment import (
@@ -127,6 +129,14 @@ def validate_project(
         layout.trusted_state_path.read_text(encoding="utf-8")
     )
     policy = build_policy_manifest(config)
+    worker_policy = config.raw["policy"]["one_shot_compute_worker"]
+    mechanical_capability = attest_mechanical_host_capability(
+        declared=bool(worker_policy.get("enabled", False)),
+        selection_mode=str(
+            (worker_policy.get("selection_policy") or {}).get("mode")
+            or "preferred"
+        ),
+    )
     validation_authority_head = build_validation_authority_head(
         audit_config=dict(config.raw["audit"]),
         policy_manifest_sha256=str(policy["manifest_sha256"]),
@@ -175,6 +185,10 @@ def validate_project(
         claim_graph=graph,
         validation_authority_head=validation_authority_head,
     )
+    reconciliation_result = ReconciliationStore(
+        project_root=root,
+        runtime_root=layout.autonomous_root,
+    ).summary(transition_store=transition_store)
     final_claim = graph.claims[manifest.final_claim_id]
     if (
         semantic_alignment.present
@@ -228,6 +242,7 @@ def validate_project(
         "policy_manifest_sha256": policy["manifest_sha256"],
         "mechanical_primary": policy["one_shot_compute_worker"]["primary_route"],
         "mechanical_fallback": policy["one_shot_compute_worker"]["fallback_route"],
+        "mechanical_capability": mechanical_capability,
         "config_schema_version": config.raw["schema_version"],
         "config_profile": config.profile_name,
         "providers": sorted(config.raw["providers"]),
@@ -235,5 +250,6 @@ def validate_project(
         "protected_files": len(protected),
         "model_turns_started": 0,
         "semantic_alignment": semantic_result,
+        "reconciliation": reconciliation_result,
         **strict_result,
     }

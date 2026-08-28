@@ -7,6 +7,7 @@ from hashlib import sha256
 from importlib.metadata import entry_points
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import signal
@@ -107,6 +108,44 @@ _PROOF_DIRECTIVE_MARKERS = (
     "prove the", "prove that", "disprove", "construct a proof",
     "证明该", "证明此", "证明命题", "给出证明", "构造证明", "证伪命题",
 )
+
+
+def attest_mechanical_host_capability(
+    *,
+    declared: bool,
+    selection_mode: str,
+    host_system: str | None = None,
+    test_or_injected_runner: bool = False,
+) -> dict[str, Any]:
+    system = str(host_system or platform.system()).casefold()
+    enabled = bool(declared and selection_mode != "disabled")
+    if not enabled:
+        return {
+            "declared": bool(declared),
+            "runtime_available": False,
+            "reason": "disabled_by_configuration",
+            "host_system": system,
+        }
+    if test_or_injected_runner:
+        return {
+            "declared": True,
+            "runtime_available": True,
+            "reason": "injected_or_mock_runner",
+            "host_system": system,
+        }
+    if system == "windows":
+        return {
+            "declared": True,
+            "runtime_available": False,
+            "reason": "windows_split_filesystem_sandbox_unenforceable",
+            "host_system": system,
+        }
+    return {
+        "declared": True,
+        "runtime_available": True,
+        "reason": "native_split_filesystem_sandbox_supported",
+        "host_system": system,
+    }
 
 
 def _contains_proof_directive(text: str, marker: str) -> bool:

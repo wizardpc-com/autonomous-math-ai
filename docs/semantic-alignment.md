@@ -144,6 +144,31 @@ their normal domain audit and canonical gates, but Semantic Alignment v1 does
 not claim that the positive validator-to-claim path entails a refutation. They
 therefore do not receive `VERIFIED` from this positive bridge contract.
 
+## Historical trusted-core reconciliation
+
+Reliable proof and independent-audit artifacts produced outside the current
+controller may be staged with `amr reconcile stage`. Staging is append-only and
+does not change ClaimGraph or trusted state. `amr reconcile apply` revalidates
+the exact target and semantic binding, registers a sealed candidate, and runs a
+fresh controller-owned audit. A positive result writes its verification receipt,
+terminal binding, ClaimGraph update, trusted state, and applied marker in one
+canonical transaction. Terminal claims, one named proof obligation, and narrow
+derived subclaims use the same path. Reapplying a committed reconciliation is a
+zero-model no-op, and incomplete prepared transactions use normal canonical
+crash recovery.
+
+An unapplied stage is a claim-local authority-drift gate. Director admission and
+final dispatch reject ordinary research for that affected claim while leaving
+unrelated frontier claims available. Historical audit text is evidence for the
+fresh audit; it never serves as the fresh receipt itself.
+
+The bundle is an exact JSON object with `schema_version`, `kind`,
+`target_claim_id`, nullable `target_obligation_id`, a standard candidate-event
+object, and nonempty `historical_proof_paths` and `historical_audit_paths` arrays.
+`kind` is `TERMINAL_CLAIM`, `PARTIAL_OBLIGATION`, or
+`NARROW_DERIVED_SUBCLAIM`. Paths are project-relative POSIX paths or portable
+AMR URIs; staging hashes them and rejects missing or escaping files.
+
 ## Legacy projects
 
 If the file has never been supplied, validation and campaigns continue with

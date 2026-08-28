@@ -17,6 +17,8 @@ from .. import __version__
 from ..app_server import AppServerClient
 from ..catalog import rebuild_catalog
 from ..capabilities import inspect_generated_schema
+from ..canonical_transition import CanonicalTransitionStore
+from ..claim_graph import ClaimGraph
 from ..config import CONFIG_SCHEMA_VERSION, default_max_audit, load_config
 from ..controller import (
     NEXT_EPOCH_FRONTIER_READY_REASON,
@@ -34,6 +36,7 @@ from ..models import CandidateEvent
 from ..monitor import build_status, format_status, resolve_run, watch_run
 from ..policy import discover_policy_packs
 from ..project import ProjectManifest
+from ..reconciliation import ReconciliationStore
 from ..resources import policy_resource, schema_resource
 from ..smoke import (
     FULL_LIFECYCLE_SMOKE_BUDGET,
@@ -43,6 +46,7 @@ from ..smoke import (
     run_real_smoke,
 )
 from ..schema import load_schema, validate
+from ..semantic_alignment import SEMANTICS_FILENAME, SemanticAlignment, SemanticTrustState
 from ..storage import ProjectLayout, atomic_write_json, file_digest, read_jsonl
 from ..storage.artifacts import PORTABLE_SCHEMES, portable_project_uri
 from ..storage.steering import append_steering, ingest_asset
@@ -163,6 +167,25 @@ def build_parser() -> argparse.ArgumentParser:
             f"built-in {DEFAULT_CAMPAIGN_HOURS:g})"
         ),
     )
+
+    reconcile = sub.add_parser(
+        "reconcile", help="stage, inspect, or apply historical trusted-core evidence",
+    )
+    reconcile_sub = reconcile.add_subparsers(
+        dest="reconcile_command", required=True,
+    )
+    reconcile_stage = reconcile_sub.add_parser("stage")
+    reconcile_stage.add_argument("--project", type=Path, required=True)
+    reconcile_stage.add_argument("--bundle", type=Path, required=True)
+    reconcile_inspect = reconcile_sub.add_parser("inspect")
+    reconcile_inspect.add_argument("--project", type=Path, required=True)
+    reconcile_inspect.add_argument("--id")
+    reconcile_apply = reconcile_sub.add_parser("apply")
+    reconcile_apply.add_argument("--project", type=Path, required=True)
+    reconcile_apply.add_argument("--id", required=True)
+    reconcile_apply.add_argument("--workspace-root", type=Path)
+    reconcile_apply.add_argument("--profile", type=Path)
+    reconcile_apply.add_argument("--hours", type=float)
     run.add_argument(
         "--epoch-hours", type=float,
         help=(
@@ -798,6 +821,78 @@ async def _probe_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reconciliation_context(project: Path):
+    root = project.resolve()
+    layout = ProjectLayout(root)
+    transitions = CanonicalTransitionStore(
+        project_root=root, runtime_root=layout.autonomous_root,
+    )
+    transitions.recover()
+    graph = ClaimGraph.load(layout.claim_graph_path)
+    trusted = json.loads(layout.trusted_state_path.read_text(encoding="utf-8"))
+    trust = SemanticTrustState.from_trusted_payload(trusted)
+    alignment = SemanticAlignment.load_optional(
+        root,
+        layout.autonomous_root / SEMANTICS_FILENAME,
+        required=trust.opted_in,
+    )
+    store = ReconciliationStore(
+        project_root=root, runtime_root=layout.autonomous_root,
+    )
+    return root, layout, graph, alignment, store, transitions
+
+
+async def _reconcile_apply(args: argparse.Namespace) -> int:
+    root, _, _, _, store, transitions = _reconciliation_context(args.project)
+    stage = store.get(args.id)
+    marker = store.applied_marker(stage.reconciliation_id)
+    if marker is not None:
+        store.summary(transition_store=transitions)
+        print(json.dumps({
+            "reconciliation_id": stage.reconciliation_id,
+            "authority_sync_status": "IN_SYNC",
+            "applied": False,
+            "idempotent_no_op": True,
+            "model_turns_started": 0,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    config = load_config(
+        root,
+        workspace_root=args.workspace_root,
+        require_manifest=True,
+        profile_path=args.profile,
+    )
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    hours = float(config.epoch_hours if args.hours is None else args.hours)
+    if hours <= 0:
+        raise ValueError("--hours must be positive")
+    controller = AutonomousController(
+        config,
+        run_id=run_id,
+        reconciliation_id=stage.reconciliation_id,
+        campaign_id=run_id,
+        campaign_hours=hours,
+        epoch_hours=hours,
+    )
+    result = await controller.run(hours)
+    transitions.recover()
+    summary = store.summary(transition_store=transitions)
+    status = summary["claim_status"].get(stage.affected_claim_id, "IN_SYNC")
+    payload = {
+        "reconciliation_id": stage.reconciliation_id,
+        "authority_sync_status": status,
+        "applied": status == "IN_SYNC",
+        "idempotent_no_op": False,
+        "run_id": result.run_id,
+        "report": str(result.report_path) if result.report_path.is_file() else None,
+        "stopped_reason": result.stopped_reason,
+        "jobs_started": result.jobs_started,
+        "internal_failure": result.internal_failure,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if status == "IN_SYNC" and not result.internal_failure else 2
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     _configure_console_encoding()
     args = build_parser().parse_args(argv)
@@ -880,6 +975,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             "effective_config": explanation["effective_config"],
             "model_turns_started": 0,
             }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "reconcile":
+        try:
+            root, _, graph, alignment, store, transitions = (
+                _reconciliation_context(args.project)
+            )
+            if args.reconcile_command == "stage":
+                bundle = json.loads(args.bundle.read_text(encoding="utf-8"))
+                stage, appended = store.stage(
+                    bundle,
+                    claim_graph=graph,
+                    semantic_alignment=alignment,
+                )
+                payload = {
+                    **stage.to_dict(),
+                    "staged": appended,
+                    "idempotent_no_op": not appended,
+                    "authority_sync_status": "RECONCILIATION_REQUIRED",
+                    "model_turns_started": 0,
+                }
+            elif args.reconcile_command == "inspect":
+                payload = store.summary(transition_store=transitions)
+                if args.id is not None:
+                    payload = next(
+                        item for item in payload["stages"]
+                        if item["reconciliation_id"] == args.id
+                    )
+                payload = {**payload, "model_turns_started": 0}
+            else:
+                return asyncio.run(_reconcile_apply(args))
+        except (ValueError, OSError, StopIteration, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                "valid": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "model_turns_started": 0,
+            }, ensure_ascii=False, indent=2))
+            return 2
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "launcher":

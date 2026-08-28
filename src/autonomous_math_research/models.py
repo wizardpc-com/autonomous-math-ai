@@ -166,6 +166,7 @@ class ResearchTask:
     route_family: str = "main"
     modifies_code: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    input_closure: dict[str, Any] | None = None
     representation: dict[str, Any] = field(
         default_factory=lambda: RepresentationContract.legacy().to_dict()
     )
@@ -188,6 +189,7 @@ class ResearchTask:
         route_family: str = "main",
         modifies_code: bool = False,
         metadata: dict[str, Any] | None = None,
+        input_closure: dict[str, Any] | None = None,
         representation: dict[str, Any] | None = None,
         *,
         mathematical_impact: str | None = None,
@@ -220,6 +222,9 @@ class ResearchTask:
         self.route_family = route_family
         self.modifies_code = modifies_code
         self.metadata = {} if metadata is None else dict(metadata)
+        self.input_closure = (
+            None if input_closure is None else dict(input_closure)
+        )
         self.representation = (
             RepresentationContract.legacy().to_dict()
             if representation is None else representation
@@ -261,6 +266,7 @@ class ResearchTask:
         normalized["research_impact"] = impact
         normalized.pop("mathematical_impact", None)
         normalized.setdefault("output_contract", "worker_result.schema.json")
+        normalized.setdefault("input_closure", None)
         normalized.setdefault("representation", RepresentationContract.legacy().to_dict())
         representation = RepresentationContract.from_dict(normalized["representation"])
         normalized["representation"] = representation.to_dict()
@@ -293,6 +299,7 @@ class ResearchTask:
             "exact_objective": " ".join(self.exact_objective.split()),
             "dependencies": sorted(self.dependencies),
             "required_files": sorted(self.required_files),
+            "input_closure": self.input_closure,
             "representation_id": self.representation_id,
         })
 

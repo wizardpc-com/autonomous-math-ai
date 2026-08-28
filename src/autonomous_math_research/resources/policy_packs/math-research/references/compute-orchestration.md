@@ -44,6 +44,10 @@ research role. Keep unified-context strategy in the parent. Prefer the
 controller broker for finite enumeration, data normalization, formula
 expansion, code preparation, deterministic reproduction, and artifact checks
 whenever the packet and acceptance conditions are mechanical.
+If controller capability attestation marks the mechanical sandbox unavailable,
+the broker is prohibited rather than downgraded. For a finite exact task with a
+fixed algorithm, prefer a frozen Experiment Runner manifest; otherwise retain the
+work in a research role or repair the missing execution preconditions.
 
 ## Explorer
 

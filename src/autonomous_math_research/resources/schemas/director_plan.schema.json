@@ -10,7 +10,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["task_id", "role", "target_claim", "exact_objective", "why_now", "dependencies", "expected_information_gain", "research_impact", "estimated_cost_tier", "required_files", "stop_conditions", "priority", "route_family", "modifies_code", "metadata", "representation"],
+        "required": ["task_id", "role", "target_claim", "exact_objective", "why_now", "dependencies", "expected_information_gain", "research_impact", "estimated_cost_tier", "required_files", "stop_conditions", "priority", "route_family", "modifies_code", "metadata", "input_closure", "representation"],
         "properties": {
           "task_id": {"type": "string", "description": "Stable task-content binding within the epoch. Do not reuse an active or pending id; changed task content requires a new id."},
           "role": {"type": "string", "enum": ["prover", "falsifier", "explorer"]},
@@ -35,6 +35,29 @@
               "independent_exploration": {
                 "type": "boolean",
                 "description": "True only for a genuinely differentiated route that satisfies a reserved independent-exploration slot. The explorer role alone does not satisfy the reserve."
+              }
+            }
+          },
+          "input_closure": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["canonical_object_id", "target_representation_id", "required_bridge_ids", "required_source_ids", "source_bindings"],
+            "properties": {
+              "canonical_object_id": {"type": ["string", "null"]},
+              "target_representation_id": {"type": "string"},
+              "required_bridge_ids": {"type": "array", "items": {"type": "string"}},
+              "required_source_ids": {"type": "array", "items": {"type": "string"}},
+              "source_bindings": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["source_id", "path"],
+                  "properties": {
+                    "source_id": {"type": "string"},
+                    "path": {"type": "string"}
+                  }
+                }
               }
             }
           },

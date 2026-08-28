@@ -8,6 +8,18 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Historical trusted-core reconciliation now stages external proof/audit
+  evidence append-only and applies terminal claims, named proof obligations, or
+  narrow derived subclaims only through fresh controller audit, semantic receipt,
+  terminal binding, and one atomic canonical transition. Applied imports are
+  crash-replayable and idempotent.
+- Claim-local reconciliation drift and deterministic pre-dispatch input closure
+  now reject ordinary affected-claim research before a model starts, reporting
+  exact missing canonical object, bridge, source, or localizer ids.
+- Validation and startup now attest mechanical sandbox capability. Production
+  Windows hosts fail closed when split filesystem isolation cannot be enforced;
+  finite fixed-method exact work is routed toward Experiment Runner instead.
+
 - The Windows launcher now detects the newest real or mock campaign that still
   has budget and offers `Continue previous`. It routes unsealed epochs through
   pinned `run --resume` recovery and sealed checkpoints through `campaign
