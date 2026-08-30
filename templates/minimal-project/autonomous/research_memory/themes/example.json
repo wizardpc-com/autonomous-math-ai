@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "theme_id": "example-exact-scope",
+  "title": "Example exact-scope campaign",
+  "objective": "Resolve only the declared example obligation.",
+  "include_claim_ids": [],
+  "include_scope_ids": ["C_ROOT::EXAMPLE-SCOPE"],
+  "exclude_claim_ids": [],
+  "exclude_scope_ids": [],
+  "allowed_method_ids": [],
+  "forbidden_method_ids": [],
+  "dependency_boundary": ["C_ROOT"],
+  "combination_scope": "Do not combine beyond this exact example scope.",
+  "obligations": [
+    {
+      "scope_id": "C_ROOT::EXAMPLE-SCOPE",
+      "claim_id": "C_ROOT",
+      "exact_objective": "Replace this placeholder with one exact obligation.",
+      "representation_id": null,
+      "dependencies": [],
+      "allowed_method_ids": [],
+      "forbidden_method_ids": []
+    }
+  ]
+}

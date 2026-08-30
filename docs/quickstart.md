@@ -20,13 +20,17 @@ A source checkout includes [`../amr-launcher.cmd`](../amr-launcher.cmd). It is a
 generic bootstrap: do not add project paths or research settings to it. On first
 use, enter a workspace root. The launcher remembers only this root in the user
 LOCALAPPDATA directory and scans Git-visible `autonomous/project.json` files on
-every start. You can also use `amr launcher` from an installed package.
+every start. It reuses the installed harness unless `AMR_REFRESH_HARNESS=1` is
+set, and refuses that explicit refresh while any process uses the shared virtual
+environment. You can also use `amr launcher` from an installed package.
 
 The selected project's manifest points to its single persistent
 `autonomous/config.yaml`. Before dry-run, mock, or real execution, the launcher
 shows a redacted summary. Common numbered edits and allowed
 `dotted.path=JSON-value` inputs create a temporary profile; they never rewrite
-the project. If a real or mock campaign is unfinished and still has budget, the
+the project. Enter `fast` at the parameter prompt to proceed with a one-run-only
+`execution.fast_mode=true` profile; real launches still require the exact
+`RUN <project_id>` confirmation. If a real or mock campaign is unfinished and still has budget, the
 menu shows the newest one as `Continue previous`. It uses pinned resume for an
 unsealed epoch and checkpoint continuation for a sealed epoch. A real run
 requires `RUN <project_id>` and a real continuation requires

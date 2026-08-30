@@ -124,6 +124,7 @@ CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超
 项目目前处于 alpha 阶段。真实 campaign 前请阅读[快速开始](docs/quickstart.zh-CN.md)、
 [配置文档](docs/configuration.zh-CN.md)、[Provider 文档](docs/providers.zh-CN.md)、
 [架构](docs/architecture.md)、[可信模型](docs/trust-model.md)、
+[不可变研究记录与评估 telemetry](docs/research-records.md)、
 [研究域与 policy pack](docs/research-domains.md)、
 [确定性 Experiment Runner](docs/experiment-runner.md)以及[安全策略](SECURITY.md)。
 
@@ -132,7 +133,8 @@ CPU/系统资源、provider rate limit、256 深度队列、dispatch batch、超
 双击 [`amr-launcher.cmd`](amr-launcher.cmd)，或在安装后运行 `amr launcher`。这个通用
 入口不保存项目名称、项目路径或研究配置。首次使用时输入工作区根目录；入口只把该选择
 保存到 `%LOCALAPPDATA%\autonomous-math-ai\launcher.json`，以后每次重新扫描 Git 可见的
-`autonomous/project.json`。
+`autonomous/project.json`。bootstrap 默认复用已安装 harness。只有在共享虚拟环境的所有
+进程均已停止后才能设置 `AMR_REFRESH_HARNESS=1`；虚拟环境仍被占用时刷新会 fail-closed。
 
 选择项目后可执行 validate、strict、脱敏配置查看、dry-run、mock，以及需要输入
 `RUN <project_id>` 的真实运行。持久设置只放在 manifest 指定的

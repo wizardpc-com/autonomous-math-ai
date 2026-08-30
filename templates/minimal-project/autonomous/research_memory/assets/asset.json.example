@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "asset_id": "replace-with-stable-asset-id",
+  "kind": "LEMMA",
+  "title": "Replace with a short asset title",
+  "what_it_gives": "Replace with the exact reusable statement or capability.",
+  "scope_ids": [],
+  "claim_ids": ["C_ROOT"],
+  "representation_ids": [],
+  "preconditions": [],
+  "do_not_use": [],
+  "inputs": [],
+  "outputs": [],
+  "proof_refs": [],
+  "code_refs": [],
+  "certificate_refs": [],
+  "source_refs": [],
+  "audit": {
+    "status": "UNAUDITED",
+    "verdict": null,
+    "independent": false,
+    "auditor": null,
+    "audit_level": "RESULT",
+    "policy_version": "result-audit-v1",
+    "report_refs": [],
+    "reuse_audit_key": null
+  },
+  "known_failure_modes": [],
+  "dependencies": [],
+  "method_id": null,
+  "do_not_repeat": [],
+  "reopen_if": [],
+  "representation_edge": null,
+  "provenance": {
+    "producer": "replace-with-producer",
+    "origin": "manual",
+    "produced_at": "replace-with-ISO-8601-time",
+    "lineage": []
+  },
+  "supersedes": []
+}

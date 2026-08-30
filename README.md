@@ -47,9 +47,13 @@ output as trusted truth.
   repair turn; turn/token boundaries checkpoint the task for the next epoch.
   Provider quota exhaustion pauses and preserves work without counting as
   mathematical failure or stagnation.
-- **Canonical research frontier:** math proof obligations and non-math domain
-  frontiers live in `ClaimGraph`; only audited canonical progress can close a
-  frontier or reset stagnation.
+- **Separated routing and authority truth:** the rebuildable Audited Frontier
+  decides what may be researched now, while `ClaimGraph` and controller receipts
+  remain the only authority truth. An exact independently audited external result
+  may suppress duplicate routing without promoting a theorem.
+- **Shared research memory:** content-addressed Asset, Representation, Method,
+  and Audit registries provide progressive reuse across autonomous, web, manual,
+  and Codex research threads without treating chat memory as state.
 - **Pinned domain semantics:** a run selects one strictly validated bundled
   policy pack, snapshots its role policy and domain contract, and fails closed
   on missing, modified, or cross-domain state.
@@ -144,13 +148,31 @@ amr reconcile apply --project ./research-target --id reconciliation-...
 The second successful `apply` is a zero-model no-op. See
 [Semantic Alignment](docs/semantic-alignment.md) for the bundle and trust gates.
 
+External Result Audit artifacts and reusable research assets use the separate
+noncanonical coordination path:
+
+```console
+amr frontier rebuild --project ./research-target --theme autonomous/research_memory/themes/example.json
+amr frontier inspect --project ./research-target
+amr frontier context --project ./research-target --claim C_ROOT --scope C_ROOT::EXAMPLE-SCOPE
+```
+
+Every real campaign performs the same reconciliation before model startup and
+again while sealing its final delta. See [Audited Frontier and shared research
+memory](docs/research-memory.md). New epochs also produce [immutable research
+records and evaluation telemetry](docs/research-records.md); use `--purpose` to
+separate development, natural research, and frozen evaluation data.
+
 ### Windows one-file launcher
 
 Double-click [`amr-launcher.cmd`](amr-launcher.cmd), or run `amr launcher` after
 installation. The generic launcher never contains a project name, project path,
 or research configuration. On first use it asks for a workspace root and stores
 only that choice in `%LOCALAPPDATA%\autonomous-math-ai\launcher.json`; every
-launch rescans Git-visible `autonomous/project.json` manifests.
+launch rescans Git-visible `autonomous/project.json` manifests. The bootstrap
+reuses the installed harness by default. Set `AMR_REFRESH_HARNESS=1` only after
+every process using the shared virtual environment has stopped; refresh fails
+closed while that environment is in use.
 
 After choosing a project, the menu offers validation, strict validation,
 redacted configuration, dry-run, mock, and a separately confirmed real run.
@@ -220,11 +242,12 @@ written. `RUN_STOPPED` is committed only after that derived artifact set is
 durable. Ctrl+C records a structured interruption and cannot enter the next
 automatic epoch.
 
-The Director's falsification, representation-bridge, audit, kill-gate, and route
-novelty rules live in AMR. A project `director.md` is an optional stable
-constraints overlay, not a frontier source. The Director receives a
-controller-owned compatibility view for claim
-representations and audited bridges. If every proposed task fails semantic
+The Director's falsification, representation-bridge, audit, kill-gate, Theme,
+asset-reuse, and route novelty rules live in AMR. A project `director.md` is an
+optional stable constraints overlay, not a frontier source. The Director receives
+the current Audited Frontier, pinned Campaign Theme, minimal relevant Asset
+bundle, and controller-owned compatibility view. Routing-only external bridges
+never authorize canonical promotion. If every proposed task fails semantic
 admission, route bookkeeping is retained and the controller requests one bounded
 repair plan. A second plan with no runnable research or audit work pauses the
 campaign cleanly; route updates alone never keep an empty execution queue alive.
@@ -277,6 +300,7 @@ usage as a lower bound when any mechanical attempt lacks complete telemetry.
 - [Provider adapters](docs/providers.md)
 - [Architecture](docs/architecture.md)
 - [Trust model](docs/trust-model.md)
+- [Immutable research records and evaluation telemetry](docs/research-records.md)
 - [Research domains and policy packs](docs/research-domains.md)
 - [Semantic alignment and representation bridges](docs/semantic-alignment.md)
 - [Deterministic Experiment Runner](docs/experiment-runner.md)

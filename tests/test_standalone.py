@@ -55,7 +55,7 @@ class StandalonePackageTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
             build_parser().parse_args(["--version"])
         self.assertEqual(stopped.exception.code, 0)
-        self.assertEqual(output.getvalue().strip(), "amr 0.2.14")
+        self.assertEqual(output.getvalue().strip(), "amr 0.2.15")
 
     def test_init_and_validate_arbitrary_external_project(self) -> None:
         self._init()
@@ -448,7 +448,7 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertEqual(Path(mechanical_package.__file__).parent.name, "mechanical")
         self.assertEqual(Path(protocol_package.__file__).parent.name, "protocol")
         self.assertEqual(Path(storage_package.__file__).parent.name, "storage")
-        self.assertEqual(protocol_package.OUTPUT_PROTOCOL_VERSION, 2)
+        self.assertEqual(protocol_package.OUTPUT_PROTOCOL_VERSION, 3)
         self.assertIs(legacy_storage.ArtifactStore, storage_package.ArtifactStore)
 
     def test_public_distribution_metadata_and_cli_are_stable(self) -> None:
@@ -575,7 +575,11 @@ class StandalonePackageTests(unittest.TestCase):
         self.assertNotIn("AMR_PROJECT_ROOT=", text)
         self.assertNotIn("AMR_PROFILE=", text)
         self.assertIn('set "AMR_HARNESS_ROOT=%~dp0."', text)
-        self.assertIn('if not defined AMR_REFRESH_HARNESS set "AMR_REFRESH_HARNESS=1"', text)
+        self.assertIn('if not defined AMR_REFRESH_HARNESS set "AMR_REFRESH_HARNESS=0"', text)
+        self.assertNotIn('if not defined AMR_REFRESH_HARNESS set "AMR_REFRESH_HARNESS=1"', text)
+        self.assertIn("call :ensure_venv_idle", text)
+        self.assertIn("Get-Process -ErrorAction SilentlyContinue", text)
+        self.assertIn("Refusing to install or upgrade", text)
         self.assertIn('"%AMR_EXE%" launcher %*', text)
         self.assertNotRegex(text, r"sk-[A-Za-z0-9_-]{16,}")
         self.assertNotIn("OPENAI_API_KEY=", text)

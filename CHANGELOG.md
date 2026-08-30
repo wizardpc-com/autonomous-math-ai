@@ -8,6 +8,31 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Immutable schema-v14 run records now freeze campaign purpose, target and AMR
+  revisions, dirty-state/input roots, Theme, Frontier-before, ClaimGraph,
+  reusable-asset/representation/kill-gate snapshots, configuration, runtime,
+  models, and budgets. Content-addressed terminal records append Frontier-after,
+  schema-v2 deltas, exact result identities, end time, and deterministic metrics.
+- Director admission, dispatch suppression, asset retrieval/use, AuditKey
+  hit/miss and savings, per-job cost, and orthogonal research-outcome telemetry
+  are structured events. Output Protocol v3 requires explicit used/rejected and
+  cited asset accounting without changing canonical authority.
+- `amr record inspect|replay-context|metrics` verifies frozen bytes and rebuilds
+  the external decision context. Older run manifests remain untouched and are
+  exposed through an explicitly partial legacy normalized view.
+
+- A content-addressed Audited Frontier now rebuilds at real campaign start and
+  end from ClaimGraph, trusted state, project evidence inventory, structured
+  external results, exact routing audit receipts, and the pinned Campaign Theme.
+  Routing suppression is explicitly separate from canonical authority.
+- The shared Research Asset Registry, Representation Graph, Method Ledger, and
+  deterministic AuditKey index support progressive theorem/bridge/tool/verifier
+  reuse, exact-scope kill gates, audit deduplication, and minimal context bundles
+  across autonomous and external research threads.
+- `amr frontier rebuild|inspect|context` validates and exposes this routing-only
+  coordination state. `amr run --theme` pins include/exclude scopes, method and
+  dependency boundaries, combination scope, and exact obligations for the full
+  campaign.
 - Historical trusted-core reconciliation now stages external proof/audit
   evidence append-only and applies terminal claims, named proof obligations, or
   narrow derived subclaims only through fresh controller audit, semantic receipt,
@@ -25,6 +50,10 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pinned `run --resume` recovery and sealed checkpoints through `campaign
   continue`, preserves the prior execution mode, enables safe cross-epoch
   continuation, and opens the monitor on the exact resumed or reserved run ID.
+- Entering `fast` at the launcher parameter prompt now creates a one-run-only
+  `execution.fast_mode=true` profile and proceeds to execution. Real launches
+  retain their exact project confirmation, and unsupported Fast routes fail
+  closed during configuration preflight.
 
 ### Fixed
 

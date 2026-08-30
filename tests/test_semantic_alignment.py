@@ -2181,6 +2181,16 @@ class SemanticAlignmentTests(unittest.TestCase):
             controller._input_closure_missing_ids(task),
             sorted(["object:accepted-input", *BRIDGES]),
         )
+        repair = controller._semantic_input_closure_repair(task)
+        self.assertEqual(repair["canonical_object_id"], "object:accepted-input")
+        self.assertEqual(
+            repair["target_representation_id"], LEGACY_REPRESENTATION.representation_id
+        )
+        self.assertEqual(repair["representation"], LEGACY_REPRESENTATION.to_dict())
+        self.assertEqual(repair["required_bridge_ids"], BRIDGES)
+        self.assertEqual(
+            repair["required_semantic_files"], sorted(["claims/CLAIMS.md", EVIDENCE])
+        )
         task.required_files = ["claims/CLAIMS.md", EVIDENCE]
         self.assertEqual(controller._input_closure_missing_ids(task), [])
         task.input_closure = {

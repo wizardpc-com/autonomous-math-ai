@@ -2,13 +2,27 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["result_type", "main_finding", "status", "artifact_paths", "next_suggested_question", "evidence_level"],
+  "required": ["result_type", "main_finding", "status", "artifact_paths", "next_suggested_question", "evidence_level", "asset_usage"],
   "properties": {
     "result_type": {"type": "string", "enum": ["PROOF", "COUNTEREXAMPLE", "STRICT_REDUCTION", "NEW_OBSTRUCTION", "NEW_DETECTOR", "STRONGER_COMPUTATION", "DEPENDENCY_CHANGE", "COMPUTATIONAL_PATTERN", "CHECKER_RESULT", "CERTIFICATE", "EXPERIMENT_RESULT", "EMPIRICAL_FINDING", "NO_PROGRESS", "BLOCKED", "TOOL_ERROR"]},
     "main_finding": {"type": "string"},
     "status": {"type": "string"},
     "artifact_paths": {"type": "array", "items": {"type": "string"}},
     "next_suggested_question": {"type": "string"},
-    "evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]}
+    "evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]},
+    "asset_usage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset_id", "disposition", "reason", "cited_in_result"],
+        "properties": {
+          "asset_id": {"type": "string"},
+          "disposition": {"type": "string", "enum": ["USED", "REJECTED"]},
+          "reason": {"type": "string"},
+          "cited_in_result": {"type": "boolean"}
+        }
+      }
+    }
   }
 }

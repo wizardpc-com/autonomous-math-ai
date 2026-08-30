@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "result_id": "replace-with-stable-result-id",
+  "exact_statement": "Replace with the exact audited statement.",
+  "scope_ids": ["replace-with-exact-obligation-id"],
+  "claim_ids": ["C_ROOT"],
+  "representation_id": "replace-with-representation-id",
+  "dependencies": [],
+  "classification": "UNAUDITED_EXTERNAL_RESULT",
+  "conclusion": "PROVED",
+  "maturity_level": "RESULT",
+  "proof_refs": [],
+  "certificate_refs": [],
+  "source_refs": [],
+  "audit": {
+    "verdict": null,
+    "independent": false,
+    "auditor": null,
+    "audit_level": "RESULT",
+    "policy_version": "result-audit-v1",
+    "report_refs": [],
+    "reuse_audit_key": null
+  },
+  "provenance": {
+    "producer": "replace-with-producer",
+    "origin": "manual",
+    "produced_at": "replace-with-ISO-8601-time",
+    "lineage": []
+  },
+  "supersedes": []
+}

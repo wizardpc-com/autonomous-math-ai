@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "theme_id", "title", "objective", "include_claim_ids",
+    "include_scope_ids", "exclude_claim_ids", "exclude_scope_ids",
+    "allowed_method_ids", "forbidden_method_ids", "dependency_boundary",
+    "combination_scope", "obligations"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "theme_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$"},
+    "title": {"type": "string", "minLength": 1},
+    "objective": {"type": "string", "minLength": 1},
+    "include_claim_ids": {"$ref": "#/$defs/strings"},
+    "include_scope_ids": {"$ref": "#/$defs/strings"},
+    "exclude_claim_ids": {"$ref": "#/$defs/strings"},
+    "exclude_scope_ids": {"$ref": "#/$defs/strings"},
+    "allowed_method_ids": {"$ref": "#/$defs/strings"},
+    "forbidden_method_ids": {"$ref": "#/$defs/strings"},
+    "dependency_boundary": {"$ref": "#/$defs/strings"},
+    "combination_scope": {"type": "string", "minLength": 1},
+    "obligations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope_id", "claim_id", "exact_objective", "representation_id", "dependencies", "allowed_method_ids", "forbidden_method_ids"],
+        "properties": {
+          "scope_id": {"type": "string", "minLength": 1},
+          "claim_id": {"type": ["string", "null"]},
+          "exact_objective": {"type": "string", "minLength": 1},
+          "representation_id": {"type": ["string", "null"]},
+          "dependencies": {"$ref": "#/$defs/strings"},
+          "allowed_method_ids": {"$ref": "#/$defs/strings"},
+          "forbidden_method_ids": {"$ref": "#/$defs/strings"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "strings": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  }
+}

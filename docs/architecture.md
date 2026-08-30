@@ -8,7 +8,7 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 ## Package boundaries
 
 - `engine/` controls dynamic admission and scheduling pressure.
-- `protocol/` exposes Output Protocol v2 contracts, error classes, and schema
+- `protocol/` exposes Output Protocol v3 contracts, error classes, and schema
   compatibility preflight.
 - `lifecycle/` owns monotone phases, campaign/epoch state, audit leases, and
   derived cognitive views.
@@ -116,6 +116,12 @@ byte-exact run-local snapshots
 canonical_state.json
     │ drift/integrity gate
     ▼
+structured external result + asset manifests
+    │ exact paths/hashes + routing-only independent audit receipts
+    ▼
+Audited Frontier + Campaign Theme + relevant Asset bundle
+    │ no ClaimGraph or trusted-state mutation
+    ▼
 compact_snapshot + CORE_CAPSULE + RESEARCH_MAP
     ▼
 fresh Director
@@ -124,9 +130,11 @@ fresh Director
 The run-local `canonical_state.json` freezes each unique canonical input once
 and records its role membership. Director inputs are embedded as UTF-8 content
 in the dynamic snapshot, so the Director does not need to reopen project files.
-The ClaimGraph is loaded into the dynamic snapshot as the sole status and proof-
-frontier authority. Trusted metadata must match its recorded graph digest when
-one is present. Ordinary Markdown remains contextual. A canonical input may
+The ClaimGraph is loaded into the dynamic snapshot as the sole theorem-status
+and authority graph. The independently rebuilt Audited Frontier is routing truth:
+it may suppress an exact independently audited external scope without changing
+ClaimGraph. Trusted metadata must match its recorded graph digest when one is
+present. Ordinary Markdown remains contextual. A canonical input may
 opt into a strict machine state view with one
 `AMR-CANONICAL-STATE-BEGIN`/`END` block; a malformed or nonmatching block stops
 before backend startup. The refresh does not rewrite any of these files or
@@ -274,12 +282,15 @@ The rebuilt snapshot records its attempt, generation, event watermark, and
 canonical/planning hashes. The original absolute epoch deadline remains
 authoritative, so restarting a controller cannot extend an epoch.
 
-### Canonical domain frontier
+### Stable ClaimGraph authority and dynamic routing frontier
 
-For `math-research`, proof obligations live inside each canonical `ClaimGraph`
-claim (schema v3). They have stable content-derived ids, status, dependencies,
-and evidence paths. `proof_frontier` derives `remaining_obligation_ids` and
-`next_obligation_id` from that graph; there is no parallel `proof_state`.
+For `math-research`, mature proof obligations live inside each canonical
+`ClaimGraph` claim (schema v3). They have stable content-derived ids, status,
+dependencies, and evidence paths. `proof_frontier` remains the canonical view of
+those mature obligations; there is no parallel authority state. Small audited
+results, scenario supports, tools, hypotheses, and exact method failures instead
+live in the noncanonical research-memory layer until a Theme Integration Audit
+justifies a stable ClaimGraph transition.
 ClaimGraph also owns the canonical dependency resolver: it normalizes direct
 claim and proof-obligation edges, resolves obligation ids to owning claims, and
 provides the dependency closure consumed by semantic receipts and final gates.
@@ -289,7 +300,8 @@ Legacy v1/v2 math graphs gain a deterministic root/gap obligation on load.
 
 Non-math graphs use `research_frontier` with the pack's `certificate` or
 `empirical_protocol` obligation kind and do not synthesize proof obligations.
-Only an audited canonical transition can change either kind of frontier.
+Only an audited canonical transition can change either kind of ClaimGraph
+authority. Rebuilding Audited Frontier changes routing only.
 
 ClaimGraph schema v3 is also the single machine-readable claim-status source.
 The trusted-state file stores audit provenance and binds to the exact graph
@@ -385,12 +397,14 @@ Incremental Director work is coalesced and debounced behind a version watermark.
 The Director does not wait for all research and audit jobs to drain and cannot
 block their normal dispatch.
 
-Falsification-first ordering, representation bridges, audit gates, route kill
-gates, route novelty, task deduplication, and bounded stop conditions are
+Falsification-first ordering, Campaign Theme boundaries, representation bridges,
+audit gates, exact-scope route kill gates, asset reuse, route novelty, task
+deduplication, and bounded stop conditions are
 tool-level Director policy. `prompts/director.md` is only an optional stable
-project-constraint overlay. The dynamic canonical snapshot has explicit
-precedence over that overlay and every prior planning mirror for current
-frontier, open/closed claims, and recent progress.
+project-constraint overlay. Current routing comes from a new reconciliation of
+ClaimGraph plus structured audited external results, filtered through the pinned
+Theme. The dynamic snapshot has explicit precedence over that overlay and every
+prior planning mirror.
 
 A task id is a stable binding to one task fingerprint within an epoch. The
 controller rejects changed task content that reuses an accepted id and has a
@@ -401,7 +415,10 @@ mechanical broker configuration.
 
 Every Director snapshot includes a controller-owned representation compatibility
 view (claims grouped by representation id, known complete contracts, missing
-contract ids, and independently audited bridge pairs) plus latest route state.
+contract ids, canonical bridge pairs, and routing-only externally audited bridge
+pairs), latest route state, the Campaign Theme, and a minimal relevant Asset
+bundle. A routing bridge can enable investigation but cannot authorize final
+candidate promotion.
 Route updates are durable bookkeeping, not runnable queue work. If semantic
 admission rejects every proposed task and no audit priority is applicable, the
 controller supplies the rejection reasons to one bounded repair turn; retry
@@ -433,12 +450,12 @@ transaction binds its bundle digest, fresh audit, semantic receipt, ClaimGraph,
 and trusted-state update. This makes application idempotent and crash-replayable
 without granting the import command direct ClaimGraph mutation authority.
 
-New `RUN_MANIFEST` records use schema v13 and pin the AMR version and source
+New `RUN_MANIFEST` records use schema v14 and pin the AMR version and source
 digest, Python version, Git revision when available, Codex CLI version, and App
 Server schema/required-protocol digests. AMR source changes fail resume closed.
 A Codex CLI/schema change is accepted only when the required protocol digest is
 unchanged and the compatible change is appended to the epoch events. Schema-v12
-manifests remain resumable under an explicit legacy-provenance event.
+and schema-v13 manifests remain resumable under explicit legacy handling.
 
 Director `required_files` accepts those durable URIs as well as legacy
 project-relative or project-contained absolute paths. The controller resolves

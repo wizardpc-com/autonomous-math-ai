@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_id", "schema_version", "exact_statement", "scope", "math_status", "maturity_level", "evidence_level", "representation_id", "dependencies", "proof_objects", "certificate_objects", "source_objects", "audit_key", "audit_status", "authority_status", "routing_effect", "assets_used", "assets_created", "research_outcome", "producer", "provenance", "cost", "content_sha256"],
+  "properties": {
+    "result_id": {"type": "string"},
+    "schema_version": {"type": "integer", "const": 1},
+    "exact_statement": {"type": "string"},
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_ids", "scope_ids", "route_family", "input_closure"],
+      "properties": {
+        "claim_ids": {"type": "array", "items": {"type": "string"}},
+        "scope_ids": {"type": "array", "items": {"type": "string"}},
+        "route_family": {"type": ["string", "null"]},
+        "input_closure": {"type": ["object", "null"]}
+      }
+    },
+    "math_status": {"type": "string", "enum": ["PROVED", "FALSIFIED", "COMPUTATION_ONLY", "OPEN"]},
+    "maturity_level": {"type": "string", "enum": ["RESULT_CANDIDATE", "AUDITED_RESULT", "VERIFIED_THEME_CLAIM", "FINAL_CONJECTURE_CLOSURE"]},
+    "evidence_level": {"type": "string"},
+    "representation_id": {"type": ["string", "null"]},
+    "dependencies": {"type": "array", "items": {"type": "string"}},
+    "proof_objects": {"$ref": "#/$defs/object_refs"},
+    "certificate_objects": {"$ref": "#/$defs/object_refs"},
+    "source_objects": {"$ref": "#/$defs/object_refs"},
+    "audit_key": {"type": ["string", "null"]},
+    "audit_status": {"type": "string"},
+    "authority_status": {"type": "string"},
+    "routing_effect": {"type": "string"},
+    "assets_used": {"type": "array", "items": {"type": "string"}},
+    "assets_created": {"type": "array", "items": {"type": "string"}},
+    "research_outcome": {"type": "string", "enum": ["PROVED_RESULT", "USEFUL_NEGATIVE_RESULT", "NEW_KILL_GATE", "NEW_REUSABLE_ASSET", "COMPUTATION_ONLY", "REPRESENTATION_BLOCKED", "DEPENDENCY_BLOCKED", "BOUNDED_SEARCH_EXHAUSTED", "NO_PROGRESS", "INVALID_RESULT"]},
+    "producer": {"type": "object"},
+    "provenance": {"type": "object"},
+    "cost": {"type": "object"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "object_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["object_id", "path", "sha256"],
+        "properties": {
+          "object_id": {"type": "string"},
+          "path": {"type": ["string", "null"]},
+          "sha256": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

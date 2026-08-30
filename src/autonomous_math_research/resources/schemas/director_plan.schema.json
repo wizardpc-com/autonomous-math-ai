@@ -40,12 +40,13 @@
           },
           "input_closure": {
             "type": ["object", "null"],
+            "description": "Exact pre-dispatch binding. For a semantically bound claim, copy the claim binding from task_packet.semantic_contract. For a theme scope, canonical_object_id is the exact included scope_id. Identifiers are equality constraints, not file paths.",
             "additionalProperties": false,
             "required": ["canonical_object_id", "target_representation_id", "required_bridge_ids", "required_source_ids", "source_bindings"],
             "properties": {
-              "canonical_object_id": {"type": ["string", "null"]},
-              "target_representation_id": {"type": "string"},
-              "required_bridge_ids": {"type": "array", "items": {"type": "string"}},
+              "canonical_object_id": {"type": ["string", "null"], "description": "Semantic canonical object id, or the exact included campaign-theme scope_id for a scope-bound task."},
+              "target_representation_id": {"type": "string", "description": "Must equal the content hash of this task's representation object; for a semantically bound claim it must also equal the claim binding representation_id."},
+              "required_bridge_ids": {"type": "array", "description": "For a semantically bound claim, copy the claim binding's ordered required_bridges exactly.", "items": {"type": "string"}},
               "required_source_ids": {"type": "array", "items": {"type": "string"}},
               "source_bindings": {
                 "type": "array",

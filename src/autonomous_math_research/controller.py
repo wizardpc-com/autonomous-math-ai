@@ -102,6 +102,11 @@ from .reconciliation import (
     ReconciliationStage,
     ReconciliationStore,
 )
+from .research_memory import CampaignTheme, ResearchMemoryStore
+from .research_record import (
+    ResearchRecordStore,
+    decision_reason_code,
+)
 from .reporting import write_report
 from .representation import RepresentationContract, require_compatible_representations
 from .reasoning_health import ReasoningHealthMonitor
@@ -610,10 +615,12 @@ class AutonomousController:
         resume: bool = False,
         recover_candidates_from: str | None = None,
         reconciliation_id: str | None = None,
+        theme_path: Path | None = None,
         campaign_id: str | None = None,
         previous_epoch_id: str | None = None,
         campaign_hours: float = DEFAULT_CAMPAIGN_HOURS,
         epoch_hours: float = DEFAULT_EPOCH_HOURS,
+        run_purpose: str | None = None,
     ):
         self.config = config
         self.layout = ProjectLayout(config.project_root)
@@ -669,6 +676,27 @@ class AutonomousController:
             project_root=config.project_root,
             runtime_root=self.layout.autonomous_root,
         )
+        self.research_memory = ResearchMemoryStore(
+            project_root=config.project_root,
+            runtime_root=self.layout.autonomous_root,
+        )
+        self.requested_run_purpose = run_purpose
+        self.run_purpose: str | None = None
+        self.research_record = ResearchRecordStore(
+            project_root=config.project_root,
+            runtime_root=self.layout.autonomous_root,
+            run_dir=self.run_dir,
+            campaign_root=self.campaign_store.root,
+            run_id=self.run_id,
+            campaign_id=self.campaign_id,
+            epoch_id=self.epoch_id,
+        )
+        self._task_loaded_asset_ids: dict[str, set[str]] = {}
+        self.requested_theme_path = theme_path
+        self.campaign_theme: CampaignTheme | None = None
+        self.audited_frontier: dict[str, Any] | None = None
+        self.frontier_delta: dict[str, Any] | None = None
+        self.routing_representation_bridges: set[tuple[str, str]] = set()
         self._reconciliation_candidates: dict[str, ReconciliationStage] = {}
         self.graph = ClaimGraph.load(
             self.layout.claim_graph_path, semantics=self.domain_semantics,
@@ -1923,9 +1951,11 @@ class AutonomousController:
             top_level.add("canonical_state")
         if version >= 13:
             top_level.add("runtime_provenance")
+        if version >= 14:
+            top_level.update({"run_purpose", "research_record"})
         if set(existing) != top_level:
             raise ValueError(f"RUN_MANIFEST fields are invalid: {sorted(set(existing) ^ top_level)}")
-        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}:
+        if version not in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
             raise ValueError("unsupported or legacy RUN_MANIFEST schema")
         fingerprinted = dict(existing)
         reported = str(fingerprinted.pop("manifest_sha256", ""))
@@ -1953,11 +1983,18 @@ class AutonomousController:
             or not str(existing["research_target"].get("project_name", "")).strip()
         ):
             raise ValueError("RUN_MANIFEST research_target fields are invalid")
-        if version >= 8 and existing.get("output_protocol") != {
-            "version": OUTPUT_PROTOCOL_VERSION,
-            "strict_json_object": True,
-        }:
-            raise ValueError("RUN_MANIFEST output protocol is invalid")
+        if version >= 8:
+            output_protocol = existing.get("output_protocol")
+            allowed_versions = (
+                {OUTPUT_PROTOCOL_VERSION} if version >= 14 else {1, 2}
+            )
+            if (
+                not isinstance(output_protocol, dict)
+                or set(output_protocol) != {"version", "strict_json_object"}
+                or output_protocol.get("version") not in allowed_versions
+                or output_protocol.get("strict_json_object") is not True
+            ):
+                raise ValueError("RUN_MANIFEST output protocol is invalid")
         if version >= 10:
             campaign = existing.get("campaign")
             if not isinstance(campaign, dict) or set(campaign) != {
@@ -1994,6 +2031,26 @@ class AutonomousController:
             or not str(existing["runtime_provenance"].get("source_sha256") or "")
         ):
             raise ValueError("RUN_MANIFEST runtime_provenance fields are invalid")
+        if version >= 14:
+            if existing.get("run_purpose") not in {
+                "DEVELOPMENT", "NATURAL_RESEARCH", "EVALUATION",
+            }:
+                raise ValueError("RUN_MANIFEST run purpose is invalid")
+            research_record = existing.get("research_record")
+            if (
+                not isinstance(research_record, dict)
+                or set(research_record) != {
+                    "context_manifest", "context_manifest_sha256",
+                    "context_sha256", "input_evidence_root_sha256",
+                    "snapshot_sha256", "target_project_git", "schema_versions",
+                }
+                or not str(research_record.get("context_manifest_sha256") or "")
+                or not str(research_record.get("context_sha256") or "")
+                or not isinstance(research_record.get("snapshot_sha256"), dict)
+                or not isinstance(research_record.get("target_project_git"), dict)
+                or not isinstance(research_record.get("schema_versions"), dict)
+            ):
+                raise ValueError("RUN_MANIFEST research record is invalid")
         output_schemas = existing.get("output_schemas")
         if not isinstance(output_schemas, dict) or set(output_schemas) != {
             "director_plan.schema.json", "worker_result.schema.json", "audit_result.schema.json",
@@ -2482,6 +2539,138 @@ class AutonomousController:
         self._canonical_state = state
         self._director_overlay = director_overlay_text(state, run_dir=self.run_dir)
 
+    def _reconcile_research_memory(self, phase: str) -> None:
+        """Refresh noncanonical routing truth without changing ClaimGraph authority."""
+        self.campaign_theme = self.research_memory.load_or_pin_theme(
+            self.campaign_store.root,
+            self.requested_theme_path,
+        )
+        state, delta = self.research_memory.reconcile(
+            graph=self.graph,
+            claim_graph_path=self.layout.claim_graph_path,
+            trusted_state_path=self.layout.trusted_state_path,
+            final_claim_id=self.final_conjecture_claim_id,
+            theme=self.campaign_theme,
+            phase=phase,
+            campaign_id=self.campaign_id,
+            epoch_id=self.epoch_id,
+        )
+        self.audited_frontier = state
+        self.frontier_delta = delta
+        self.routing_representation_bridges = (
+            self.research_memory.routing_bridge_pairs()
+        )
+        self.store.append("AUDITED_FRONTIER_RECONCILED", {
+            "phase": phase,
+            "frontier_sha256": state["frontier_sha256"],
+            "theme_id": (
+                self.campaign_theme.theme_id if self.campaign_theme is not None else None
+            ),
+            "theme_sha256": (
+                self.campaign_theme.theme_sha256
+                if self.campaign_theme is not None else None
+            ),
+            "source_counts": state["source_counts"],
+            "delta": delta,
+            "routing_truth": "AUDITED_FRONTIER",
+            "authority_truth": "CLAIMGRAPH_AND_CONTROLLER_RECEIPTS",
+            "canonical_files_modified": False,
+        })
+        audit_objects = [
+            item for item in state.get("frontier_entries", [])
+            if item.get("object_kind") == "EXTERNAL_RESULT" and item.get("audit_key")
+        ]
+        if self.research_memory.registry_path.is_file():
+            registry = json.loads(
+                self.research_memory.registry_path.read_text(encoding="utf-8")
+            )
+            audit_objects.extend(
+                {
+                    "object_kind": "ASSET",
+                    "result_id": item.get("asset_id"),
+                    "audit_key": item.get("audit_key"),
+                    "audit_identity": item.get("audit_identity"),
+                    "audit_reused": item.get("audit_reused", False),
+                    "audit_status": item.get("audit_status"),
+                    "supersedes": item.get("supersedes", []),
+                }
+                for item in registry.get("assets", [])
+                if item.get("audit_key")
+            )
+        existing_ids = {
+            str(item.get("payload", {}).get("audit_decision_id") or "")
+            for item in self.store.replay()
+            if item.get("kind") == "AUDIT_KEY_DECISION"
+        }
+        for item in audit_objects:
+            object_id = str(item.get("result_id") or "")
+            audit_key = str(item.get("audit_key") or "")
+            decision_id = stable_hash({
+                "run_id": self.run_id,
+                "object_kind": item.get("object_kind"),
+                "object_id": object_id,
+                "audit_key": audit_key,
+            })
+            if decision_id in existing_ids:
+                continue
+            cache_hit = bool(item.get("audit_reused"))
+            self.store.append("AUDIT_KEY_DECISION", {
+                "schema_version": 1,
+                "audit_decision_id": decision_id,
+                "first_observed_phase": phase,
+                "object_kind": item.get("object_kind"),
+                "object_id": object_id,
+                "audit_key": audit_key,
+                "cache_hit": cache_hit,
+                "cache_miss_reason": (
+                    None if cache_hit
+                    else self.research_memory.audit_miss_reason(item)
+                ),
+                "reused_receipt": audit_key if cache_hit else None,
+                "saved_audit_execution": cache_hit,
+                "estimated_saved_tokens": None,
+                "estimated_saved_wall_seconds": None,
+                "estimated_saved_model_calls": 1 if cache_hit else 0,
+                "authority_effect": "NONE",
+            })
+        recorded_results = {
+            (
+                str(item.get("payload", {}).get("result_id") or ""),
+                str(item.get("payload", {}).get("content_sha256") or ""),
+            )
+            for item in self.store.replay()
+            if item.get("kind") == "RESEARCH_RESULT_RECORDED"
+        }
+        for entry in state.get("frontier_entries", []):
+            if entry.get("object_kind") != "EXTERNAL_RESULT":
+                continue
+            result_payload, result_path = self.research_record.record_frontier_result(
+                entry
+            )
+            identity = (
+                str(result_payload["result_id"]),
+                str(result_payload["content_sha256"]),
+            )
+            if identity in recorded_results:
+                continue
+            self.store.append("RESEARCH_RESULT_RECORDED", {
+                "schema_version": 1,
+                "result_id": result_payload["result_id"],
+                "content_sha256": result_payload["content_sha256"],
+                "path": (
+                    f"epoch://{self.epoch_id}/research_record/results/"
+                    f"{result_path.name}"
+                ),
+                "math_status": result_payload["math_status"],
+                "maturity_level": result_payload["maturity_level"],
+                "audit_status": result_payload["audit_status"],
+                "authority_status": result_payload["authority_status"],
+                "routing_effect": result_payload["routing_effect"],
+                "research_outcome": result_payload["research_outcome"],
+                "producer_job_id": None,
+                "external_ingestion": True,
+            })
+
     def _assert_startup_canonical_sources(self) -> None:
         if self._canonical_state is None:
             raise ValueError("startup canonical state has not been refreshed")
@@ -2602,9 +2791,42 @@ class AutonomousController:
         if requested_hours <= 0:
             raise ValueError("hours must be positive")
         self._effective_run_hours = requested_hours
+        started_at = utc_now()
+        self.run_purpose = self.research_record.pin_purpose(
+            self.requested_run_purpose,
+            default=(
+                "DEVELOPMENT" if self.mock or dry_run else "NATURAL_RESEARCH"
+            ),
+            started_at=started_at,
+        )
+        context_manifest = self.research_record.freeze_context_before(
+            started_at=started_at,
+            run_purpose=self.run_purpose,
+            sources={
+                "config": config_snapshot,
+                "claim_graph": self.layout.claim_graph_path,
+                "trusted_state": self.layout.trusted_state_path,
+                "canonical_state": self.run_dir / "state" / "canonical_state.json",
+                "frontier_before": self.research_memory.current_path,
+                "asset_registry": self.research_memory.registry_path,
+                "representation_graph": self.research_memory.representation_graph_path,
+                "method_ledger": self.research_memory.method_ledger_path,
+                "audit_index": self.research_memory.audit_index_path,
+            },
+            theme=(
+                self.campaign_theme.to_dict()
+                if self.campaign_theme is not None else None
+            ),
+            runtime_provenance=self._runtime_provenance,
+        )
+        snapshot_sha256 = {
+            key: (value or {}).get("sha256")
+            for key, value in context_manifest["snapshots"].items()
+        }
         payload = {
-            "schema_version": 13,
+            "schema_version": 14,
             "run_id": self.run_id,
+            "run_purpose": self.run_purpose,
             "campaign": {
                 "campaign_id": self.campaign_id,
                 "epoch_id": self.epoch_id,
@@ -2640,7 +2862,7 @@ class AutonomousController:
             "execution": {
                 "mode": "mock" if self.mock else "real",
                 "dry_run": bool(dry_run),
-                "started_at": utc_now(),
+                "started_at": started_at,
                 "started_epoch": now_epoch,
                 "limits": {
                     "global_tokens": self.governor.global_budget,
@@ -2676,6 +2898,21 @@ class AutonomousController:
                 "git_revision": self._canonical_state["git_revision"],
             },
             "runtime_provenance": self._runtime_provenance,
+            "research_record": {
+                "context_manifest": (
+                    f"epoch://{self.epoch_id}/research_record/CONTEXT_MANIFEST.json"
+                ),
+                "context_manifest_sha256": file_digest(
+                    self.research_record.context_manifest_path
+                ),
+                "context_sha256": context_manifest["context_sha256"],
+                "input_evidence_root_sha256": context_manifest[
+                    "input_evidence_root_sha256"
+                ],
+                "snapshot_sha256": snapshot_sha256,
+                "target_project_git": context_manifest["target_project_git"],
+                "schema_versions": context_manifest["schema_versions"],
+            },
             "candidate_recovery": {"source_run_id": self.recover_candidates_from},
             "output_schemas": output_schemas,
         }
@@ -2714,6 +2951,8 @@ class AutonomousController:
                     name: entry["sha256"] for name, entry in payload["output_schemas"].items()
                 },
                 "canonical_state": payload["canonical_state"],
+                "run_purpose": payload["run_purpose"],
+                "research_record": payload["research_record"],
             }
             observed = {
                 "run_id": existing.get("run_id"),
@@ -2748,6 +2987,8 @@ class AutonomousController:
                     if isinstance(entry, dict)
                 },
                 "canonical_state": existing.get("canonical_state"),
+                "run_purpose": existing.get("run_purpose"),
+                "research_record": existing.get("research_record"),
             }
             if int(existing.get("schema_version", 0)) < 10:
                 immutable_checks.pop("campaign", None)
@@ -2758,6 +2999,14 @@ class AutonomousController:
             if int(existing.get("schema_version", 0)) < 12:
                 immutable_checks.pop("canonical_state", None)
                 observed.pop("canonical_state", None)
+            if int(existing.get("schema_version", 0)) < 14:
+                immutable_checks.pop("run_purpose", None)
+                immutable_checks.pop("research_record", None)
+                observed.pop("run_purpose", None)
+                observed.pop("research_record", None)
+                immutable_checks["output_protocol"] = existing.get(
+                    "output_protocol", immutable_checks["output_protocol"]
+                )
             if observed != immutable_checks:
                 raise ValueError("RUN_MANIFEST immutable inputs do not match the resumed controller")
             if bool(existing["execution"].get("dry_run")) or dry_run:
@@ -5594,6 +5843,20 @@ class AutonomousController:
                 "bootstrap failed: canonical-state refresh: "
                 f"{_sanitize_live_text(exc)[:500]}"
             )
+        if not dry_run and not self.mock:
+            try:
+                self._reconcile_research_memory("CAMPAIGN_START")
+            except Exception as exc:
+                self.store.append("AUDITED_FRONTIER_RECONCILIATION_FAILED", {
+                    "phase": "CAMPAIGN_START",
+                    "error": _sanitize_live_text(exc),
+                    "action": "stopped before backend start or model turn",
+                    "canonical_files_modified": False,
+                })
+                return self._attempt_failure_result(
+                    "bootstrap failed: audited-frontier reconciliation: "
+                    f"{_sanitize_live_text(exc)[:500]}"
+                )
         try:
             deadline_epoch = self._pin_run_inputs(hours, dry_run)
         except Exception as exc:
@@ -6124,6 +6387,20 @@ class AutonomousController:
             active_tasks, self.governor.snapshot(), current_changes,
         )
         snapshot["schema_version"] = DIRECTOR_CONTEXT_SCHEMA_VERSION
+        snapshot["audited_frontier"] = (
+            self.research_memory.director_view(self.audited_frontier)
+            if self.audited_frontier is not None else {
+                "routing_truth": "UNAVAILABLE",
+                "authority_truth": "CLAIMGRAPH_AND_CONTROLLER_RECEIPTS",
+                "route_entries": [],
+                "relevant_assets": {},
+            }
+        )
+        snapshot["campaign_theme"] = (
+            self.campaign_theme.to_dict()
+            if self.campaign_theme is not None else None
+        )
+        snapshot["frontier_delta"] = deepcopy(self.frontier_delta)
         graph_payload = self.graph.to_payload()
         graph_digest = (
             file_digest(self.layout.claim_graph_path)
@@ -6164,9 +6441,11 @@ class AutonomousController:
             "startup_path": self._canonical_state["claim_graph"]["path"],
             "startup_sha256": self._canonical_state["claim_graph"]["sha256"],
             "status_rule": (
-                "ClaimGraph is the sole mathematical-status and proof-frontier "
-                "authority. Canonical Markdown is context-only unless it contains a "
-                "strict generated state block. Every status upgrade is audit-gated."
+                "ClaimGraph and controller receipts are the sole mathematical authority. "
+                "Audited Frontier is separate routing truth: an independently audited "
+                "external exact scope may suppress duplicate research while authority "
+                "remains pending. Canonical Markdown is context-only unless it contains "
+                "a strict generated state block. Every authority upgrade is audit-gated."
                 if self.domain_semantics.domain == "math-research" else
                 "ClaimGraph is the sole domain-status and research-frontier authority. "
                 "Canonical Markdown is context-only unless it contains a strict generated "
@@ -6437,6 +6716,10 @@ class AutonomousController:
             "audited_bridges": [
                 list(pair) for pair in sorted(self.audited_representation_bridges)
             ],
+            "audited_routing_bridges": [
+                list(pair) for pair in sorted(self.routing_representation_bridges)
+            ],
+            "routing_bridge_does_not_grant_authority": True,
             "known_contract_does_not_imply_compatibility": True,
         }
 
@@ -6616,6 +6899,9 @@ class AutonomousController:
             "output_protocol_version": OUTPUT_PROTOCOL_VERSION,
             "state_version": snapshot_version,
             "semantic_contract": semantic_contract_input,
+            "research_coordination": self.research_memory.director_view(
+                self.audited_frontier
+            ),
             "research_policy": self._policy_view(Role.DIRECTOR),
             "workspace": metadata,
         })
@@ -8717,6 +9003,14 @@ class AutonomousController:
                     "phase": "dispatch",
                 }
                 self.store.append("TASK_REJECTED_BEFORE_MODEL", rejection)
+                self._record_director_task_decision(
+                    director_job_id="controller-dispatch",
+                    task=task,
+                    decision="SUPPRESSED",
+                    reason_code="WAIT_DEPENDENCY",
+                    reason_detail=str(rejection["reason"]),
+                    stage="DISPATCH",
+                )
                 self.director_constraints.append({
                     "action": "REPAIR_TASK_INPUTS",
                     "claim_id": task.target_claim,
@@ -8741,6 +9035,14 @@ class AutonomousController:
                     "phase": "dispatch",
                 }
                 self.store.append("TASK_REJECTED", rejection)
+                self._record_director_task_decision(
+                    director_job_id="controller-dispatch",
+                    task=task,
+                    decision="SUPPRESSED",
+                    reason_code=decision_reason_code(reason),
+                    reason_detail=reason,
+                    stage="DISPATCH",
+                )
                 self.director_constraints.append({
                     "action": "REPAIR_TASK_INPUTS",
                     "claim_id": task.target_claim,
@@ -8757,10 +9059,19 @@ class AutonomousController:
             estimated = self._estimated_tokens(task.role, task.estimated_cost_tier)
             if not self.governor.may_start(task.role, estimated):
                 budget_blocked += 1
-                self._emit_scheduler_event_once(
+                newly_reported = self._emit_scheduler_event_once(
                     f"task-paused:{task.fingerprint}:budget", "TASK_PAUSED",
                     {"task_id": task.task_id, "reason": "role/global budget"},
                 )
+                if newly_reported:
+                    self._record_director_task_decision(
+                        director_job_id="controller-dispatch",
+                        task=task,
+                        decision="SUPPRESSED",
+                        reason_code="BUDGET_REJECTED",
+                        reason_detail="role/global token or cost budget rejected dispatch",
+                        stage="DISPATCH",
+                    )
                 deferred.append(task)
                 continue
             job_id = self._new_job_id()
@@ -8777,6 +9088,86 @@ class AutonomousController:
             semantic_binding = self.semantic_alignment.claims.get(
                 task.target_claim,
             )
+            research_context = self.research_memory.task_context_bundle(task)
+            retrieved_assets = {
+                str(item["asset_id"]): item
+                for section in (
+                    "required_audited_theorems", "representation_bridges",
+                    "reusable_tools", "kill_gates", "hypotheses",
+                )
+                for item in research_context.get(section, [])
+            }
+            self._task_loaded_asset_ids[task.task_id] = set(retrieved_assets)
+            for asset_id in sorted(retrieved_assets):
+                self.store.append(
+                    "ASSET_USE_RECORDED",
+                    ResearchRecordStore.asset_event(
+                        task_id=task.task_id,
+                        asset_id=asset_id,
+                        stage="RETRIEVED",
+                        reason="deterministic task relevance query matched the asset card",
+                    ),
+                )
+                self.store.append(
+                    "ASSET_USE_RECORDED",
+                    ResearchRecordStore.asset_event(
+                        task_id=task.task_id,
+                        asset_id=asset_id,
+                        stage="LOADED",
+                        reason="asset card was included in the frozen worker task packet",
+                    ),
+                )
+            asset_file_access: list[dict[str, str]] = []
+            seen_asset_paths: set[tuple[str, str]] = set()
+            for section in (
+                "required_audited_theorems", "representation_bridges",
+                "reusable_tools", "kill_gates", "hypotheses",
+            ):
+                for asset in research_context.get(section, []):
+                    asset_id = str(asset["asset_id"])
+                    for reference in asset.get("main_refs", []):
+                        relative = str(reference["path"])
+                        identity = (asset_id, str(relative))
+                        if identity in seen_asset_paths:
+                            continue
+                        seen_asset_paths.add(identity)
+                        source = (self.config.project_root / str(relative)).resolve()
+                        if not source.is_relative_to(self.config.project_root.resolve()):
+                            raise ValueError(
+                                f"research asset path escapes project: {relative}"
+                            )
+                        if file_digest(source) != str(reference["sha256"]):
+                            raise ValueError(
+                                f"research asset evidence changed after Frontier rebuild: {relative}"
+                            )
+                        copied = self.workspace.materialize_input(workspace, source)
+                        asset_file_access.append({
+                            "asset_id": asset_id,
+                            "reference": str(relative),
+                            "path": str(copied),
+                            "sha256": file_digest(copied),
+                        })
+            research_context["asset_file_access"] = asset_file_access
+            reusable_asset_ids = sorted({
+                str(item["asset_id"])
+                for key in (
+                    "required_audited_theorems", "representation_bridges",
+                    "reusable_tools", "kill_gates",
+                )
+                for item in research_context.get(key, [])
+            })
+            self.store.append("ASSET_REUSE_GATE_APPLIED", {
+                "task_id": task.task_id,
+                "claim_id": task.target_claim,
+                "route_family": task.route_family,
+                "frontier_sha256": research_context.get("frontier_sha256"),
+                "equivalent_or_relevant_audited_asset_ids": reusable_asset_ids,
+                "default_action": "REUSE_IF_EQUIVALENT",
+                "nonreuse_requirement": (
+                    "record the existing asset id, violated applicability condition, "
+                    "and exact difference before creating a replacement"
+                ),
+            })
             # The worker may submit a single validated event file, but cannot
             # write the controller-owned ledger, candidates, audits, or state.
             job_inbox = self._task_inbox(task.task_id)
@@ -8787,6 +9178,7 @@ class AutonomousController:
                 "canonical_project": None,
                 "nightly_claim_graph": str(nightly_claim_graph),
                 "semantic_contract": semantic_contract_input,
+                "research_context": research_context,
                 "semantic_claim": self.semantic_alignment.evaluate_claim(
                     task.target_claim,
                     trust_state=self.semantic_trust,
@@ -9016,6 +9408,34 @@ class AutonomousController:
             record["artifact_validation_errors"] = artifact_errors
             self.completed_jobs.append(record)
             self.store.append("JOB_COMPLETED", record)
+            self.store.append("RESEARCH_COST_RECORDED", {
+                "schema_version": 1,
+                "job_id": job_id,
+                "task_id": outcome.task_id,
+                "claim_id": outcome.claim_id,
+                "role": outcome.role,
+                "cost_class": (
+                    "AUDIT" if active.kind == "audit" else
+                    "ROUTING" if active.kind == "director" else "RESEARCH"
+                ),
+                "token_usage": outcome.token_usage.to_dict(),
+                "token_telemetry": outcome.token_telemetry,
+                "cost_usd": outcome.cost_usd,
+                "cost_telemetry": outcome.cost_telemetry,
+                "wall_seconds": record["elapsed_seconds"],
+                "model_calls": 1,
+                "retry_count": self._retry_count(
+                    self.retry_counts, active.task.task_id,
+                    outcome.failure_kind or "research_failure",
+                ) if active.kind == "research" else 0,
+                "producer": {
+                    "model": outcome.model or active.model,
+                    "provider": outcome.provider or active.provider,
+                    "reasoning_effort": (
+                        outcome.reasoning_effort or active.reasoning_effort
+                    ),
+                },
+            })
             finding = (
                 outcome.result.get("main_finding")
                 or outcome.result.get("short_rationale")
@@ -9215,6 +9635,29 @@ class AutonomousController:
             "internal_failure": False,
         })
 
+    def _record_director_task_decision(
+        self,
+        *,
+        director_job_id: str,
+        task: ResearchTask,
+        decision: str,
+        reason_code: str,
+        reason_detail: str,
+        stage: str = "ADMISSION",
+    ) -> None:
+        self.store.append(
+            "DIRECTOR_TASK_DECISION",
+            ResearchRecordStore.director_decision(
+                run_id=self.run_id,
+                director_job_id=director_job_id,
+                task=task,
+                decision=decision,
+                reason_code=reason_code,
+                reason_detail=reason_detail,
+                stage=stage,
+            ),
+        )
+
     def _accept_director_result(self, outcome: JobOutcome) -> None:
         """Apply a v2 plan while rebasing every action against current state."""
         incremental = self._director_incremental
@@ -9289,6 +9732,15 @@ class AutonomousController:
                 deferred = deferred_by_fingerprint.get(task.fingerprint)
             if deferred is not None and deferred.fingerprint == task.fingerprint:
                 deferred_proposals.append(task)
+                self._record_director_task_decision(
+                    director_job_id=outcome.job_id,
+                    task=task,
+                    decision="DEFERRED",
+                    reason_code="WAIT_DEPENDENCY",
+                    reason_detail=(
+                        "checkpointed continuation is unavailable in the current epoch"
+                    ),
+                )
                 self.store.append("TASK_DEFERRED_UNTIL_NEXT_EPOCH", {
                     "task_id": task.task_id,
                     "fingerprint": task.fingerprint,
@@ -9306,6 +9758,13 @@ class AutonomousController:
                     "authority_sync_status": authority_status,
                 }
                 rejected_tasks.append(rejection)
+                self._record_director_task_decision(
+                    director_job_id=outcome.job_id,
+                    task=task,
+                    decision="SUPPRESSED",
+                    reason_code="WAIT_DEPENDENCY",
+                    reason_detail=str(rejection["reason"]),
+                )
                 self.store.append("TASK_REJECTED_BEFORE_MODEL", rejection)
                 continue
             missing_input_ids = self._input_closure_missing_ids(task)
@@ -9317,7 +9776,19 @@ class AutonomousController:
                     "reason": "INPUT_CLOSURE_INCOMPLETE",
                     "missing_input_ids": missing_input_ids,
                 }
+                repair_requirements = self._semantic_input_closure_repair(task)
+                if repair_requirements is not None:
+                    rejection["repair_requirements"] = repair_requirements
                 rejected_tasks.append(rejection)
+                self._record_director_task_decision(
+                    director_job_id=outcome.job_id,
+                    task=task,
+                    decision="SUPPRESSED",
+                    reason_code="WAIT_DEPENDENCY",
+                    reason_detail=(
+                        f"INPUT_CLOSURE_INCOMPLETE: {missing_input_ids}"
+                    ),
+                )
                 self.store.append("TASK_REJECTED_BEFORE_MODEL", rejection)
                 continue
             task_error = self._validate_director_task(task)
@@ -9328,11 +9799,25 @@ class AutonomousController:
                     "reason": task_error,
                 }
                 rejected_tasks.append(rejection)
+                self._record_director_task_decision(
+                    director_job_id=outcome.job_id,
+                    task=task,
+                    decision="SUPPRESSED",
+                    reason_code=decision_reason_code(task_error),
+                    reason_detail=task_error,
+                )
                 self.store.append("TASK_REJECTED", rejection)
                 continue
             bound_fingerprint = provisional_task_bindings.get(task.task_id)
             if bound_fingerprint is not None:
                 if bound_fingerprint == task.fingerprint:
+                    self._record_director_task_decision(
+                        director_job_id=outcome.job_id,
+                        task=task,
+                        decision="SUPPRESSED",
+                        reason_code="DUPLICATE_TASK",
+                        reason_detail="stable task_id and fingerprint already accepted",
+                    )
                     self.store.append("TASK_DEDUPLICATED", {
                         "task_id": task.task_id,
                         "fingerprint": task.fingerprint,
@@ -9349,9 +9834,23 @@ class AutonomousController:
                         ),
                     }
                     rejected_tasks.append(rejection)
+                    self._record_director_task_decision(
+                        director_job_id=outcome.job_id,
+                        task=task,
+                        decision="SUPPRESSED",
+                        reason_code="DUPLICATE_TASK",
+                        reason_detail=str(rejection["reason"]),
+                    )
                     self.store.append("TASK_REJECTED", rejection)
                 continue
             if task.fingerprint in self.seen_task_fingerprints:
+                self._record_director_task_decision(
+                    director_job_id=outcome.job_id,
+                    task=task,
+                    decision="SUPPRESSED",
+                    reason_code="DUPLICATE_TASK",
+                    reason_detail="task fingerprint already accepted in this campaign",
+                )
                 self.store.append("TASK_DEDUPLICATED", {
                     "task_id": task.task_id,
                     "fingerprint": task.fingerprint,
@@ -9359,6 +9858,13 @@ class AutonomousController:
                 continue
             accepted_tasks.append(task)
             provisional_task_bindings[task.task_id] = task.fingerprint
+            self._record_director_task_decision(
+                director_job_id=outcome.job_id,
+                task=task,
+                decision="ADMITTED",
+                reason_code="ADMITTED",
+                reason_detail="passed current Frontier, Theme, dependency, representation, and duplicate gates",
+            )
 
         prioritized = 0
         for item in plan.audit_priorities:
@@ -9585,6 +10091,14 @@ class AutonomousController:
         target = self.graph.claims.get(task.target_claim)
         if target is None:
             return f"unknown target claim: {task.target_claim}"
+        if self.audited_frontier is not None:
+            frontier_error = self.research_memory.task_admission_error(
+                task,
+                theme=self.campaign_theme,
+                state=self.audited_frontier,
+            )
+            if frontier_error:
+                return frontier_error
         if target.research_status in (
             self.domain_semantics.terminal_positive
             | self.domain_semantics.terminal_negative
@@ -9633,10 +10147,12 @@ class AutonomousController:
             if (
                 task.representation_id != dependency_representation
                 and pair not in self.audited_representation_bridges
+                and pair not in self.routing_representation_bridges
             ):
                 return (
                     "representation mismatch with dependency requires an independently "
-                    f"PASSed REPRESENTATION_BRIDGE: {dependency} {pair}"
+                    "PASSed REPRESENTATION_BRIDGE in controller authority or the audited "
+                    f"routing Representation Graph: {dependency} {pair}"
                 )
         try:
             self._required_file_access(task)
@@ -9652,6 +10168,35 @@ class AutonomousController:
             pending_reconciliation_id=self.reconciliation_id,
         )
         return str(summary["claim_status"].get(claim_id) or AUTHORITY_SYNC_IN_SYNC)
+
+    def _semantic_input_closure_repair(
+        self, task: ResearchTask,
+    ) -> dict[str, Any] | None:
+        binding = self.semantic_alignment.claims.get(task.target_claim)
+        if binding is None:
+            return None
+        required_files: set[str] = set()
+        canonical = self.semantic_alignment.entries.get(binding.canonical_object)
+        if canonical is not None:
+            required_files.add(canonical.canonical_source.split("#", 1)[0])
+        for bridge_id in binding.required_bridges:
+            bridge = self.semantic_alignment.bridges.get(bridge_id)
+            if bridge is not None:
+                required_files.update(bridge.evidence)
+        repair: dict[str, Any] = {
+            "canonical_object_id": binding.canonical_object,
+            "target_representation_id": binding.representation_id,
+            "required_bridge_ids": list(binding.required_bridges),
+            "required_semantic_files": sorted(required_files),
+            "instruction": (
+                "copy these equality requirements exactly; rep:/bridge: ids are not "
+                "source bindings"
+            ),
+        }
+        representation = self.representation_contracts.get(binding.representation_id)
+        if representation is not None:
+            repair["representation"] = deepcopy(representation)
+        return repair
 
     def _input_closure_missing_ids(self, task: ResearchTask) -> list[str]:
         closure = task.input_closure
@@ -9738,7 +10283,13 @@ class AutonomousController:
                         missing.append(bridge_id)
                         break
         elif closure.get("canonical_object_id") is not None:
-            missing.append(str(closure["canonical_object_id"]))
+            canonical_object_id = str(closure["canonical_object_id"])
+            theme_scope_ids = (
+                set(self.campaign_theme.include_scope_ids)
+                if self.campaign_theme is not None else set()
+            )
+            if canonical_object_id not in theme_scope_ids:
+                missing.append(canonical_object_id)
         source_paths = {
             item["source_id"]: item["path"] for item in source_bindings
         }
@@ -10823,6 +11374,99 @@ class AutonomousController:
         task: ResearchTask,
         job_record: dict[str, Any] | None = None,
     ) -> None:
+        raw_asset_usage = outcome.result.get("asset_usage", [])
+        asset_usage: list[dict[str, Any]] = []
+        loaded_asset_ids = set(self._task_loaded_asset_ids.get(task.task_id) or set())
+        valid_usage = isinstance(raw_asset_usage, list)
+        if valid_usage:
+            for row in raw_asset_usage:
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {
+                        "asset_id", "disposition", "reason", "cited_in_result",
+                    }
+                    or row.get("disposition") not in {"USED", "REJECTED"}
+                    or not isinstance(row.get("asset_id"), str)
+                    or not isinstance(row.get("reason"), str)
+                    or type(row.get("cited_in_result")) is not bool
+                ):
+                    valid_usage = False
+                    break
+                asset_usage.append(dict(row))
+        reported_asset_ids = [str(row["asset_id"]) for row in asset_usage]
+        if (
+            not valid_usage
+            or len(reported_asset_ids) != len(set(reported_asset_ids))
+            or set(reported_asset_ids) != loaded_asset_ids
+        ):
+            self.store.append("ASSET_USAGE_INVALID", {
+                "schema_version": 1,
+                "task_id": task.task_id,
+                "job_id": outcome.job_id,
+                "loaded_asset_ids": sorted(loaded_asset_ids),
+                "reported_asset_ids": sorted(set(reported_asset_ids)),
+                "output_protocol_version": (
+                    (self._run_manifest.get("output_protocol") or {}).get("version")
+                    if self._run_manifest else None
+                ),
+                "action": "do not infer use or citation from an incomplete report",
+            })
+            asset_usage = [
+                row for row in asset_usage if row["asset_id"] in loaded_asset_ids
+            ]
+        result_payload, result_path = self.research_record.record_result(
+            outcome=outcome,
+            task=task,
+            job_record=job_record,
+            asset_usage=asset_usage,
+        )
+        for row in asset_usage:
+            asset_id = str(row["asset_id"])
+            if row["disposition"] == "USED":
+                self.store.append(
+                    "ASSET_USE_RECORDED",
+                    ResearchRecordStore.asset_event(
+                        task_id=task.task_id,
+                        asset_id=asset_id,
+                        stage="USED",
+                        reason=str(row["reason"]),
+                        result_id=result_payload["result_id"],
+                    ),
+                )
+                if row["cited_in_result"]:
+                    self.store.append(
+                        "ASSET_USE_RECORDED",
+                        ResearchRecordStore.asset_event(
+                            task_id=task.task_id,
+                            asset_id=asset_id,
+                            stage="CITED_IN_RESULT",
+                            reason="worker bound the asset into the result dependency",
+                            result_id=result_payload["result_id"],
+                        ),
+                    )
+            else:
+                self.store.append("ASSET_REUSE_REJECTED", {
+                    "schema_version": 1,
+                    "task_id": task.task_id,
+                    "asset_id": asset_id,
+                    "reason": str(row["reason"]),
+                    "result_id": result_payload["result_id"],
+                })
+        self.store.append("RESEARCH_RESULT_RECORDED", {
+            "schema_version": 1,
+            "result_id": result_payload["result_id"],
+            "content_sha256": result_payload["content_sha256"],
+            "path": (
+                f"epoch://{self.epoch_id}/research_record/results/{result_path.name}"
+            ),
+            "math_status": result_payload["math_status"],
+            "maturity_level": result_payload["maturity_level"],
+            "audit_status": result_payload["audit_status"],
+            "authority_status": result_payload["authority_status"],
+            "routing_effect": result_payload["routing_effect"],
+            "research_outcome": result_payload["research_outcome"],
+            "producer_job_id": outcome.job_id,
+        })
         if not outcome.succeeded:
             failure_kind = outcome.failure_kind or "research_failure"
             if failure_kind == "provider_transport_lost":
@@ -11164,6 +11808,32 @@ class AutonomousController:
             elif "canonical guard failed" not in reason:
                 reason = f"canonical guard failed: {changed}"
             self._internal_failure = True
+        if (
+            not self._dry_run
+            and not self.mock
+            and self.audited_frontier is not None
+            and not changed
+        ):
+            try:
+                self._reconcile_research_memory("CAMPAIGN_END")
+            except Exception as exc:
+                frontier_reason = (
+                    "campaign-end audited-frontier reconciliation failed: "
+                    f"{_sanitize_live_text(exc)[:800]}"
+                )
+                self.store.append("AUDITED_FRONTIER_RECONCILIATION_FAILED", {
+                    "phase": "CAMPAIGN_END",
+                    "error": _sanitize_live_text(exc),
+                    "canonical_files_modified": False,
+                })
+                if self._internal_failure:
+                    self._secondary_failures.append({
+                        "kind": "AUDITED_FRONTIER_RECONCILIATION_FAILED",
+                        "detail": frontier_reason,
+                    })
+                else:
+                    reason = frontier_reason
+                self._internal_failure = True
         lifecycle = job_lifecycle_metrics(self.store.replay())
         mechanical_lifecycle = mechanical_lifecycle_metrics(self.store.replay())
         if (
@@ -11291,6 +11961,54 @@ class AutonomousController:
                 "epoch_id": self.epoch_id,
                 "error": _sanitize_live_text(exc),
             })
+        research_record_final: dict[str, Any] | None = None
+        if self.research_record.context_manifest_path.is_file():
+            try:
+                ended_at = utc_now()
+                record_events = self.store.replay()
+                research_record_final = self.research_record.finalize(
+                    frontier_after_path=(
+                        self.research_memory.current_path
+                        if self.audited_frontier is not None else None
+                    ),
+                    frontier_delta=self.frontier_delta,
+                    events=record_events,
+                    jobs=self.completed_jobs,
+                    mechanical_jobs=self.completed_mechanical_jobs,
+                    ended_at=ended_at,
+                    started_at=(
+                        (self._run_manifest.get("execution") or {}).get("started_at")
+                    ),
+                )
+                self.store.append("RESEARCH_RECORD_FINALIZED", {
+                    "schema_version": 1,
+                    "event_watermark": research_record_final["event_watermark"],
+                    "final_record_sha256": research_record_final[
+                        "final_record_sha256"
+                    ],
+                    "context_manifest_sha256": research_record_final[
+                        "context_manifest_sha256"
+                    ],
+                    "metrics": research_record_final["metrics"],
+                    "authority_effect": "NONE",
+                })
+            except Exception as exc:
+                record_reason = (
+                    "research record finalization failed: "
+                    f"{type(exc).__name__}: {_sanitize_live_text(exc)[:800]}"
+                )
+                if self._internal_failure:
+                    self._secondary_failures.append({
+                        "kind": "RESEARCH_RECORD_FINALIZATION_FAILED",
+                        "detail": record_reason,
+                    })
+                else:
+                    reason = record_reason
+                self._internal_failure = True
+                self.store.append("RESEARCH_RECORD_FINALIZATION_FAILED", {
+                    "error": record_reason,
+                    "historical_records_modified": False,
+                })
         execution_mode = "dry-run" if self._dry_run else ("mock" if self.mock else "real")
         campaign_completed = bool(
             not self._internal_failure
@@ -11357,6 +12075,7 @@ class AutonomousController:
                 ),
                 "artifacts_finalized": artifacts_finalized,
                 "artifact_error": artifact_error,
+                "research_record": research_record_final,
                 "jobs": summary_lifecycle.jobs_terminal,
                 **summary_lifecycle.to_dict(),
                 "mechanical_subtasks": summary_mechanical.to_dict(),
@@ -11733,12 +12452,14 @@ def build_mock_full_cycle_backend(
         "status": "COMPLETED", "artifact_paths": [],
         "next_suggested_question": "independent audit",
         "evidence_level": proposed_evidence,
+        "asset_usage": [],
     }
     falsifier_result = {
         "result_type": "NO_PROGRESS",
         "main_finding": "no boundary failure in deterministic mock range", "status": "NO_COUNTEREXAMPLE_WITHIN_SCOPE",
         "artifact_paths": [], "next_suggested_question": "audit proof",
         "evidence_level": "E0_SPECULATIVE",
+        "asset_usage": [],
     }
     scripts: dict[str, list[dict[str, Any]]] = {
         "director": [{"result": director_plan, "tokens": 120}, {"result": {

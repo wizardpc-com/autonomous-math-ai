@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "campaign_id", "epoch_id", "run_purpose", "started_at", "snapshots", "target_project_git", "environment", "input_evidence_root_sha256", "schema_versions", "context_sha256"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "run_id": {"type": "string"},
+    "campaign_id": {"type": "string"},
+    "epoch_id": {"type": "string"},
+    "run_purpose": {"type": "string", "enum": ["DEVELOPMENT", "NATURAL_RESEARCH", "EVALUATION"]},
+    "started_at": {"type": "string"},
+    "snapshots": {"type": "object"},
+    "target_project_git": {"type": "object"},
+    "environment": {"type": "object"},
+    "input_evidence_root_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schema_versions": {"type": "object"},
+    "context_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

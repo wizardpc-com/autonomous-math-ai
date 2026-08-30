@@ -415,6 +415,11 @@ def format_config_summary(config: HarnessConfig) -> str:
         f"项目: {summary['project']}  final claim: {summary['final_claim_id']}",
         f"配置: {summary['project_config']}",
         (
+            "Fast: ON（main roles service_tier=fast）"
+            if summary["execution"]["fast_mode"]
+            else "Fast: OFF"
+        ),
+        (
             "时长: campaign={hours}h, epoch={epoch_hours}h"
         ).format(**summary["campaign"]),
         (
@@ -587,6 +592,7 @@ def _prepare_and_run(
     command_runner: Callable[[Sequence[str]], int],
 ) -> int:
     overrides: dict[str, Any] = {}
+    fast_launch = False
     while True:
         try:
             with temporary_profile(overrides, profile_path) as effective_profile:
@@ -595,10 +601,19 @@ def _prepare_and_run(
                 )
                 output("\n" + format_config_summary(config))
                 output(
-                    "\n[Enter] 执行  [N] 常用参数  [O] dotted.path=JSON  "
+                    "\n[Enter] 执行  [FAST] Fast 方式执行  [N] 常用参数  "
+                    "[O] dotted.path=JSON  "
                     "[V] 完整脱敏配置  [F] 编辑项目配置  [B] 返回"
                 )
-                choice = input_fn("选择: ").strip().lower()
+                if fast_launch:
+                    choice = ""
+                    fast_launch = False
+                else:
+                    choice = input_fn("选择: ").strip().lower()
+                if choice == "fast":
+                    _set_dotted(overrides, "execution.fast_mode", True)
+                    fast_launch = True
+                    continue
                 if choice == "":
                     if action == "real":
                         confirmation = input_fn(
@@ -642,6 +657,7 @@ def _prepare_and_run(
                 else:
                     output("未知选择。")
         except (ValueError, OSError, json.JSONDecodeError) as exc:
+            fast_launch = False
             output(f"配置预检失败，未启动模型: {exc}")
             choice = input_fn(
                 "输入 R 清除一次性覆盖，F 打开项目配置，B 返回: "

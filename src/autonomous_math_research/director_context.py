@@ -9,7 +9,7 @@ from typing import Any
 DIRECTOR_PROMPT_TARGET_BYTES = 4 * 1024
 DIRECTOR_PROMPT_HARD_LIMIT_BYTES = 10 * 1024
 COMPACT_SNAPSHOT_HARD_LIMIT_BYTES = 128 * 1024
-DIRECTOR_CONTEXT_SCHEMA_VERSION = 3
+DIRECTOR_CONTEXT_SCHEMA_VERSION = 4
 
 _CHECKPOINT_SECTIONS = frozenset({
     "candidate_audit_frontier",
@@ -234,6 +234,9 @@ def build_compact_snapshot(
         "mechanical_subworkers",
         "research_policy",
         "director_constraints",
+        "audited_frontier",
+        "campaign_theme",
+        "frontier_delta",
     ):
         compact[key] = _bounded_json(full_snapshot.get(key))
     compact["representation_compatibility"] = _exact_or_bounded(
@@ -274,6 +277,11 @@ def build_compact_snapshot(
             "route_state",
         )
     }
+    audited_frontier = full_snapshot.get("audited_frontier")
+    compact["summary_counts"]["audited_frontier"] = len(
+        audited_frontier.get("route_entries") or []
+        if isinstance(audited_frontier, dict) else []
+    )
     payload = _json_bytes(compact)
     if len(payload) >= COMPACT_SNAPSHOT_HARD_LIMIT_BYTES:
         # This fail-safe intentionally keeps only the recovery pointer and the
@@ -322,6 +330,10 @@ def build_compact_snapshot(
                 for key in sorted(_CHECKPOINT_SECTIONS)
             },
         }
+        compact["summary_counts"]["audited_frontier"] = len(
+            audited_frontier.get("route_entries") or []
+            if isinstance(audited_frontier, dict) else []
+        )
         if domain and domain != "math-research":
             compact["domain"] = str(domain)
         payload = _json_bytes(compact)

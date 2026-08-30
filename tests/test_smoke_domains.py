@@ -73,6 +73,7 @@ class _ScriptedSmokeClient:
                 "artifact_paths": [],
                 "next_suggested_question": "none for this smoke",
                 "evidence_level": evidence,
+                "asset_usage": [],
             }
         else:
             if "empirical-research" in prompt:

@@ -104,6 +104,11 @@ class PolicyDomainPackTests(unittest.TestCase):
         )
         self.assertIn("cheapest exact falsification", math_prompt)
         self.assertIn("Model output alone is never proof", math_prompt)
+        self.assertIn("open the exact `semantic_contract`", math_prompt)
+        self.assertIn("`representation_compatibility.known_contracts", math_prompt)
+        self.assertIn("A `rep:` or `bridge:` identifier is", math_prompt)
+        self.assertIn("repair constraint contains `repair_requirements`", math_prompt)
+        self.assertIn("copy its `scope_id`", math_prompt)
 
         certified = self._config("certified-computational-research")
         certified_path = self.root / "certified/policy/MANIFEST.json"

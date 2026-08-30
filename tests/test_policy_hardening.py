@@ -185,6 +185,7 @@ class _TierClient:
                 "artifact_paths": [],
                 "next_suggested_question": "none",
                 "evidence_level": "E0_SPECULATIVE",
+                "asset_usage": [],
             }),
             TokenUsage(),
             "unknown",

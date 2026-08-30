@@ -26,11 +26,14 @@ amr init ./study-target --domain empirical-research
 源码仓库根目录提供 [`../amr-launcher.cmd`](../amr-launcher.cmd)，安装后也可直接运行
 `amr launcher`。入口是通用 bootstrap，不要写入项目路径或研究配置。首次使用时输入
 工作区根目录；该选择只保存在用户 LOCALAPPDATA 中，以后每次启动重新扫描 Git 可见的
-`autonomous/project.json`。
+`autonomous/project.json`。入口默认复用已安装 harness；只有显式设置
+`AMR_REFRESH_HARNESS=1` 才会刷新，并且共享虚拟环境仍有进程时会拒绝刷新。
 
 项目 manifest 指向唯一持久配置 `autonomous/config.yaml`。dry-run、mock、real 前会
 展示脱敏摘要；常用编号修改或 `dotted.path=JSON值` 高级输入只生成临时 profile，绝不
-写回项目。若存在仍有预算的未完成 real/mock campaign，菜单会显示最近一项并提供
+写回项目。在参数选择处输入 `fast` 会用仅限本次的
+`execution.fast_mode=true` 直接进入启动流程；真实运行仍需要输入 `RUN <project_id>`
+确认。若存在仍有预算的未完成 real/mock campaign，菜单会显示最近一项并提供
 `8. Continue previous`：未封存 epoch 走原地 resume，已封存 epoch 从 checkpoint
 新建下一 epoch。真实运行必须准确输入 `RUN <project_id>`，继续真实 campaign 必须输入
 `CONTINUE <campaign_id>`。每种 run 操作还会同步打开一个精确绑定恢复中或新分配 run ID

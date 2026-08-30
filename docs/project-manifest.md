@@ -69,10 +69,10 @@ project manifests and Director files continue to load, but any stale frontier or
 progress prose in the overlay is subordinate to the dynamic canonical snapshot.
 
 No project-manifest migration is required for crash recovery. The separate
-run-local `RUN_MANIFEST` is schema v13 for new epochs and pins campaign/epoch
+run-local `RUN_MANIFEST` is schema v14 for new epochs and pins campaign/epoch
 identity, absolute timing, AMR source provenance, and Codex App Server protocol
 provenance. Resume validates that record before any campaign write. Existing
-schema-v12 run manifests remain readable; they are marked as legacy-unpinned in
+schema-v12 and schema-v13 run manifests remain readable; they are normalized in
 the append-only event log rather than rewritten.
 
 The manifest-selected configuration is schema v12. Its optional Fast choice is

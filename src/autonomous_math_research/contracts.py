@@ -8,7 +8,7 @@ from typing import Any, Iterable
 # Bump this value whenever a wire schema, parser contract, or prompt contract
 # changes.  It is persisted in run manifests so recovery never has to infer the
 # protocol from whichever source file happens to be current.
-OUTPUT_PROTOCOL_VERSION = 2
+OUTPUT_PROTOCOL_VERSION = 3
 
 DIRECTOR_PLAN_KEYS = (
     "assessment",
@@ -24,6 +24,7 @@ WORKER_RESULT_KEYS = (
     "artifact_paths",
     "next_suggested_question",
     "evidence_level",
+    "asset_usage",
 )
 AUDIT_RESULT_KEYS = (
     "verdict",

@@ -642,6 +642,7 @@ class OpenAICompatibleAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "artifact_paths": [],
                 "next_suggested_question": "None.",
                 "evidence_level": "E0_SPECULATIVE",
+                "asset_usage": [],
             }
             return {
                 "id": "response-test", "model": "test-model",

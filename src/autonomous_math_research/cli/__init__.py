@@ -34,9 +34,15 @@ from ..lifecycle.campaign import (
 )
 from ..models import CandidateEvent
 from ..monitor import build_status, format_status, resolve_run, watch_run
-from ..policy import discover_policy_packs
+from ..policy import (
+    build_policy_manifest,
+    discover_policy_packs,
+    domain_contract_from_manifest,
+)
 from ..project import ProjectManifest
 from ..reconciliation import ReconciliationStore
+from ..research_memory import ResearchMemoryStore
+from ..research_record import ResearchRecordStore, RUN_PURPOSES
 from ..resources import policy_resource, schema_resource
 from ..smoke import (
     FULL_LIFECYCLE_SMOKE_BUDGET,
@@ -47,6 +53,7 @@ from ..smoke import (
 )
 from ..schema import load_schema, validate
 from ..semantic_alignment import SEMANTICS_FILENAME, SemanticAlignment, SemanticTrustState
+from ..domain_semantics import domain_semantics_from_contract
 from ..storage import ProjectLayout, atomic_write_json, file_digest, read_jsonl
 from ..storage.artifacts import PORTABLE_SCHEMES, portable_project_uri
 from ..storage.steering import append_steering, ingest_asset
@@ -186,11 +193,60 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_apply.add_argument("--workspace-root", type=Path)
     reconcile_apply.add_argument("--profile", type=Path)
     reconcile_apply.add_argument("--hours", type=float)
+
+    frontier = sub.add_parser(
+        "frontier",
+        help="rebuild or inspect noncanonical audited routing memory",
+    )
+    frontier_sub = frontier.add_subparsers(
+        dest="frontier_command", required=True,
+    )
+    frontier_rebuild = frontier_sub.add_parser(
+        "rebuild",
+        help="ingest structured external results/assets and rebuild current Frontier",
+    )
+    frontier_rebuild.add_argument("--project", type=Path, required=True)
+    frontier_rebuild.add_argument("--theme", type=Path)
+    frontier_inspect = frontier_sub.add_parser(
+        "inspect", help="print the current derived Frontier without rebuilding it",
+    )
+    frontier_inspect.add_argument("--project", type=Path, required=True)
+    frontier_context = frontier_sub.add_parser(
+        "context", help="retrieve a minimal relevant Frontier and Asset bundle",
+    )
+    frontier_context.add_argument("--project", type=Path, required=True)
+    frontier_context.add_argument("--claim", action="append", default=[])
+    frontier_context.add_argument("--scope", action="append", default=[])
+    frontier_context.add_argument("--representation", action="append", default=[])
+    frontier_context.add_argument("--method", action="append", default=[])
+    record = sub.add_parser(
+        "record", help="inspect or replay an immutable structured research record",
+    )
+    record_sub = record.add_subparsers(dest="record_command", required=True)
+    for name in ("inspect", "replay-context", "metrics"):
+        command = record_sub.add_parser(name)
+        command.add_argument("--project", type=Path, required=True)
+        command.add_argument("--run-id", required=True)
     run.add_argument(
         "--epoch-hours", type=float,
         help=(
             "maximum duration of this epoch (default: project campaign.epoch_hours, "
             f"built-in {DEFAULT_EPOCH_HOURS:g})"
+        ),
+    )
+    run.add_argument(
+        "--theme", type=Path,
+        help=(
+            "project-local Campaign Theme JSON path or a name under "
+            "autonomous/research_memory/themes; pinned for the whole campaign"
+        ),
+    )
+    run.add_argument(
+        "--purpose",
+        choices=tuple(sorted(RUN_PURPOSES)),
+        help=(
+            "freeze the campaign as DEVELOPMENT, NATURAL_RESEARCH, or EVALUATION; "
+            "defaults to NATURAL_RESEARCH for real runs and DEVELOPMENT otherwise"
         ),
     )
     run.add_argument(
@@ -654,10 +710,12 @@ async def _execute_epoch(args: argparse.Namespace):
         max_mechanical_subworkers=_mechanical_cap_override(args.max_mechanical_subworkers),
         mock=args.mock, resume=resume,
         recover_candidates_from=args.recover_candidates_from,
+        theme_path=getattr(args, "theme", None),
         campaign_id=args.campaign_id,
         previous_epoch_id=args.previous_epoch_id,
         campaign_hours=campaign_hours,
         epoch_hours=configured_epoch_hours,
+        run_purpose=getattr(args, "purpose", None),
     )
     result = await controller.run(epoch_hours, dry_run=args.dry_run)
     return result, config
@@ -752,6 +810,8 @@ async def _run_command(args: argparse.Namespace) -> int:
             recover_candidates_from=None,
             campaign_id=result.campaign_id,
             previous_epoch_id=previous_epoch_id,
+            purpose=getattr(args, "purpose", None),
+            theme=getattr(args, "theme", None),
         )
         result, config = await _execute_epoch(forwarded)
         results.append(result)
@@ -797,8 +857,146 @@ async def _continue_campaign(args: argparse.Namespace) -> int:
         auto_epochs=args.auto_epochs,
         run_id=args.run_id, recover_candidates_from=None, campaign_id=args.campaign,
         previous_epoch_id=previous_epoch_id,
+        purpose=None, theme=None,
     )
     return await _run_command(forwarded)
+
+
+def _frontier_command(args: argparse.Namespace) -> int:
+    project = args.project.resolve()
+    manifest = ProjectManifest.load(project)
+    layout = ProjectLayout(project)
+    store = ResearchMemoryStore(project, manifest.resolve(manifest.runtime_root))
+    if args.frontier_command == "inspect":
+        if not store.current_path.is_file():
+            raise ValueError("Audited Frontier has not been built")
+        payload = json.loads(store.current_path.read_text(encoding="utf-8"))
+    elif args.frontier_command == "context":
+        if not store.current_path.is_file():
+            raise ValueError("Audited Frontier has not been built")
+        state = json.loads(store.current_path.read_text(encoding="utf-8"))
+        payload = store.relevant_context_bundle(
+            claim_ids=args.claim,
+            scope_ids=args.scope,
+            representation_ids=args.representation,
+            method_ids=args.method,
+            state=state,
+        )
+    else:
+        config = load_config(project, require_manifest=True)
+        semantics = domain_semantics_from_contract(
+            domain_contract_from_manifest(build_policy_manifest(config))
+        )
+        graph = ClaimGraph.load(layout.claim_graph_path, semantics=semantics)
+        graph.validate()
+        theme = store.load_theme(args.theme) if args.theme is not None else None
+        epoch_id = datetime.now(timezone.utc).strftime("manual-%Y%m%dT%H%M%S.%fZ")
+        state, delta = store.reconcile(
+            graph=graph,
+            claim_graph_path=layout.claim_graph_path,
+            trusted_state_path=layout.trusted_state_path,
+            final_claim_id=config.final_conjecture_claim_id,
+            theme=theme,
+            phase="MANUAL",
+            campaign_id="manual",
+            epoch_id=epoch_id,
+        )
+        payload = {
+            "rebuilt": True,
+            "frontier_sha256": state["frontier_sha256"],
+            "current_path": str(store.current_path),
+            "asset_registry_path": str(store.registry_path),
+            "representation_graph_path": str(store.representation_graph_path),
+            "method_ledger_path": str(store.method_ledger_path),
+            "audit_index_path": str(store.audit_index_path),
+            "source_counts": state["source_counts"],
+            "delta": delta,
+            "canonical_authority_changed": False,
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _record_command(args: argparse.Namespace) -> int:
+    project = args.project.resolve()
+    layout = ProjectLayout(project)
+    run_dir = layout.run_dir(args.run_id)
+    manifest_path = run_dir / "RUN_MANIFEST.json"
+    if not manifest_path.is_file():
+        raise ValueError("run has no RUN_MANIFEST.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    AutonomousController._verify_run_manifest(manifest)
+    campaign = manifest.get("campaign") or {
+        "campaign_id": args.run_id,
+        "epoch_id": args.run_id,
+    }
+    store = ResearchRecordStore(
+        project_root=project,
+        runtime_root=layout.autonomous_root,
+        run_dir=run_dir,
+        campaign_root=layout.campaigns_root / str(campaign["campaign_id"]),
+        run_id=args.run_id,
+        campaign_id=str(campaign["campaign_id"]),
+        epoch_id=str(campaign["epoch_id"]),
+    )
+    if int(manifest.get("schema_version", 0)) >= 14:
+        if args.record_command == "inspect":
+            payload = store.inspect()
+        elif args.record_command == "replay-context":
+            payload = store.replay_context()
+        else:
+            payload = store.latest_metrics()
+    else:
+        events = read_jsonl(run_dir / "EVENTS.jsonl")
+        legacy_view = {
+            "schema_version": 1,
+            "compatibility": "PARTIAL_LEGACY_NORMALIZED_VIEW",
+            "historical_bytes_modified": False,
+            "run_id": args.run_id,
+            "run_manifest_schema_version": manifest.get("schema_version"),
+            "available_context": {
+                "config": manifest.get("config"),
+                "claim_graph": manifest.get("canonical_claim_graph"),
+                "canonical_state": manifest.get("canonical_state"),
+                "output_schemas": manifest.get("output_schemas"),
+                "research_policy": manifest.get("research_policy"),
+            },
+            "unavailable_context": [
+                "frontier_before", "asset_registry", "representation_graph",
+                "method_ledger", "director_decision_taxonomy",
+            ],
+            "event_count": len(events),
+        }
+        if args.record_command == "metrics":
+            jobs = [
+                item.get("payload") or {} for item in events
+                if item.get("kind") == "JOB_COMPLETED"
+            ]
+            mechanical_jobs = [
+                item.get("payload") or {} for item in events
+                if item.get("kind") in {
+                    "MECHANICAL_SUBTASK_COMPLETED", "MECHANICAL_SUBTASK_FAILED",
+                }
+            ]
+            payload = ResearchRecordStore.metrics(
+                run_id=args.run_id,
+                campaign_id=str(campaign["campaign_id"]),
+                epoch_id=str(campaign["epoch_id"]),
+                events=events,
+                jobs=jobs,
+                mechanical_jobs=mechanical_jobs,
+                frontier_delta=None,
+                started_at=(manifest.get("execution") or {}).get("started_at"),
+                ended_at=(
+                    str(events[-1].get("timestamp")) if events else "UNKNOWN"
+                ),
+            )
+            payload["compatibility"] = "PARTIAL_LEGACY_NORMALIZED_VIEW"
+            payload["historical_bytes_modified"] = False
+        else:
+            payload = legacy_view
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
 
 
 async def _probe_command(args: argparse.Namespace) -> int:
@@ -1090,6 +1288,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(json.dumps({"ingested": True, **record}, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "frontier":
+        try:
+            return _frontier_command(args)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                "rebuilt": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "canonical_authority_changed": False,
+            }, ensure_ascii=False, indent=2))
+            return 2
+    if args.command == "record":
+        try:
+            return _record_command(args)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                "valid": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "historical_bytes_modified": False,
+            }, ensure_ascii=False, indent=2))
+            return 2
     if args.command == "campaign":
         try:
             return asyncio.run(_continue_campaign(args))

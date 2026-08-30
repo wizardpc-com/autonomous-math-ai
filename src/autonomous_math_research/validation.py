@@ -8,6 +8,7 @@ from typing import Any
 from .claim_graph import ClaimGraph
 from .canonical_transition import CanonicalTransitionStore
 from .config import DEFAULT_PROTECTED, load_config
+from .contracts import OUTPUT_PROTOCOL_VERSION
 from .models import TrustStatus
 from .mechanical import attest_mechanical_host_capability
 from .policy import build_policy_manifest
@@ -236,7 +237,7 @@ def validate_project(
         "domain": graph.semantics.domain,
         "final_claim_id": manifest.final_claim_id,
         "workspace_root": str(config.workspace_root),
-        "output_protocol": 2,
+        "output_protocol": OUTPUT_PROTOCOL_VERSION,
         "schemas": [*sorted(schemas), "candidate_event.schema.json (local inbox)"],
         "config_schema": "config.schema.json",
         "policy_manifest_sha256": policy["manifest_sha256"],

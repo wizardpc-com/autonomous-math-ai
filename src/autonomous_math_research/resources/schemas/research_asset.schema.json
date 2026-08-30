@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "asset_id", "kind", "title", "what_it_gives", "scope_ids",
+    "claim_ids", "representation_ids", "preconditions", "do_not_use", "inputs",
+    "outputs", "proof_refs", "code_refs", "certificate_refs", "source_refs",
+    "audit", "known_failure_modes", "dependencies", "method_id", "do_not_repeat",
+    "reopen_if", "representation_edge", "provenance", "supersedes"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "asset_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$"},
+    "kind": {"enum": ["THEOREM", "LEMMA", "REPRESENTATION_BRIDGE", "RESEARCH_TOOL", "CERTIFICATE_VERIFIER", "NEGATIVE_RESULT", "KILL_GATE", "RESEARCH_HYPOTHESIS"]},
+    "title": {"type": "string", "minLength": 1},
+    "what_it_gives": {"type": "string", "minLength": 1},
+    "scope_ids": {"$ref": "#/$defs/strings"},
+    "claim_ids": {"$ref": "#/$defs/strings"},
+    "representation_ids": {"$ref": "#/$defs/strings"},
+    "preconditions": {"$ref": "#/$defs/strings"},
+    "do_not_use": {"$ref": "#/$defs/strings"},
+    "inputs": {"$ref": "#/$defs/strings"},
+    "outputs": {"$ref": "#/$defs/strings"},
+    "proof_refs": {"$ref": "#/$defs/evidenceRefs"},
+    "code_refs": {"$ref": "#/$defs/evidenceRefs"},
+    "certificate_refs": {"$ref": "#/$defs/evidenceRefs"},
+    "source_refs": {"$ref": "#/$defs/evidenceRefs"},
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "verdict", "independent", "auditor", "audit_level", "policy_version", "report_refs", "reuse_audit_key"],
+      "properties": {
+        "status": {"enum": ["AUDITED", "UNAUDITED", "UNPROVED", "CONFLICTING"]},
+        "verdict": {"type": ["string", "null"], "enum": ["PASS", "REJECT", "UNRESOLVED", null]},
+        "independent": {"type": "boolean"},
+        "auditor": {"type": ["string", "null"]},
+        "audit_level": {"enum": ["RESULT", "THEME_INTEGRATION", "GLOBAL"]},
+        "policy_version": {"type": "string", "minLength": 1},
+        "report_refs": {"$ref": "#/$defs/evidenceRefs"},
+        "reuse_audit_key": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "known_failure_modes": {"$ref": "#/$defs/strings"},
+    "dependencies": {"$ref": "#/$defs/strings"},
+    "method_id": {"type": ["string", "null"]},
+    "do_not_repeat": {"$ref": "#/$defs/strings"},
+    "reopen_if": {"$ref": "#/$defs/strings"},
+    "representation_edge": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["source_representation_id", "target_representation_id", "conditions", "localization", "saturation", "content", "exceptional_factors"],
+      "properties": {
+        "source_representation_id": {"type": "string", "minLength": 1},
+        "target_representation_id": {"type": "string", "minLength": 1},
+        "conditions": {"$ref": "#/$defs/strings"},
+        "localization": {"type": "string", "minLength": 1},
+        "saturation": {"type": "string", "minLength": 1},
+        "content": {"type": "string", "minLength": 1},
+        "exceptional_factors": {"$ref": "#/$defs/strings"}
+      }
+    },
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "supersedes": {"$ref": "#/$defs/strings"}
+  },
+  "$defs": {
+    "strings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "evidenceRefs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidenceRef"}
+    },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["producer", "origin", "produced_at", "lineage"],
+      "properties": {
+        "producer": {"type": "string", "minLength": 1},
+        "origin": {"type": "string", "minLength": 1},
+        "produced_at": {"type": "string", "minLength": 1},
+        "lineage": {"$ref": "#/$defs/strings"}
+      }
+    }
+  }
+}

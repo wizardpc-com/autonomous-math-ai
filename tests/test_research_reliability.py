@@ -58,6 +58,7 @@ def worker_result(
         "artifact_paths": [],
         "next_suggested_question": "continue the next open obligation",
         "evidence_level": "E0_SPECULATIVE",
+        "asset_usage": [],
     }
 
 

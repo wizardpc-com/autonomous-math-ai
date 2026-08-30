@@ -6,8 +6,8 @@ title Autonomous Math AI
 rem Generic bootstrap only. Project paths and research configuration never live here.
 if not defined AMR_HARNESS_ROOT set "AMR_HARNESS_ROOT=%~dp0."
 if not defined AMR_VENV_ROOT set "AMR_VENV_ROOT=%LOCALAPPDATA%\autonomous-math-ai-venv"
-rem 1 refreshes the local harness installation on every launch; 0 reuses it.
-if not defined AMR_REFRESH_HARNESS set "AMR_REFRESH_HARNESS=1"
+rem 0 reuses the local harness installation; set 1 only while the shared venv is idle.
+if not defined AMR_REFRESH_HARNESS set "AMR_REFRESH_HARNESS=0"
 set "AMR_LAUNCHER_INTERACTIVE=0"
 if "%~1"=="" set "AMR_LAUNCHER_INTERACTIVE=1"
 
@@ -43,9 +43,19 @@ if not errorlevel 1 (
 exit /b %ERRORLEVEL%
 
 :install_harness
+call :ensure_venv_idle
+if errorlevel 1 exit /b %ERRORLEVEL%
 echo Installing local harness: %AMR_HARNESS_ROOT%
 "%AMR_VENV_ROOT%\Scripts\python.exe" -m pip install --disable-pip-version-check --upgrade "%AMR_HARNESS_ROOT%"
 exit /b %ERRORLEVEL%
+
+:ensure_venv_idle
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$root=[IO.Path]::GetFullPath($env:AMR_VENV_ROOT).TrimEnd([IO.Path]::DirectorySeparatorChar)+[IO.Path]::DirectorySeparatorChar; $busy=@(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $processPath=$_.Path } catch { $processPath=$null }; $processPath -and [IO.Path]::GetFullPath($processPath).StartsWith($root,[StringComparison]::OrdinalIgnoreCase) }); if ($busy) { $busy | Select-Object Id,ProcessName,Path | Format-Table -AutoSize; exit 32 }"
+if errorlevel 1 (
+  echo Refusing to install or upgrade while the shared virtual environment is in use.
+  exit /b 32
+)
+exit /b 0
 
 :harness_error
 echo Harness checkout not found: %AMR_HARNESS_ROOT%\pyproject.toml

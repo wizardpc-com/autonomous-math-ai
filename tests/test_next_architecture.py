@@ -620,8 +620,8 @@ class NextArchitectureTests(unittest.TestCase):
         run_manifest = json.loads(
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(run_manifest["schema_version"], 13)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.14")
+        self.assertEqual(run_manifest["schema_version"], 14)
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.15")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -1200,7 +1200,10 @@ class NextArchitectureTests(unittest.TestCase):
         manifest_path = controller.run_dir / "RUN_MANIFEST.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest.pop("runtime_provenance")
+        manifest.pop("run_purpose")
+        manifest.pop("research_record")
         manifest["schema_version"] = 12
+        manifest["output_protocol"]["version"] = 2
         unsigned = dict(manifest)
         unsigned.pop("manifest_sha256")
         manifest["manifest_sha256"] = stable_hash(unsigned)
@@ -1944,7 +1947,7 @@ class NextArchitectureTests(unittest.TestCase):
         snapshot = json.loads(
             first._write_compact_snapshot().read_text(encoding="utf-8")
         )
-        self.assertEqual(snapshot["schema_version"], 3)
+        self.assertEqual(snapshot["schema_version"], 4)
         self.assertEqual(snapshot["pending_research"], [])
         self.assertEqual(
             [item["task_id"] for item in snapshot["next_epoch_pending_research"]],

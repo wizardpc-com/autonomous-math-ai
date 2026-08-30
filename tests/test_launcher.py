@@ -214,6 +214,68 @@ class UnifiedLauncherTests(unittest.TestCase):
         self.assertEqual(len(profiles), 1)
         self.assertFalse(profiles[0].exists())
 
+    def test_fast_keyword_starts_with_one_time_fast_profile(self) -> None:
+        profiles: list[Path] = []
+
+        def runner(arguments):  # type: ignore[no-untyped-def]
+            args = list(arguments)
+            profile = Path(args[args.index("--profile") + 1])
+            self.assertTrue(profile.is_file())
+            config = load_config(self.project, profile_path=profile)
+            self.assertTrue(config.fast_mode)
+            self.assertEqual(config.requested_service_tier, "fast")
+            self.assertTrue(all(
+                route["service_tier"] == "fast"
+                for route in config.raw["models"].values()
+            ))
+            worker = config.raw["policy"]["one_shot_compute_worker"]
+            self.assertIsNone(worker["service_tier"])
+            self.assertIsNone(worker["primary_route"]["service_tier"])
+            self.assertIsNone(worker["fallback_route"]["service_tier"])
+            profiles.append(profile)
+            return 0
+
+        result = run_launcher(
+            project_root=self.project,
+            action="real",
+            state_path=self.state,
+            input_fn=self._inputs(["fast", "RUN alpha"]),
+            output=lambda _text: None,
+            command_runner=runner,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(load_config(self.project).fast_mode)
+        self.assertEqual(len(profiles), 1)
+        self.assertFalse(profiles[0].exists())
+
+    def test_fast_keyword_fails_closed_when_fast_profile_is_invalid(self) -> None:
+        commands: list[list[str]] = []
+        messages: list[str] = []
+
+        def reject_fast(*args, **kwargs):  # type: ignore[no-untyped-def]
+            config = load_config(*args, **kwargs)
+            if config.fast_mode:
+                raise ValueError("provider does not support fast")
+            return config
+
+        with patch(
+            "autonomous_math_research.launcher.load_config",
+            side_effect=reject_fast,
+        ):
+            result = run_launcher(
+                project_root=self.project,
+                action="real",
+                state_path=self.state,
+                input_fn=self._inputs(["fast", "r", "b"]),
+                output=messages.append,
+                command_runner=lambda args: commands.append(list(args)) or 0,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(commands, [])
+        self.assertTrue(any("配置预检失败" in item for item in messages))
+
     def test_monitor_command_waits_for_the_exact_launcher_run(self) -> None:
         command = _monitor_command(self.project, "20260820T010203.123456Z")
         self.assertIn("watch", command)
@@ -355,6 +417,7 @@ class UnifiedLauncherTests(unittest.TestCase):
         self.assertIn("alpha", summary)
         self.assertIn("prover", summary)
         self.assertIn("gpt-5.6-sol", summary)
+        self.assertIn("Fast: OFF", summary)
         self.assertNotIn("sk-", summary)
 
 
