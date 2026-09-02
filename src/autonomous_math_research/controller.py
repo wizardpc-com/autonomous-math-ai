@@ -8461,6 +8461,7 @@ class AutonomousController:
                     "action": "reuse canonical registration and request fresh audit",
                 })
             try:
+                self.graph.validate_candidate_dependencies(event)
                 self._validate_candidate_provenance(event)
                 self._validate_final_target_candidate(event)
                 self._validate_candidate_evidence(event)
@@ -9209,6 +9210,12 @@ class AutonomousController:
                         self.domain_semantics.event_transitions
                     ),
                     "assigned_claim_id": task.target_claim,
+                    "allowed_dependency_claim_ids": sorted(self.graph.claims),
+                    "dependency_rule": (
+                        "candidate_event.dependencies accepts existing ClaimGraph claim IDs "
+                        "only; external source IDs, asset IDs, task IDs, and representation "
+                        "IDs remain in input_closure/source_bindings, evidence, or provenance"
+                    ),
                     "semantic_binding": (
                         {
                             "representation_id": semantic_binding.representation_id,
@@ -9243,6 +9250,7 @@ class AutonomousController:
                 "--project", str(self.config.project_root),
                 "--file", str(workspace / "candidate_event.json"),
                 "--inbox-dir", str(job_inbox),
+                "--claim-graph", str(nightly_claim_graph),
             ])
             prompt = worker_prompt(
                 self.config.project_root, task, packet, event_command,
@@ -9617,7 +9625,12 @@ class AutonomousController:
         )
         return "applied", None
 
-    def _pause_for_next_epoch_frontier(self, selected_task_ids: list[str]) -> None:
+    def _pause_for_next_epoch_frontier(self) -> None:
+        deferred_task_ids = [
+            task.task_id for task in self.deferred_research_continuations
+        ]
+        if not deferred_task_ids or len(deferred_task_ids) != len(set(deferred_task_ids)):
+            raise ValueError("next-epoch continuation frontier is empty or has duplicate ids")
         self.director_needed = False
         self._replan_after_wave = False
         if self.lifecycle.phase is LifecyclePhase.RUNNING:
@@ -9627,10 +9640,9 @@ class AutonomousController:
             )
         self.scheduler_stop_reason = NEXT_EPOCH_FRONTIER_READY_REASON
         self.store.append("NEXT_EPOCH_FRONTIER_READY", {
-            "selected_task_ids": selected_task_ids,
-            "deferred_task_ids": [
-                task.task_id for task in self.deferred_research_continuations
-            ],
+            "selected_task_ids": deferred_task_ids,
+            "deferred_task_ids": deferred_task_ids,
+            "selection_authority": "controller",
             "action": "seal the current epoch and import the verified frontier in a fresh epoch",
             "internal_failure": False,
         })
@@ -9952,13 +9964,16 @@ class AutonomousController:
             or self.pending_audits
             or any(item.kind in {"research", "audit"} for item in self.active.values())
         )
-        deferred_only_selection = bool(
-            plan.spawn
-            and len(deferred_proposals) == len(plan.spawn)
-            and self.deferred_research_continuations
+        controller_owned_next_epoch_handoff = bool(
+            self.deferred_research_continuations
             and not healthy_work
+            and not runnable
+            and (
+                not plan.spawn
+                or len(deferred_proposals) == len(plan.spawn)
+            )
         )
-        if not runnable and not deferred_only_selection:
+        if not runnable and not controller_owned_next_epoch_handoff:
             repair_constraint: dict[str, Any] = {
                 "action": "REPAIR_PLAN",
                 "claim_id": self.final_conjecture_claim_id or "FRONTIER",
@@ -9982,10 +9997,8 @@ class AutonomousController:
                 meaningful_change=False,
                 immediate=False,
             )
-        elif deferred_only_selection:
-            self._pause_for_next_epoch_frontier([
-                task.task_id for task in deferred_proposals
-            ])
+        elif controller_owned_next_epoch_handoff:
+            self._pause_for_next_epoch_frontier()
         elif not runnable:
             self._queue_director_retry(
                 "director_no_runnable_work",

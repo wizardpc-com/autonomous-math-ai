@@ -221,16 +221,19 @@ files before their terminal records exist. An artifact failure or operator
 interrupt records a terminal diagnostic and cannot enter the automatic epoch
 loop.
 
-With `amr run --auto-epochs`, an ordinary epoch-time seal immediately launches
-a new controller and epoch using the latest usable checkpoint. The campaign
-duration remains the outer budget; the last epoch is shortened to the remaining
-time. A fresh controller repeats canonical refresh, consistency checks, stale-
-planning disposal, and derived-state rebuild every time. Only the exact clean
-epoch-time boundary is auto-continuable. Quota pause, canonical/bootstrap
-failure, internal failure, stop-after-epoch steering, final-claim completion,
-and campaign-budget exhaustion terminate the loop. `amr campaign continue`
-remains compatible and accepts optional `--auto-epochs` for unattended
-continuation from an already sealed checkpoint.
+With `amr run --auto-epochs`, an ordinary epoch-time seal or a controller-
+attested `NEXT_EPOCH_FRONTIER_READY` seal immediately launches a new controller
+and epoch using the latest usable checkpoint. The latter is emitted when
+verified continuations are the only remaining frontier and a conforming
+Director returns no current-epoch runnable work; the Director never has to
+resubmit a forbidden deferred task. The campaign duration remains the outer
+budget; the last epoch is shortened to the remaining time. A fresh controller
+repeats canonical refresh, consistency checks, stale-planning disposal, and
+derived-state rebuild every time. Quota pause, canonical/bootstrap failure,
+internal failure, stop-after-epoch steering, final-claim completion, and
+campaign-budget exhaustion terminate the loop. `amr campaign continue` remains
+compatible and accepts optional `--auto-epochs` for unattended continuation
+from an already sealed checkpoint.
 
 The same loop may follow a crash recovery with
 `amr run --resume EPOCH_ID --auto-epochs`: the resumed epoch must first recover
@@ -464,6 +467,13 @@ with an internal read-path mapping while preserving the portable reference in
 the task and event history. `ResearchTask.dependencies` names existing
 `ClaimGraph` claims only; task-to-task sequencing is expressed by a later
 Director wave rather than by placing task ids in that field.
+
+`CandidateEvent.dependencies` uses the same ClaimGraph-only namespace. External
+result/source ids remain in input closure and source bindings; asset, task, and
+representation ids remain in their evidence or provenance fields. The worker-
+facing emit helper checks the frozen ClaimGraph before writing its inbox file,
+and the controller repeats the check at final candidate admission without
+deleting, converting, or substituting unknown ids.
 
 `CORE_CAPSULE` is a bounded rebuildable snapshot, `RESEARCH_MAP` is a derived
 human-readable view, and `ROUTE_LEDGER` records failed approaches and explicit

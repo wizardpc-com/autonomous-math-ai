@@ -284,8 +284,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-epochs",
         action="store_true",
         help=(
-            "automatically start fresh epochs at ordinary epoch time boundaries "
-            "until the campaign time budget is exhausted"
+            "automatically start fresh epochs at ordinary epoch time boundaries or "
+            "controller-attested next-epoch frontiers until the campaign time budget "
+            "is exhausted"
         ),
     )
     run.add_argument("--resume", nargs="?", const="latest")
@@ -1232,6 +1233,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         with schema_resource("candidate_event.schema.json") as schema_path:
             validate(data, load_schema(schema_path))
             event = CandidateEvent.from_dict(data)
+            layout = ProjectLayout(project)
+            graph = ClaimGraph.load(layout.claim_graph_path)
+            graph.validate()
+            graph.validate_candidate_dependencies(event)
             portable: list[str] = []
             for raw in event.artifact_paths:
                 if raw.startswith(PORTABLE_SCHEMES):
@@ -1244,7 +1249,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 portable.append(portable_project_uri(project, resolved))
             event.artifact_paths = portable
-            layout = ProjectLayout(project)
             layout.ensure()
             inbox = CandidateInbox(layout)
             target = inbox.submit(

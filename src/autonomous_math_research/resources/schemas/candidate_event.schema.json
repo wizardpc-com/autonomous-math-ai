@@ -19,7 +19,11 @@
     "dependency_impact": {"type": "array", "items": {"type": "string"}},
     "proposed_evidence_level": {"type": "string", "enum": ["E0_SPECULATIVE", "E1_NUMERIC", "E2_EXACT_TESTED", "E3_REDUNDANT_EXACT", "E4_CERTIFIED", "E5_FORMAL"]},
     "assumptions": {"type": "array", "items": {"type": "string"}},
-    "dependencies": {"type": "array", "items": {"type": "string"}},
+    "dependencies": {
+      "type": "array",
+      "description": "Existing ClaimGraph claim IDs only. External source IDs, asset IDs, task IDs, and representation IDs belong in input_closure/source_bindings, evidence, or provenance fields.",
+      "items": {"type": "string"}
+    },
     "evidence_receipts": {
       "type": "array",
       "items": {

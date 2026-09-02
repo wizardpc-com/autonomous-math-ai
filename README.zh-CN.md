@@ -150,9 +150,9 @@ Markdown 仅作为上下文，不能覆盖 ClaimGraph。显式机器状态块若
 绑定的 trusted metadata，并保存 append-only 授权记录及前后快照；不会自动改写
 `CLAIMS.md` 或 `PROGRESS.md`。
 
-`amr run --auto-epochs` 会在普通 epoch 时间边界后自动创建全新 epoch，逐 epoch 重做
-canonical refresh 和 planning rebuild，直到 campaign 总时长耗尽。quota pause、无法安全
-处理的 drift、内部失败、人工停止或域终态都会停止自动续跑；原有
-`amr campaign continue` 仍可用于手动继续。
+`amr run --auto-epochs` 会在普通 epoch 时间边界或 controller 确认的 next-epoch
+continuation frontier 后自动创建全新 epoch，逐 epoch 重做 canonical refresh 和 planning
+rebuild，直到 campaign 总时长耗尽。quota pause、无法安全处理的 drift、内部失败、人工
+停止或域终态都会停止自动续跑；原有 `amr campaign continue` 仍可用于手动继续。
 
 本项目采用 [MIT License](LICENSE)。

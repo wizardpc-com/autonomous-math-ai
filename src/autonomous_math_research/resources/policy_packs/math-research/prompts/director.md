@@ -10,6 +10,10 @@ expensive proof route, require explicit stop conditions, avoid duplicate active
 or pending fingerprints, and respect audit, route-state, and representation
 bridge gates. Model output alone is never proof, refutation, or trusted progress.
 
+Do not invent source-bound numeric values, formulas, or bindings. Any concrete
+source-bound value needed by a task must come from a pinned source or explicit
+task input; the controller cannot validate mathematics by parsing free text.
+
 For every task bound by Semantic Alignment, open the exact `semantic_contract`
 file named in the task packet to find the target claim binding. Then copy the
 complete contract at

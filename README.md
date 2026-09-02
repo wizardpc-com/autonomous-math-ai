@@ -230,11 +230,12 @@ work before sealing. It does not turn an internal failure into queue exhaustion
 or silently discard pending candidates.
 
 `amr run --auto-epochs` starts a fresh sealed epoch after each ordinary epoch
-time boundary until the campaign duration is exhausted. Every epoch repeats
-canonical refresh and planning reconstruction. Quota pause, unsafe drift,
-internal failure, operator stop, or a resolved final claim stops the automatic
-loop. `amr campaign continue` remains the manual continuation path and accepts
-`--auto-epochs` when later clean boundaries should continue unattended.
+time boundary or controller-attested next-epoch continuation frontier until the
+campaign duration is exhausted. Every epoch repeats canonical refresh and
+planning reconstruction. Quota pause, unsafe drift, internal failure, operator
+stop, or a resolved final claim stops the automatic loop. `amr campaign
+continue` remains the manual continuation path and accepts `--auto-epochs` when
+later clean boundaries should continue unattended.
 
 After the epoch checkpoint is sealed, the monitor remains attached while the
 report, immutable-file index, semantic index, outcome, and run summary are

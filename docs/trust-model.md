@@ -19,6 +19,11 @@ separates generation, evidence, audit, and trust.
 Evidence levels communicate what was actually checked. They do not silently
 upgrade when a related or narrower subclaim receives stronger evidence.
 
+Candidate dependencies name existing ClaimGraph claims only. External source,
+asset, task, and representation identifiers remain in their dedicated input,
+evidence, or provenance fields; neither the emit helper nor the controller may
+silently translate them into claim dependencies.
+
 Canonical `ClaimGraph` obligations remain open until the selected domain's
 required audit and canonical gates close them. The math pack uses proof
 obligations; non-math packs use certificate or empirical-protocol frontiers and

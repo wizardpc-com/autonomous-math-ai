@@ -57,6 +57,15 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A controller-verified next-epoch continuation frontier now seals cleanly when
+  a conforming Director returns no current-epoch work. The transition no longer
+  depends on the Director resubmitting a task that its prompt forbids, and
+  `--auto-epochs` can import the checkpoint in a fresh epoch without consuming
+  Director repair retries.
+- Candidate dependencies now use one explicit ClaimGraph-only namespace across
+  schema, task packet, worker prompt, emit helper, and final controller
+  admission. Unknown source, asset, task, or representation ids fail before the
+  inbox write and are never silently removed or translated.
 - Research jobs now distinguish persistent execution blockers from mathematical
   claim state, stop after one blocker repair, and cap ordinary Prover,
   Falsifier, and Explorer turns at 4/3/3 by default. Candidate validation

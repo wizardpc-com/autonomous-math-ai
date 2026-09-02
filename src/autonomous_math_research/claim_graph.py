@@ -482,13 +482,22 @@ class ClaimGraph:
         """Compatibility alias for the mathematical ClaimGraph API."""
         return self.research_frontier(claim_id)
 
+    def validate_candidate_dependencies(self, event: CandidateEvent) -> None:
+        missing = sorted(set(event.dependencies) - set(self.claims))
+        if missing:
+            raise ValueError(
+                "candidate_event.dependencies contains unknown ClaimGraph claim IDs: "
+                f"{missing}. This field accepts existing ClaimGraph claim IDs only; "
+                "external source IDs, asset IDs, task IDs, and representation IDs "
+                "must remain in input_closure/source_bindings, evidence, or provenance "
+                "fields. No dependency was removed or rewritten."
+            )
+
     def mark_candidate(self, event: CandidateEvent) -> None:
         self.semantics.validate_event_type(event.type)
+        self.validate_candidate_dependencies(event)
         claim = self.claims.get(event.claim_id)
         if claim is None:
-            missing = set(event.dependencies) - set(self.claims)
-            if missing:
-                raise ValueError(f"candidate has unknown dependencies: {sorted(missing)}")
             if event.parent_claim_id is not None and event.parent_claim_id not in self.claims:
                 raise ValueError(f"candidate has unknown parent claim: {event.parent_claim_id}")
             claim = Claim(

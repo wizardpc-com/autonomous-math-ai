@@ -38,6 +38,7 @@ from autonomous_math_research.director_context import (
     utf8_size,
 )
 from autonomous_math_research.eventing import CandidateInbox
+from autonomous_math_research.emit_event import main as emit_event_main
 from autonomous_math_research.initializer import initialize_project
 from autonomous_math_research.lifecycle.audit_lease import AuditLeaseBook
 from autonomous_math_research.lifecycle.campaign import CampaignStore
@@ -621,7 +622,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 14)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.15")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.16")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -1367,7 +1368,7 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertTrue(events[-1]["payload"]["artifacts_finalized"])
         self.assertTrue(events[-1]["payload"]["operator_interrupted"])
 
-    def test_auto_epochs_continue_only_at_clean_epoch_boundaries(self) -> None:
+    def test_auto_epochs_start_fresh_epoch_for_controller_frontier(self) -> None:
         profile = self.root / "fast-profile.json"
         profile.write_text(json.dumps({
             "profile_schema_version": 1,
@@ -1411,7 +1412,7 @@ class NextArchitectureTests(unittest.TestCase):
             final = index == 2
             reason = (
                 "campaign time budget exhausted" if final
-                else "epoch time limit reached"
+                else NEXT_EPOCH_FRONTIER_READY_REASON
             )
             status = "STOPPED" if final else "PAUSED"
             store.append_epoch_sealed(
@@ -1958,6 +1959,98 @@ class NextArchitectureTests(unittest.TestCase):
             [continued.task_id],
         )
 
+    def test_token_continuation_empty_plan_handoffs_and_imports_once(self) -> None:
+        config = load_config(self.project)
+        first = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="token-frontier-one", campaign_id="token-frontier-campaign",
+        )
+        first._pin_run_inputs(0.01, True)
+        first.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        first.director_needed = False
+        task = research_task("token-limited-task")
+        outcome = JobOutcome(
+            job_id="job-token-limited", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed",
+            result={
+                "result_type": "NO_PROGRESS",
+                "status": "OPEN",
+                "main_finding": "A durable intermediate reduction remains incomplete.",
+                "next_suggested_question": "Continue the exact remaining reduction.",
+                "artifact_paths": [],
+                "evidence_level": "E0_SPECULATIVE",
+            },
+            turn_history=[{"turn_index": 1}],
+            logical_stop_reason="controller token budget reached",
+        )
+        job_record = self._durable_research_job_record(first, outcome)
+
+        first._accept_research_result(outcome, task, job_record)
+
+        self.assertEqual(len(first.deferred_research_continuations), 1)
+        continuation = first.deferred_research_continuations[0]
+        checkpoint = json.loads(
+            first._write_compact_snapshot().read_text(encoding="utf-8")
+        )
+        self.assertEqual(checkpoint["pending_research"], [])
+        self.assertEqual(checkpoint["pending_audits"], [])
+        self.assertEqual(checkpoint["candidate_audit_frontier"], [])
+        self.assertEqual(
+            [item["task_id"] for item in checkpoint["next_epoch_pending_research"]],
+            [continuation.task_id],
+        )
+        self.assertFalse(first.active)
+        empty_plan = {
+            "assessment": "Only the next-epoch checkpoint remains.",
+            "spawn": [],
+            "audit_priorities": [],
+            "route_updates": [],
+            "short_rationale": "Deferred work is forbidden in the current epoch.",
+        }
+        first._accept_director_result(JobOutcome(
+            job_id="director-empty", task_id="director-empty", role="director",
+            claim_id="FRONTIER", status="completed", result=empty_plan,
+        ))
+
+        events = first.store.replay()
+        kinds = [event["kind"] for event in events]
+        self.assertEqual(first.scheduler_stop_reason, NEXT_EPOCH_FRONTIER_READY_REASON)
+        self.assertEqual(first.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        self.assertIn("NEXT_EPOCH_FRONTIER_READY", kinds)
+        self.assertNotIn("DIRECTOR_PLAN_REPAIR_REQUIRED", kinds)
+        self.assertNotIn("DIRECTOR_RETRY_QUEUED", kinds)
+        self.assertNotIn("director_no_runnable_work", json.dumps(events))
+        frontier = next(
+            event["payload"] for event in events
+            if event["kind"] == "NEXT_EPOCH_FRONTIER_READY"
+        )
+        self.assertEqual(frontier["selection_authority"], "controller")
+        self.assertEqual(frontier["selected_task_ids"], [continuation.task_id])
+        first._write_compact_snapshot()
+
+        second = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="token-frontier-two", campaign_id="token-frontier-campaign",
+            previous_epoch_id="token-frontier-one",
+        )
+        second._pin_run_inputs(0.01, True)
+        second._import_previous_epoch_checkpoint()
+
+        self.assertEqual(
+            [item.task_id for item in second.pending_research],
+            [continuation.task_id],
+        )
+        self.assertNotIn(task.task_id, {
+            item.task_id for item in second.pending_research
+        })
+        self.assertEqual(
+            sum(
+                event["kind"] == "RESEARCH_CONTINUATION_IMPORTED"
+                for event in second.store.replay()
+            ),
+            1,
+        )
+
     def test_controller_token_boundary_without_artifact_pauses_without_next_epoch(self) -> None:
         config = load_config(self.project)
         controller = AutonomousController(
@@ -2419,7 +2512,7 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(latest["representation_id"], contract.representation_id)
         self.assertEqual([item.task_id for item in controller.pending_research], [task.task_id])
 
-    def test_director_selecting_only_deferred_work_closes_current_epoch_cleanly(self) -> None:
+    def test_legacy_director_deferred_selection_closes_current_epoch_cleanly(self) -> None:
         controller = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=True,
             run_id="deferred-frontier", campaign_id="campaign-1",
@@ -2448,6 +2541,7 @@ class NextArchitectureTests(unittest.TestCase):
         kinds = [event["kind"] for event in controller.store.replay()]
         self.assertIn("TASK_DEFERRED_UNTIL_NEXT_EPOCH", kinds)
         self.assertIn("NEXT_EPOCH_FRONTIER_READY", kinds)
+        self.assertNotIn("DIRECTOR_PLAN_REPAIR_REQUIRED", kinds)
         self.assertNotIn("DIRECTOR_RETRY_QUEUED", kinds)
 
     def test_director_retry_requires_the_stored_controller_condition(self) -> None:
@@ -2626,7 +2720,13 @@ class NextArchitectureTests(unittest.TestCase):
         task.role = "prover"
         task.required_files = ["project://claims/CLAIMS.md"]
         controller.pending_research = [task]
-        controller._start_job = lambda *args, **kwargs: "job-packet"  # type: ignore[method-assign]
+        captured: dict[str, object] = {}
+
+        def capture_start(*args, **kwargs):  # type: ignore[no-untyped-def]
+            captured["prompt"] = args[1]
+            return "job-packet"
+
+        controller._start_job = capture_start  # type: ignore[method-assign]
 
         asyncio.run(controller._launch_research(capacity=1, allow_exploration=False))
 
@@ -2646,6 +2746,16 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertNotIn(
             "CERTIFICATE", packet["candidate_protocol"]["allowed_event_types"],
         )
+        self.assertEqual(
+            packet["candidate_protocol"]["allowed_dependency_claim_ids"],
+            sorted(controller.graph.claims),
+        )
+        self.assertIn(
+            "external source IDs", packet["candidate_protocol"]["dependency_rule"],
+        )
+        prompt = str(captured["prompt"])
+        self.assertIn("candidate_event.dependencies may contain only", prompt)
+        self.assertIn("--claim-graph", prompt)
         self.assertEqual(len(packet["required_file_access"]), 1)
         access = packet["required_file_access"][0]
         self.assertEqual(access["reference"], "project://claims/CLAIMS.md")
@@ -2659,6 +2769,140 @@ class NextArchitectureTests(unittest.TestCase):
             (self.project / "claims" / "CLAIMS.md").read_bytes(),
         )
         self.assertEqual(access["sha256"], file_digest(materialized))
+
+    def test_emit_helper_rejects_external_dependency_before_inbox_write(self) -> None:
+        layout = ProjectLayout(self.project)
+        event = CandidateEvent(
+            event_id="external-dependency", producer_thread_id=None,
+            producer_task_id="producer-task", claim_id="C_ROOT",
+            parent_claim_id=None, type="KEY_LEMMA", impact="HIGH",
+            concise_summary="One candidate with a misplaced source id.",
+            exact_statement="The initialized root claim.", artifact_paths=[],
+            reproduction_commands=[], dependency_impact=[],
+            dependencies=["external-result-source-v1"],
+        )
+        payload = event.to_dict()
+        payload.pop("fingerprint")
+        candidate_path = self.root / "external-dependency.json"
+        candidate_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        target_root = layout.inbox_root / event.producer_task_id
+
+        with (
+            patch("sys.argv", [
+                "autonomous-math-emit-event",
+                "--project", str(self.project),
+                "--file", str(candidate_path),
+                "--inbox-dir", str(target_root),
+                "--claim-graph", str(layout.claim_graph_path),
+            ]),
+            self.assertRaisesRegex(
+                ValueError,
+                "unknown ClaimGraph claim IDs.*external-result-source-v1.*"
+                "input_closure/source_bindings",
+            ),
+        ):
+            emit_event_main()
+
+        self.assertFalse(target_root.exists())
+
+    def test_controller_rejects_unknown_dependency_after_helper_bypass(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="candidate-final-dependency-gate",
+            campaign_id="candidate-final-dependency-gate",
+        )
+        event = CandidateEvent(
+            event_id="bypass-unknown-dependency", producer_thread_id=None,
+            producer_task_id="producer-task", claim_id="C_ROOT",
+            parent_claim_id=None, type="KEY_LEMMA", impact="HIGH",
+            concise_summary="An invalid candidate bypassed the worker helper.",
+            exact_statement="The initialized root claim.", artifact_paths=[],
+            reproduction_commands=[], dependency_impact=[],
+            dependencies=["external-result-source-v1"],
+        )
+        controller.inbox.submit(
+            event, target_root=controller._task_inbox(event.producer_task_id),
+        )
+        asyncio.run(controller._poll_filesystem_candidates())
+        asyncio.run(controller._process_candidate_queue())
+
+        rejected = [
+            item["payload"] for item in controller.store.replay()
+            if item["kind"] == "CANDIDATE_REJECTED"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("unknown ClaimGraph claim IDs", rejected[0]["reason"])
+        self.assertFalse(rejected[0]["auditor_queue_entered"])
+        self.assertEqual(controller.audit_gate.states, {})
+
+    def test_legal_claim_dependency_enters_controller_audit_flow(self) -> None:
+        config = load_config(self.project)
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=False,
+            run_id="candidate-dependency", campaign_id="candidate-dependency",
+        )
+        controller._pin_run_inputs(0.01, True)
+        task = research_task("legal-dependency-producer")
+        task.role = "prover"
+        task.metadata["allow_derived_claims"] = True
+        controller.store.append("TASK_ACCEPTED", {
+            "task_id": task.task_id,
+            "fingerprint": task.fingerprint,
+            "representation_id": task.representation_id,
+            "task": task.to_dict(),
+        })
+        controller.store.append("JOB_STARTED", {
+            "job_id": "job-legal-dependency",
+            "task_id": task.task_id,
+            "role": task.role,
+            "claim_id": task.target_claim,
+        })
+        event = CandidateEvent.from_dict({
+            "event_id": "legal-claim-dependency",
+            "producer_task_id": task.task_id,
+            "claim_id": "AUTO_DERIVED",
+            "parent_claim_id": "C_ROOT",
+            "type": "KEY_LEMMA",
+            "impact": "HIGH",
+            "concise_summary": "A derived claim depends on the existing root claim.",
+            "exact_statement": "A neutral derived subclaim remains auditable.",
+            "artifact_paths": [],
+            "reproduction_commands": [],
+            "dependency_impact": [],
+            "dependencies": ["C_ROOT"],
+        })
+        payload = event.to_dict()
+        payload.pop("fingerprint")
+        candidate_path = self.root / "legal-dependency.json"
+        candidate_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch("sys.argv", [
+                "autonomous-math-emit-event",
+                "--project", str(self.project),
+                "--file", str(candidate_path),
+                "--inbox-dir", str(controller._task_inbox(task.task_id)),
+                "--claim-graph", str(controller.active_graph_path),
+            ]),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(emit_event_main(), 0)
+        asyncio.run(controller._poll_filesystem_candidates())
+        asyncio.run(controller._process_candidate_queue())
+
+        events = controller.store.replay()
+        self.assertIn("CANDIDATE_PROCESSED", [item["kind"] for item in events])
+        self.assertNotIn("CANDIDATE_REJECTED", [item["kind"] for item in events])
+        self.assertEqual(len(controller.audit_gate.states), 1)
+        state = next(iter(controller.audit_gate.states.values()))
+        self.assertEqual(state.event.dependencies, ["C_ROOT"])
+        self.assertTrue(controller.pending_audits)
 
     def test_research_required_file_rejects_credential_bearing_names(self) -> None:
         controller = AutonomousController(
