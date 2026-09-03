@@ -58,6 +58,7 @@ from autonomous_math_research.lifecycle.state import (
 from autonomous_math_research.models import (
     AuditResult, CandidateEvent, Claim, JobOutcome, ResearchTask, stable_hash,
 )
+from autonomous_math_research.outcomes import _artifact_references
 from autonomous_math_research.project import (
     ProjectManifest,
     discover_workspace_root,
@@ -141,7 +142,21 @@ class NextArchitectureTests(unittest.TestCase):
         return {"artifact_hashes": {str(artifact.resolve()): file_digest(artifact)}}
 
     @staticmethod
-    def _completion_theme(*, max_candidates: int = 1) -> CampaignTheme:
+    def _completion_theme(
+        *,
+        max_candidates: int = 1,
+        terminal_research_outcomes: list[str] | None = None,
+    ) -> CampaignTheme:
+        completion_policy = {
+            "max_accepted_candidates": max_candidates,
+            "post_candidate_mode": "AUDIT_ONLY",
+            "max_valid_audit_attempts_per_candidate": 1,
+            "terminal_audit_verdicts": ["PASS", "REJECT", "UNRESOLVED"],
+        }
+        if terminal_research_outcomes:
+            completion_policy["terminal_research_outcomes"] = (
+                terminal_research_outcomes
+            )
         return CampaignTheme.from_dict({
             "schema_version": 2,
             "theme_id": f"bounded-{max_candidates}-candidate-completion",
@@ -156,12 +171,7 @@ class NextArchitectureTests(unittest.TestCase):
             "dependency_boundary": ["C_ROOT"],
             "combination_scope": "No cross-scope union.",
             "obligations": [],
-            "completion_policy": {
-                "max_accepted_candidates": max_candidates,
-                "post_candidate_mode": "AUDIT_ONLY",
-                "max_valid_audit_attempts_per_candidate": 1,
-                "terminal_audit_verdicts": ["PASS", "REJECT", "UNRESOLVED"],
-            },
+            "completion_policy": completion_policy,
         })
 
     @staticmethod
@@ -711,7 +721,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 14)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.18")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.19")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -2633,6 +2643,281 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
         self.assertIn("director failed after bounded retries", controller.scheduler_stop_reason)
 
+    def test_empty_plan_waits_for_paused_route_condition_without_director_retry(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="paused-route-wait", campaign_id="paused-route-wait",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        controller.route_ledger.append(
+            route_id="route-paused",
+            representation_id="representation:legacy-unspecified",
+            method_tags=["explorer"],
+            status="PAUSED",
+            failure_class=None,
+            retry_condition="new_evidence:C_ROOT",
+            evidence_refs=[],
+            source="test",
+        )
+        outcome = JobOutcome(
+            job_id="director-paused", task_id="director-paused", role="director",
+            claim_id="FRONTIER", status="completed", result={
+                "assessment": "Every applicable route is paused.",
+                "spawn": [], "audit_priorities": [], "route_updates": [],
+                "short_rationale": "Wait for controller-owned new evidence.",
+            },
+        )
+
+        controller._accept_director_result(outcome)
+
+        kinds = [item["kind"] for item in controller.store.replay()]
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        self.assertFalse(controller.director_needed)
+        self.assertIn("ROUTE_RETRY_CONDITION_WAIT", kinds)
+        self.assertNotIn("DIRECTOR_PLAN_REPAIR_REQUIRED", kinds)
+        self.assertNotIn("DIRECTOR_RETRY_QUEUED", kinds)
+
+    def test_paused_route_cannot_be_relabelled_as_fresh_independent_work(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="paused-route-relabel", campaign_id="paused-route-relabel",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        controller.route_ledger.append(
+            route_id="route-paused",
+            representation_id="representation:legacy-unspecified",
+            method_tags=["explorer"], status="PAUSED", failure_class=None,
+            retry_condition="new_evidence:C_ROOT", evidence_refs=[], source="test",
+        )
+        task = research_task("relabelled-independent", route="route-paused")
+        task.metadata["independent_exploration"] = True
+
+        controller._accept_director_result(JobOutcome(
+            job_id="director-relabel", task_id="director-relabel",
+            role="director", claim_id="FRONTIER", status="completed", result={
+                "assessment": "Retry the paused obligation as independent work.",
+                "spawn": [task.to_dict()],
+                "audit_priorities": [], "route_updates": [],
+                "short_rationale": "No controller condition changed.",
+            },
+        ))
+
+        kinds = [item["kind"] for item in controller.store.replay()]
+        self.assertEqual(controller.pending_research, [])
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        self.assertIn("TASK_REJECTED", kinds)
+        self.assertIn("ROUTE_RETRY_CONDITION_WAIT", kinds)
+        self.assertNotIn("DIRECTOR_PLAN_REPAIR_REQUIRED", kinds)
+        self.assertNotIn("DIRECTOR_RETRY_QUEUED", kinds)
+
+    def test_zero_independent_slots_normalize_director_metadata(self) -> None:
+        config = load_config(self.project)
+        config.raw["scheduler"]["independent_exploration_fraction"] = 0.0
+        controller = AutonomousController(
+            config, backend=MockCodexBackend(), mock=True,
+            run_id="zero-independent", campaign_id="zero-independent",
+        )
+        task = research_task("zero-independent-task", route="independent")
+        self.assertTrue(task.metadata["independent_exploration"])
+        outcome = JobOutcome(
+            job_id="director-zero-independent",
+            task_id="director-zero-independent",
+            role="director", claim_id="FRONTIER", status="completed",
+            result={
+                "assessment": "One bounded route is ready.",
+                "spawn": [task.to_dict()],
+                "audit_priorities": [], "route_updates": [],
+                "short_rationale": "Use the configured single worker.",
+            },
+        )
+
+        controller._accept_director_result(outcome)
+
+        self.assertEqual(controller._configured_independent_exploration_slots(), 0)
+        self.assertEqual(len(controller.pending_research), 1)
+        self.assertFalse(
+            controller.pending_research[0].metadata["independent_exploration"]
+        )
+        self.assertFalse(controller.pending_research[0].is_independent_exploration)
+        normalized = [
+            item["payload"] for item in controller.store.replay()
+            if item["kind"] == "TASK_METADATA_NORMALIZED"
+        ]
+        self.assertEqual(normalized[-1]["configured_independent_exploration_slots"], 0)
+
+    def test_terminal_research_outcomes_complete_without_claim_promotion(self) -> None:
+        cases = (
+            ("BLOCKED", "OPEN", "BLOCKED"),
+            ("COUNTEREXAMPLE", "FALSIFIED", "FALSIFIED"),
+            (
+                "NO_PROGRESS", "NO_COUNTEREXAMPLE_WITHIN_SCOPE",
+                "OBLIGATION_EXHAUSTED",
+            ),
+        )
+        for index, (result_type, status, expected) in enumerate(cases):
+            with self.subTest(terminal_research_outcome=expected):
+                controller = AutonomousController(
+                    load_config(self.project), backend=MockCodexBackend(), mock=True,
+                    run_id=f"terminal-research-{index}",
+                    campaign_id=f"terminal-research-{index}",
+                )
+                controller.campaign_theme = self._completion_theme(
+                    terminal_research_outcomes=[
+                        "BLOCKED", "FALSIFIED", "OBLIGATION_EXHAUSTED",
+                    ]
+                )
+                controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+                task = research_task(f"terminal-task-{index}")
+                claim_before = controller.graph.claims["C_ROOT"].to_dict()
+                outcome = JobOutcome(
+                    job_id=f"terminal-job-{index}", task_id=task.task_id,
+                    role=task.role, claim_id=task.target_claim, status="completed",
+                    result={
+                        "result_type": result_type,
+                        "main_finding": "bounded terminal research report",
+                        "status": status,
+                        "artifact_paths": [],
+                        "next_suggested_question": "",
+                        "evidence_level": "E0_SPECULATIVE",
+                        "asset_usage": [],
+                    },
+                )
+
+                controller._accept_research_result(outcome, task)
+
+                self.assertTrue(controller._completion_policy_satisfied)
+                self.assertEqual(controller.lifecycle.phase, LifecyclePhase.FINALIZING)
+                self.assertEqual(
+                    controller.graph.claims["C_ROOT"].to_dict(), claim_before,
+                )
+                event_payload = next(
+                    item["payload"] for item in reversed(controller.store.replay())
+                    if item["kind"] == "CAMPAIGN_COMPLETION_POLICY_SATISFIED"
+                )
+                self.assertEqual(event_payload["completion_basis"], "TERMINAL_RESEARCH_OUTCOME")
+                self.assertEqual(event_payload["terminal_research_outcome"], expected)
+                self.assertEqual(event_payload["mathematical_status_effect"], "none")
+                self.assertEqual(event_payload["canonical_transitions_created"], 0)
+
+    def test_terminal_research_policy_reaches_completed_without_more_work(self) -> None:
+        task = research_task("terminal-blocked-task")
+        task_payload = task.to_dict()
+        task_payload.pop("output_contract")
+        backend = MockCodexBackend({
+            "director": [{"result": {
+                "assessment": "Run the one bounded obligation.",
+                "spawn": [task_payload], "audit_priorities": [],
+                "route_updates": [], "short_rationale": "One route remains.",
+            }}],
+            "explorer": [{"result": {
+                "result_type": "BLOCKED",
+                "main_finding": "The required external fact is unavailable.",
+                "status": "OPEN", "artifact_paths": [],
+                "next_suggested_question": "Wait for the missing fact.",
+                "evidence_level": "E0_SPECULATIVE", "asset_usage": [],
+            }}],
+        })
+        controller = AutonomousController(
+            load_config(self.project), backend=backend, mock=True,
+            run_id="terminal-blocked-run", campaign_id="terminal-blocked-run",
+        )
+        controller.campaign_theme = self._completion_theme(
+            terminal_research_outcomes=["BLOCKED"],
+        )
+        claim_before = controller.graph.claims["C_ROOT"].to_dict()
+
+        result = asyncio.run(controller.run(0.01))
+
+        kinds = [item["kind"] for item in controller.store.replay()]
+        self.assertEqual(result.campaign_status, "COMPLETED")
+        self.assertTrue(result.artifacts_finalized)
+        self.assertEqual([call.role for call in backend.calls], ["director", "explorer"])
+        self.assertEqual(kinds.count("CAMPAIGN_COMPLETION_POLICY_SATISFIED"), 1)
+        self.assertNotIn("AUDIT_RECORDED", kinds)
+        self.assertEqual(controller.graph.claims["C_ROOT"].to_dict(), claim_before)
+
+    def test_continuation_compacts_checkpoint_chain_and_preserves_asset_scope(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="continuation-compaction", campaign_id="continuation-compaction",
+        )
+        prior_path = (
+            controller.run_dir / "state" / "research_checkpoints" / "prior.json"
+        )
+        prior_path.parent.mkdir(parents=True, exist_ok=True)
+        prior_path.write_text("{}\n", encoding="utf-8")
+        prior_uri = (
+            f"epoch://{controller.epoch_id}/state/research_checkpoints/prior.json"
+        )
+        task = research_task("continued-task")
+        task.required_files.append(prior_uri)
+        outcome = JobOutcome(
+            job_id="continued-job", task_id=task.task_id, role=task.role,
+            claim_id=task.target_claim, status="completed", result={
+                "result_type": "STRICT_REDUCTION",
+                "main_finding": "one bounded reduction",
+                "status": "OPEN",
+                "artifact_paths": [],
+                "next_suggested_question": "continue the same exact obligation",
+                "evidence_level": "E0_SPECULATIVE",
+                "asset_usage": [],
+            },
+            turn_history=[{"turn_index": 1}],
+            logical_stop_reason="bounded same-thread turn limit reached",
+        )
+        job_record = self._durable_research_job_record(controller, outcome)
+        controller._task_loaded_asset_ids[task.task_id] = {"asset-current"}
+
+        continuation = controller._checkpoint_research_continuation(
+            outcome, task, job_record,
+        )
+
+        checkpoint_refs = [
+            item for item in continuation.required_files
+            if "/state/research_checkpoints/" in item
+        ]
+        self.assertEqual(len(checkpoint_refs), 1)
+        self.assertNotIn(prior_uri, continuation.required_files)
+        checkpoint = json.loads(
+            controller.artifact_store.resolve_uri(checkpoint_refs[0]).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            checkpoint["history_compaction"]["prior_checkpoint"]["uri"],
+            prior_uri,
+        )
+        self.assertEqual(
+            checkpoint["asset_usage"]["loaded_asset_ids"], ["asset-current"],
+        )
+
+    def test_final_index_resolves_relative_artifacts_from_job_workspace(self) -> None:
+        run_dir = self.runtime / "runs" / "relative-artifact-index"
+        workspace = run_dir / "jobs" / "worker-job"
+        workspace.mkdir(parents=True)
+        names = [
+            "gate_check.py", "gate_result.json", "GATE_REPORT.md", "gate_manifest.json",
+        ]
+        for name in names:
+            (workspace / name).write_text(f"artifact {name}\n", encoding="utf-8")
+        jobs = [{
+            "cwd": str(workspace),
+            "artifact_paths": names,
+            "result": {"artifact_paths": names},
+        }]
+
+        records, skipped = _artifact_references(
+            self.project, run_dir, run_dir / "NIGHTLY_REPORT.md", jobs, [],
+        )
+
+        self.assertEqual(skipped, [])
+        indexed = [item["path"] for item in records]
+        for name in names:
+            expected = (workspace / name).relative_to(self.project).as_posix()
+            self.assertEqual(indexed.count(expected), 1)
+
     def test_single_candidate_completion_policy_becomes_audit_only_then_complete(self) -> None:
         controller = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=True,
@@ -3428,6 +3713,7 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertEqual(len(packet_paths), 1)
         packet = json.loads(packet_paths[0].read_text(encoding="utf-8"))
         self.assertEqual(packet["task"]["required_files"], ["project://claims/CLAIMS.md"])
+        self.assertEqual(packet["research_context"]["loaded_asset_ids"], [])
         self.assertEqual(packet["candidate_protocol"]["domain"], "math-research")
         self.assertEqual(
             packet["candidate_protocol"]["allowed_event_types"],
@@ -3445,6 +3731,9 @@ class NextArchitectureTests(unittest.TestCase):
         )
         prompt = str(captured["prompt"])
         self.assertIn("candidate_event.dependencies may contain only", prompt)
+        self.assertIn(
+            "research_context.loaded_asset_ids as the sole current-turn", prompt,
+        )
         self.assertIn("--claim-graph", prompt)
         self.assertEqual(len(packet["required_file_access"]), 1)
         access = packet["required_file_access"][0]

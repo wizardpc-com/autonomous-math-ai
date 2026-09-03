@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -89,15 +90,35 @@ def _artifact_references(
         (run_dir / "LIVE_EVENTS.jsonl").resolve(),
     }
 
-    raw_references: list[str] = []
+    raw_references: dict[tuple[str, str], tuple[str, Path]] = {}
+
+    def add_reference(raw: Any, base: Path) -> None:
+        rendered = str(raw)
+        raw_references.setdefault(
+            (rendered, os.path.normcase(str(base.resolve()))),
+            (rendered, base),
+        )
+
     for job in jobs:
-        raw_references.extend(str(item) for item in job.get("artifact_paths", []) or [])
-        raw_references.extend(str(item) for item in job.get("artifacts", []) or [])
+        workspace = str(
+            job.get("cwd")
+            or (job.get("workspace_metadata") or {}).get("path")
+            or project_root
+        )
+        workspace_path = Path(workspace)
+        if not workspace_path.is_absolute():
+            workspace_path = project_root / workspace_path
+        for item in job.get("artifact_paths", []) or []:
+            add_reference(item, workspace_path)
+        for item in job.get("artifacts", []) or []:
+            add_reference(item, workspace_path)
         result = job.get("result") or {}
-        raw_references.extend(str(item) for item in result.get("artifact_paths", []) or [])
-        raw_references.extend(str(item) for item in result.get("artifacts", []) or [])
+        for item in result.get("artifact_paths", []) or []:
+            add_reference(item, workspace_path)
+        for item in result.get("artifacts", []) or []:
+            add_reference(item, workspace_path)
         if result.get("report_path"):
-            raw_references.append(str(result["report_path"]))
+            add_reference(result["report_path"], workspace_path)
     for event in events:
         payload = event.get("payload") or {}
         if event.get("kind") == "CANDIDATE_PROCESSED" and payload.get("fingerprint"):
@@ -107,7 +128,8 @@ def _artifact_references(
                 run_dir / "candidates" / f"{fingerprint}.json",
             ]
             existing = [path for path in alternatives if path.is_file()]
-            raw_references.extend(str(path) for path in (existing or alternatives[:1]))
+            for path in existing or alternatives[:1]:
+                add_reference(path, project_root)
         if event.get("kind") == "AUDIT_RECORDED":
             fingerprint = str(payload.get("candidate_fingerprint") or "")
             audit_id = str(payload.get("audit_id") or "")
@@ -117,11 +139,12 @@ def _artifact_references(
                     run_dir / "audits" / fingerprint / f"{audit_id}.json",
                 ]
                 existing = [path for path in alternatives if path.is_file()]
-                raw_references.extend(str(path) for path in (existing or alternatives[:1]))
+                for path in existing or alternatives[:1]:
+                    add_reference(path, project_root)
 
     skipped: list[dict[str, str]] = []
     project = project_root.resolve()
-    for raw in raw_references:
+    for raw, reference_base in raw_references.values():
         if raw.startswith("project://"):
             resolved = (project / raw.removeprefix("project://")).resolve()
         elif raw.startswith("epoch://"):
@@ -132,7 +155,11 @@ def _artifact_references(
             resolved = (layout.campaigns_root / tail).resolve()
         else:
             path = Path(raw)
-            resolved = path.resolve() if path.is_absolute() else (project / path).resolve()
+            resolved = (
+                path.resolve()
+                if path.is_absolute()
+                else (reference_base / path).resolve()
+            )
         if not resolved.is_relative_to(project):
             skipped.append({"path": str(resolved), "reason": "outside project boundary"})
             continue

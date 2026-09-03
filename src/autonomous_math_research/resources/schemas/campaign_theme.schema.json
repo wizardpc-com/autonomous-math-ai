@@ -54,6 +54,11 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": {"enum": ["PASS", "REJECT", "UNRESOLVED"]}
+        },
+        "terminal_research_outcomes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["BLOCKED", "FALSIFIED", "OBLIGATION_EXHAUSTED"]}
         }
       }
     }

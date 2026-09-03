@@ -144,6 +144,9 @@ class ResearchMemoryTests(unittest.TestCase):
             "post_candidate_mode": "AUDIT_ONLY",
             "max_valid_audit_attempts_per_candidate": 1,
             "terminal_audit_verdicts": ["PASS", "REJECT", "UNRESOLVED"],
+            "terminal_research_outcomes": [
+                "BLOCKED", "FALSIFIED", "OBLIGATION_EXHAUSTED",
+            ],
         }
 
         theme = CampaignTheme.from_dict(payload)
@@ -163,6 +166,22 @@ class ResearchMemoryTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "AUDIT_ONLY"):
+            CampaignTheme.from_dict(payload)
+
+    def test_campaign_theme_v2_rejects_unknown_terminal_research_outcome(self) -> None:
+        payload = self._theme(scopes=["scope-a"], obligations=[]).to_dict(
+            include_source=False
+        )
+        payload["schema_version"] = 2
+        payload["completion_policy"] = {
+            "max_accepted_candidates": 1,
+            "post_candidate_mode": "AUDIT_ONLY",
+            "max_valid_audit_attempts_per_candidate": 1,
+            "terminal_audit_verdicts": ["PASS"],
+            "terminal_research_outcomes": ["MODEL_SAYS_DONE"],
+        }
+
+        with self.assertRaisesRegex(ValueError, "terminal research outcomes"):
             CampaignTheme.from_dict(payload)
 
     def _obligation(

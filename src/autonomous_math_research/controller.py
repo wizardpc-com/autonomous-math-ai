@@ -1355,6 +1355,28 @@ class AutonomousController:
             and self._completion_policy_audit_limit_reached(event)
         )
 
+    def _completion_policy_terminal_research_outcome(
+        self, outcome: JobOutcome,
+    ) -> str | None:
+        policy = self._completion_policy()
+        if policy is None or not outcome.succeeded:
+            return None
+        configured = set(policy.get("terminal_research_outcomes") or [])
+        if not configured:
+            return None
+        result_type = str(
+            outcome.result.get("result_type") or "NO_PROGRESS"
+        ).upper()
+        status = str(outcome.result.get("status") or "").upper()
+        terminal: str | None = None
+        if result_type == "BLOCKED":
+            terminal = "BLOCKED"
+        elif result_type == "COUNTEREXAMPLE" or status == "FALSIFIED":
+            terminal = "FALSIFIED"
+        elif status == "NO_COUNTEREXAMPLE_WITHIN_SCOPE":
+            terminal = "OBLIGATION_EXHAUSTED"
+        return terminal if terminal in configured else None
+
     def _suppress_work_after_completion_policy(self) -> None:
         self._completion_policy_audit_only = True
         self.director_needed = False
@@ -1432,6 +1454,50 @@ class AutonomousController:
             })
         return True
 
+    def _set_terminal_research_completion_policy_satisfied(
+        self,
+        outcome: JobOutcome,
+        task: ResearchTask,
+        *,
+        result_id: str,
+    ) -> bool:
+        if self._completion_policy_satisfied:
+            return True
+        terminal = self._completion_policy_terminal_research_outcome(outcome)
+        if terminal is None:
+            return False
+        policy = self._completion_policy()
+        reason = (
+            "campaign completion policy satisfied by terminal research outcome: "
+            f"{terminal}"
+        )
+        self._completion_policy_satisfied = True
+        self._completion_policy_reason = reason
+        self._suppress_work_after_completion_policy()
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(LifecyclePhase.FINALIZING, reason=reason)
+        self.scheduler_stop_reason = reason
+        self.store.append("CAMPAIGN_COMPLETION_POLICY_SATISFIED", {
+            "completion_basis": "TERMINAL_RESEARCH_OUTCOME",
+            "terminal_research_outcome": terminal,
+            "reason": reason,
+            "completion_policy": dict(policy or {}),
+            "result_id": result_id,
+            "producer_job_id": outcome.job_id,
+            "producer_task_id": task.task_id,
+            "claim_id": task.target_claim,
+            "operational_status": "COMPLETED",
+            "mathematical_status_effect": "none",
+            "trust_status_effect": "none",
+            "authority_status_effect": "none",
+            "parent_claim_status_effect": "none",
+            "candidate_receipts_created": 0,
+            "audit_results_created": 0,
+            "canonical_transitions_created": 0,
+            "action": "finalize operationally without mathematical promotion",
+        })
+        return True
+
     def _complete_by_campaign_policy(
         self, event: CandidateEvent, result: AuditResult,
     ) -> bool:
@@ -1500,7 +1566,7 @@ class AutonomousController:
                 "requeued_task_id": requeued_task_id,
                 "claim_id": task.target_claim,
                 "mode": requeue_mode,
-                **self._research_failure_payload(),
+            **self._research_failure_payload(),
                 "stagnation_effect": "none",
             })
         if self.lifecycle.phase is LifecyclePhase.RUNNING:
@@ -4132,6 +4198,14 @@ class AutonomousController:
             candidate_disposition=candidate_disposition,
             candidate_repair_attempted=candidate_repair_attempted,
         )
+        terminal_research_outcome = (
+            self._completion_policy_terminal_research_outcome(outcome)
+        )
+        if terminal_research_outcome is not None:
+            directive = TurnDirective.stop(
+                "campaign terminal research outcome: "
+                f"{terminal_research_outcome}"
+            )
         if blocker_reported and directive.continue_same_thread:
             self._blocker_repair_jobs.add(job_id)
         if directive.reason == "controller-required candidate rejection repair turn":
@@ -4541,9 +4615,12 @@ class AutonomousController:
             payload = completion_events[-1]["payload"]
             self._completion_policy_audit_only = True
             self._completion_policy_satisfied = True
-            self._completion_policy_reason = (
-                "campaign completion policy satisfied after a bounded candidate "
-                f"audit: {payload.get('audit_verdict')}"
+            self._completion_policy_reason = str(
+                payload.get("reason")
+                or (
+                    "campaign completion policy satisfied after a bounded candidate "
+                    f"audit: {payload.get('audit_verdict')}"
+                )
             )
             self.scheduler_stop_reason = self._completion_policy_reason
             self.director_needed = False
@@ -6827,6 +6904,16 @@ class AutonomousController:
             ),
         }
         snapshot["mechanical_token_governor"] = self.mechanical_governor.snapshot()
+        snapshot["research_scheduling"] = {
+            "max_research_workers": self.max_research_workers,
+            "independent_exploration_fraction": float(
+                self.config.raw["scheduler"]["independent_exploration_fraction"]
+            ),
+            "configured_independent_exploration_slots": (
+                self._configured_independent_exploration_slots()
+            ),
+            "authority": "controller_configuration",
+        }
         if self.domain_semantics.domain == "math-research":
             snapshot["research_target"] = {
                 "project_name": self.config.project_name,
@@ -9580,6 +9667,7 @@ class AutonomousController:
                 for item in research_context.get(section, [])
             }
             self._task_loaded_asset_ids[task.task_id] = set(retrieved_assets)
+            research_context["loaded_asset_ids"] = sorted(retrieved_assets)
             for asset_id in sorted(retrieved_assets):
                 self.store.append(
                     "ASSET_USE_RECORDED",
@@ -10246,6 +10334,9 @@ class AutonomousController:
         }
         provisional_task_bindings = dict(self.task_fingerprints_by_id)
         for task in plan.spawn:
+            self._normalize_independent_exploration_metadata(
+                task, source=f"director:{outcome.job_id}",
+            )
             deferred = deferred_by_id.get(task.task_id)
             if deferred is None:
                 deferred = deferred_by_fingerprint.get(task.fingerprint)
@@ -10490,6 +10581,29 @@ class AutonomousController:
                 or len(deferred_proposals) == len(plan.spawn)
             )
         )
+        route_waits = self._unsatisfied_route_retry_conditions()
+        route_wait_rejections_only = bool(rejected_tasks) and all(
+            "paused or failed and its durable retry condition has not been satisfied"
+            in str(item.get("reason") or "")
+            for item in rejected_tasks
+        )
+        plan_paused_only = bool(plan.route_updates) and all(
+            str(item.get("action") or "").upper() == "PAUSE"
+            for item in plan.route_updates
+        )
+        waiting_for_route_condition = bool(
+            not stale
+            and not runnable
+            and not healthy_work
+            and not controller_owned_next_epoch_handoff
+            and route_waits
+            and (
+                empty_plan
+                or route_wait_rejections_only
+                or plan_paused_only
+                or route_deferred > 0
+            )
+        )
         if held_for_active_work:
             self._replan_after_wave = True
             self.store.append("DIRECTOR_PLAN_HELD_FOR_ACTIVE_WORK", {
@@ -10504,6 +10618,30 @@ class AutonomousController:
                 ),
                 "director_retry_count": self.director_retry_count,
                 "action": "hold current work and request exactly one replan when it finishes",
+            })
+        elif waiting_for_route_condition:
+            reason = (
+                "all applicable research routes await unmet controller-owned "
+                "retry conditions"
+            )
+            self.director_needed = False
+            self._replan_after_wave = False
+            self.scheduler_stop_reason = reason
+            if self.lifecycle.phase is LifecyclePhase.RUNNING:
+                self.lifecycle.transition(
+                    LifecyclePhase.DRAINING_EPOCH, reason=reason,
+                )
+            self.store.append("ROUTE_RETRY_CONDITION_WAIT", {
+                "job_id": outcome.job_id,
+                "routes": route_waits,
+                "rejected_tasks": rejected_tasks,
+                "operational_status": "PAUSED",
+                "mathematical_status_effect": "none",
+                "trust_status_effect": "none",
+                "action": (
+                    "do not retry the Director or relabel the same obligation; "
+                    "resume only after controller-owned state satisfies a condition"
+                ),
             })
         elif not runnable and not controller_owned_next_epoch_handoff:
             repair_constraint: dict[str, Any] = {
@@ -10531,7 +10669,7 @@ class AutonomousController:
             )
         elif controller_owned_next_epoch_handoff:
             self._pause_for_next_epoch_frontier()
-        elif held_for_active_work:
+        elif held_for_active_work or waiting_for_route_condition:
             return
         elif not runnable:
             self._queue_director_retry(
@@ -10603,8 +10741,9 @@ class AutonomousController:
                 **self._research_failure_payload(),
             "canonical_progress": False,
             "action": (
-                "do not dispatch until the durable route retry condition is satisfied; "
-                "a fresh Director may re-admit the exact task afterward"
+                "do not dispatch or relabel the task while the durable route retry "
+                "condition is unmet; only after the controller records satisfaction "
+                "may a Director re-admit the exact task"
             ),
         }
         self.store.append("TASK_DEFERRED_BY_ROUTE_POLICY", payload)
@@ -10615,6 +10754,25 @@ class AutonomousController:
             "route_family": task.route_family,
             "retry_condition": latest.get("retry_condition"),
         })
+
+    def _unsatisfied_route_retry_conditions(self) -> list[dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for record in self.route_ledger.records():
+            route_id = str(record.get("route_id") or "")
+            if route_id:
+                latest[route_id] = record
+        return [
+            {
+                "route_id": route_id,
+                "status": record.get("status"),
+                "retry_condition": record.get("retry_condition"),
+                "representation_id": record.get("representation_id"),
+            }
+            for route_id, record in sorted(latest.items())
+            if record.get("status") in {"FAILED", "PAUSED", "PAUSE"}
+            and record.get("retry_condition")
+            and record.get("retry_condition") not in self.satisfied_route_conditions
+        ]
 
     def _defer_nonretryable_pending_routes(self, *, source: str) -> int:
         deferred = 0
@@ -10686,6 +10844,14 @@ class AutonomousController:
             )
         if not all(isinstance(task.metadata[key], bool) for key in task.metadata):
             return "research task metadata values must be booleans"
+        if (
+            task.metadata["independent_exploration"]
+            and self._configured_independent_exploration_slots() == 0
+        ):
+            return (
+                "independent_exploration must be false because the configured "
+                "independent exploration slot count is zero"
+            )
         for dependency in task.dependencies:
             dependency_representation = self.claim_representations.get(dependency)
             if dependency_representation is None:
@@ -10862,8 +11028,14 @@ class AutonomousController:
             set(task.metadata) != {"allow_derived_claims"}
             or not isinstance(task.metadata["allow_derived_claims"], bool)
         ):
+            self._normalize_independent_exploration_metadata(
+                task, source=source,
+            )
             return
-        value = task.route_family == "independent"
+        value = bool(
+            task.route_family == "independent"
+            and self._configured_independent_exploration_slots() > 0
+        )
         task.metadata["independent_exploration"] = value
         self.store.append("TASK_METADATA_COMPATIBILITY_ADAPTED", {
             "task_id": task.task_id,
@@ -10874,6 +11046,35 @@ class AutonomousController:
                 "preserve the verified legacy task identity, then add the current "
                 "scheduler-only metadata field in the new epoch"
             ),
+        })
+
+    def _configured_independent_exploration_slots(self) -> int:
+        fraction = float(
+            self.config.raw["scheduler"]["independent_exploration_fraction"]
+        )
+        if fraction <= 0:
+            return 0
+        return math.ceil(self.max_research_workers * fraction)
+
+    def _normalize_independent_exploration_metadata(
+        self, task: ResearchTask, *, source: str,
+    ) -> None:
+        if (
+            not isinstance(task.metadata, dict)
+            or task.metadata.get("independent_exploration") is not True
+            or self._configured_independent_exploration_slots() > 0
+        ):
+            return
+        task.metadata["independent_exploration"] = False
+        self.store.append("TASK_METADATA_NORMALIZED", {
+            "task_id": task.task_id,
+            "source": source,
+            "field": "independent_exploration",
+            "requested_value": True,
+            "applied_value": False,
+            "configured_independent_exploration_slots": 0,
+            "mathematical_status_effect": "none",
+            "action": "align scheduler-only metadata with the configured zero reserve",
         })
 
     def _required_file_access(self, task: ResearchTask) -> list[dict[str, str]]:
@@ -11803,7 +12004,30 @@ class AutonomousController:
         checkpoint_path = self.run_dir / relative
         checkpoint_uri = f"epoch://{self.epoch_id}/{relative.as_posix()}"
         artifact_refs = self._research_checkpoint_artifacts(job_record)
+        prior_checkpoint_refs = [
+            item for item in task.required_files
+            if re.match(
+                r"^epoch://[^/]+/state/research_checkpoints/[^/]+\.json$",
+                item,
+            )
+        ]
+        prior_checkpoint_ref_set = set(prior_checkpoint_refs)
+        carried_required_files = [
+            item for item in task.required_files
+            if item not in prior_checkpoint_ref_set
+        ]
+        prior_checkpoint = None
+        if prior_checkpoint_refs:
+            prior_uri = prior_checkpoint_refs[-1]
+            prior_path = self.artifact_store.resolve_uri(prior_uri)
+            prior_checkpoint = {
+                "uri": prior_uri,
+                "sha256": file_digest(prior_path),
+            }
         continuation_raw = task.to_dict()
+        continuation_metadata = dict(continuation_raw.get("metadata") or {})
+        if self._configured_independent_exploration_slots() == 0:
+            continuation_metadata["independent_exploration"] = False
         continuation_raw.update({
             "task_id": continuation_task_id,
             "why_now": (
@@ -11812,10 +12036,11 @@ class AutonomousController:
                 "same exact objective and next open obligation."
             ),
             "required_files": list(dict.fromkeys([
-                *task.required_files,
+                *carried_required_files,
                 checkpoint_uri,
                 *artifact_refs,
             ])),
+            "metadata": continuation_metadata,
         })
         continuation = ResearchTask.from_dict(continuation_raw)
         research_frontier = (
@@ -11863,6 +12088,22 @@ class AutonomousController:
             "last_result": outcome.result,
             "turn_history": outcome.turn_history,
             "artifact_hashes": artifact_refs,
+            "asset_usage": {
+                "loaded_asset_ids": sorted(
+                    self._task_loaded_asset_ids.get(task.task_id) or set()
+                ),
+                "scope": "historical source turn only",
+            },
+            "history_compaction": {
+                "prior_checkpoint": prior_checkpoint,
+                "checkpoint_references_removed_from_next_task": len(
+                    prior_checkpoint_refs
+                ),
+                "rule": (
+                    "the newest checkpoint supersedes prior checkpoint files for "
+                    "model context; immutable artifacts remain explicit inputs"
+                ),
+            },
             "retry_condition": f"next_epoch:{self.epoch_id}",
             "created_at": utc_now(),
             "boundary": (
@@ -12008,6 +12249,9 @@ class AutonomousController:
                     if self._run_manifest else None
                 ),
                 "action": "do not infer use or citation from an incomplete report",
+                "asset_usage_authority": (
+                    "current task_packet.research_context.loaded_asset_ids only"
+                ),
             })
             asset_usage = [
                 row for row in asset_usage if row["asset_id"] in loaded_asset_ids
@@ -12065,6 +12309,12 @@ class AutonomousController:
             "research_outcome": result_payload["research_outcome"],
             "producer_job_id": outcome.job_id,
         })
+        if self._set_terminal_research_completion_policy_satisfied(
+            outcome,
+            task,
+            result_id=str(result_payload["result_id"]),
+        ):
+            return
         if not outcome.succeeded:
             failure_kind = outcome.failure_kind or "research_failure"
             if failure_kind == "provider_transport_lost":
@@ -12273,9 +12523,13 @@ class AutonomousController:
             limit = self._thread_budget(active.task.role)
             if limit is None:
                 continue
-            observed = int(
-                (self.governor.by_job.get(job_id) or {}).get("total_tokens", 0) or 0
-            )
+            observed_row = self.governor.by_job.get(job_id) or {}
+            usage = TokenUsage(**{
+                field_name: int(observed_row.get(field_name, 0) or 0)
+                for field_name in TokenUsage.__dataclass_fields__
+            })
+            observed_total = usage.total_tokens
+            observed = usage.continuation_budget_tokens
             if observed < limit:
                 continue
             self._thread_budget_limit_reported.add(job_id)
@@ -12285,6 +12539,10 @@ class AutonomousController:
                 "job_id": job_id, "task_id": active.task.task_id,
                 "role": active.task.role, "claim_id": active.task.target_claim,
                 "observed_tokens": observed, "token_budget": limit,
+                "observed_total_tokens": observed_total,
+                "continuation_budget_basis": (
+                    "cumulative_output_plus_reasoning"
+                ),
                 "action": action,
                 "next_turn_forbidden": action in {"stop_after_turn", "interrupt"},
                 "current_turn_cancel_requested": action == "interrupt",

@@ -250,8 +250,10 @@ the current Audited Frontier, pinned Campaign Theme, minimal relevant Asset
 bundle, and controller-owned compatibility view. Routing-only external bridges
 never authorize canonical promotion. If every proposed task fails semantic
 admission, route bookkeeping is retained and the controller requests one bounded
-repair plan. A second plan with no runnable research or audit work pauses the
-campaign cleanly; route updates alone never keep an empty execution queue alive.
+repair plan. A plan whose applicable routes already wait behind unmet
+controller-owned retry conditions pauses cleanly without another Director
+retry; other truly idle plans retain the bounded repair rule. Route updates
+alone never keep an empty execution queue alive.
 
 Projects that opt into `autonomous/semantics.json` receive the additional
 domain-independent **No unverified bridge into trusted final claims** gate.

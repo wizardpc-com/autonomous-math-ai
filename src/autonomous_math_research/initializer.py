@@ -19,33 +19,33 @@ ClaimGraph snapshot and override this overlay.
     "prover.md": """# Prover
 
 Work only on the exact assigned statement and representation. Preserve gaps and
-emit candidate evidence separately. Return only Output Protocol v3.
+emit candidate evidence separately. Return only Output Protocol v4.
 """,
     "falsifier.md": """# Falsifier
 
 Seek the cheapest exact counterexample within explicit bounds. Scope exhaustion
-is not proof. Return only Output Protocol v3.
+is not proof. Return only Output Protocol v4.
 """,
     "explorer.md": """# Explorer
 
 Explore only the assigned route and representation. Record observations without
-turning them into trusted conclusions. Return only Output Protocol v3.
+turning them into trusted conclusions. Return only Output Protocol v4.
 """,
     "auditor.md": """# Auditor
 
 Reconstruct the candidate independently from its sealed bundle. Do not read the
-producer transcript. Return only PASS, REJECT, or UNRESOLVED in Output Protocol v3.
+producer transcript. Return only PASS, REJECT, or UNRESOLVED in Output Protocol v4.
 """,
     "evaluator_auditor.md": """# Evaluator Auditor
 
 Independently reproduce bounded computational evidence and evaluate only the
 assigned evidence contract. Never promote finite evidence to proof. Return only
-Output Protocol v3.
+Output Protocol v4.
 """,
     "smoke.md": """# Smoke
 
 Exercise only the configured provider protocol and output schema. Do not perform
-mathematical research or modify canonical state. Return only Output Protocol v3.
+mathematical research or modify canonical state. Return only Output Protocol v4.
 """,
     "mechanical_worker.md": """# Mechanical Worker
 
@@ -64,32 +64,32 @@ snapshot and override this overlay.
     "prover.md": """# Primary researcher
 
 Work only on the exact assigned claim and representation. Preserve gaps and
-emit candidate evidence separately. Return only Output Protocol v3.
+emit candidate evidence separately. Return only Output Protocol v4.
 """,
     "falsifier.md": """# Adversarial researcher
 
 Seek the cheapest decisive counterevidence within explicit bounds. Scope
-exhaustion is not a conclusion. Return only Output Protocol v3.
+exhaustion is not a conclusion. Return only Output Protocol v4.
 """,
     "explorer.md": """# Explorer
 
 Explore only the assigned route and representation. Record observations without
-turning them into trusted conclusions. Return only Output Protocol v3.
+turning them into trusted conclusions. Return only Output Protocol v4.
 """,
     "auditor.md": """# Auditor
 
 Reconstruct the candidate independently from its sealed bundle. Do not read the
-producer transcript. Return only PASS, REJECT, or UNRESOLVED in Output Protocol v3.
+producer transcript. Return only PASS, REJECT, or UNRESOLVED in Output Protocol v4.
 """,
     "evaluator_auditor.md": """# Evaluator Auditor
 
 Independently reproduce the declared checker or experiment protocol and evaluate
-only the assigned evidence contract. Return only Output Protocol v3.
+only the assigned evidence contract. Return only Output Protocol v4.
 """,
     "smoke.md": """# Smoke
 
 Exercise only the configured provider protocol and output schema. Do not perform
-research or modify canonical state. Return only Output Protocol v3.
+research or modify canonical state. Return only Output Protocol v4.
 """,
     "mechanical_worker.md": """# Mechanical Worker
 

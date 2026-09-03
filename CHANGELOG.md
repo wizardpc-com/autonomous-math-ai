@@ -6,6 +6,19 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Completion policies can stop operationally on explicit `BLOCKED`,
+  `FALSIFIED`, or `OBLIGATION_EXHAUSTED` research outcomes without changing
+  mathematical, trust, evidence, or canonical status.
+- Paused routes now wait for controller-owned retry conditions without forcing
+  a Director repair loop, and zero independent-exploration capacity is reflected
+  in task metadata and Director context.
+- Continuation budgets measure cumulative generated work instead of repeatedly
+  charged input context, checkpoint chains are compacted,
+  relative job artifacts resolve from the job workspace, Windows JSONL decoding
+  preserves Unicode, and asset usage is bound to an explicit current-turn id set.
+
 ### Added
 
 - Immutable schema-v14 run records now freeze campaign purpose, target and AMR
@@ -15,7 +28,7 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   schema-v2 deltas, exact result identities, end time, and deterministic metrics.
 - Director admission, dispatch suppression, asset retrieval/use, AuditKey
   hit/miss and savings, per-job cost, and orthogonal research-outcome telemetry
-  are structured events. Output Protocol v3 requires explicit used/rejected and
+  are structured events. Output Protocol v4 requires explicit used/rejected and
   cited asset accounting without changing canonical authority.
 - `amr record inspect|replay-context|metrics` verifies frozen bytes and rebuilds
   the external decision context. Older run manifests remain untouched and are

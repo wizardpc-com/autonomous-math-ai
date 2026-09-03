@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 import json
+import locale
 import os
 from pathlib import Path
 import re
@@ -189,8 +190,27 @@ def app_server_environment(
     }:
         entries.insert(0, runtime_bin)
     environment[path_key] = os.pathsep.join(entries)
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
     # Keep CODEX_HOME so App Server can let Codex read its own existing login.
     return environment
+
+
+def _decode_app_server_json_line(line: bytes) -> dict[str, Any]:
+    """Decode one JSONL protocol record without lossy replacement characters."""
+    try:
+        decoded = line.decode("utf-8")
+    except UnicodeDecodeError as utf8_error:
+        if os.name != "nt":
+            raise utf8_error
+        preferred = locale.getpreferredencoding(False)
+        if preferred.casefold().replace("-", "") in {"utf8", "utf_8"}:
+            raise utf8_error
+        decoded = line.decode(preferred)
+    value = json.loads(decoded)
+    if not isinstance(value, dict):
+        raise json.JSONDecodeError("App Server JSONL record must be an object", decoded, 0)
+    return value
 
 
 def _read_pyvenv_config(path: Path) -> dict[str, str]:
@@ -1367,7 +1387,7 @@ class AppServerClient:
         try:
             while line := process.stdout.readline():
                 try:
-                    message = json.loads(line.decode("utf-8", errors="replace"))
+                    message = _decode_app_server_json_line(line)
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if self._loop and not self._loop.is_closed():

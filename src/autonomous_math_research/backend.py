@@ -448,7 +448,7 @@ class AppServerBackend:
                         partial.continuation_budget_stop_reason = (
                             "token telemetry unavailable; bounded continuation stopped fail-closed"
                         )
-                    elif turn_usage.total_tokens >= token_budget:
+                    elif turn_usage.continuation_budget_tokens >= token_budget:
                         partial.continuation_budget_stop_reason = (
                             "controller token budget reached"
                         )
@@ -461,6 +461,12 @@ class AppServerBackend:
                     "role_reported_status": parsed.get("status"),
                     "reasoning_output_tokens": turn_usage.reasoning_output_tokens,
                     "total_tokens": turn_usage.total_tokens,
+                    "continuation_budget_tokens": (
+                        turn_usage.continuation_budget_tokens
+                    ),
+                    "continuation_budget_basis": (
+                        "cumulative_output_plus_reasoning"
+                    ),
                     "token_telemetry": turn_telemetry,
                     "token_usage": turn_usage.to_dict(),
                 }

@@ -77,7 +77,11 @@ _COMPLETION_POLICY_KEYS = frozenset({
     "max_accepted_candidates", "post_candidate_mode",
     "max_valid_audit_attempts_per_candidate", "terminal_audit_verdicts",
 })
+_COMPLETION_POLICY_OPTIONAL_KEYS = frozenset({"terminal_research_outcomes"})
 _TERMINAL_AUDIT_VERDICTS = frozenset({"PASS", "REJECT", "UNRESOLVED"})
+_TERMINAL_RESEARCH_OUTCOMES = frozenset({
+    "BLOCKED", "FALSIFIED", "OBLIGATION_EXHAUSTED",
+})
 _EVIDENCE_REF_KEYS = frozenset({"kind", "path", "sha256"})
 _AUDIT_KEYS = frozenset({
     "verdict", "independent", "auditor", "audit_level", "policy_version",
@@ -741,11 +745,21 @@ class CampaignTheme:
             completion_policy = None
         elif schema_version == THEME_SCHEMA_VERSION:
             value = _require_exact_keys(raw, _THEME_KEYS, "campaign theme")
-            policy = _require_exact_keys(
-                value["completion_policy"],
-                _COMPLETION_POLICY_KEYS,
-                "campaign theme completion_policy",
-            )
+            policy_raw = value["completion_policy"]
+            policy_keys = set(policy_raw) if isinstance(policy_raw, dict) else set()
+            if (
+                not isinstance(policy_raw, dict)
+                or not _COMPLETION_POLICY_KEYS.issubset(policy_keys)
+                or policy_keys - (
+                    _COMPLETION_POLICY_KEYS | _COMPLETION_POLICY_OPTIONAL_KEYS
+                )
+            ):
+                raise ValueError(
+                    "campaign theme completion_policy keys must contain exactly "
+                    f"{sorted(_COMPLETION_POLICY_KEYS)} plus optional "
+                    "terminal_research_outcomes"
+                )
+            policy = dict(policy_raw)
             max_candidates = policy["max_accepted_candidates"]
             max_audits = policy["max_valid_audit_attempts_per_candidate"]
             if (
@@ -773,12 +787,26 @@ class CampaignTheme:
                 raise ValueError(
                     f"unsupported terminal audit verdicts: {sorted(unknown_verdicts)}"
                 )
+            terminal_outcomes = _string_list(
+                policy.get("terminal_research_outcomes", []),
+                "terminal_research_outcomes",
+            )
+            unknown_outcomes = set(terminal_outcomes) - _TERMINAL_RESEARCH_OUTCOMES
+            if unknown_outcomes:
+                raise ValueError(
+                    "unsupported terminal research outcomes: "
+                    f"{sorted(unknown_outcomes)}"
+                )
             completion_policy = {
                 "max_accepted_candidates": max_candidates,
                 "post_candidate_mode": "AUDIT_ONLY",
                 "max_valid_audit_attempts_per_candidate": max_audits,
                 "terminal_audit_verdicts": list(terminal_verdicts),
             }
+            if "terminal_research_outcomes" in policy:
+                completion_policy["terminal_research_outcomes"] = list(
+                    terminal_outcomes
+                )
         else:
             raise ValueError("unsupported campaign theme schema")
         include_claims = _string_list(value["include_claim_ids"], "include_claim_ids")
@@ -895,6 +923,10 @@ class CampaignTheme:
                     self.completion_policy["terminal_audit_verdicts"]
                 ),
             }
+            if "terminal_research_outcomes" in self.completion_policy:
+                result["completion_policy"]["terminal_research_outcomes"] = list(
+                    self.completion_policy["terminal_research_outcomes"]
+                )
         if include_source:
             result["source_path"] = self.source_path
             result["theme_sha256"] = self.theme_sha256

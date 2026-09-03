@@ -229,6 +229,7 @@ def build_compact_snapshot(
         "budget",
         "claim_state_provenance",
         "mechanical_token_governor",
+        "research_scheduling",
         "research_target",
         "controller_watermark",
         "mechanical_subworkers",

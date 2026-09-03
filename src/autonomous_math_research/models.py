@@ -306,7 +306,7 @@ class ResearchTask:
     @property
     def is_independent_exploration(self) -> bool:
         """Whether this task satisfies the scheduler's diversification reserve."""
-        return self.route_family == "independent" or self.metadata.get("independent_exploration") is True
+        return self.metadata.get("independent_exploration") is True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -804,6 +804,29 @@ class TokenUsage:
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
+
+    @property
+    def continuation_budget_tokens(self) -> int:
+        """Return generated work used to bound same-thread continuation.
+
+        App Server reports cumulative thread usage. Input can dominate that
+        total when a long tool-using turn repeatedly reads a large frozen
+        context, regardless of whether the provider records every read as a
+        cache hit. The per-thread boundary therefore measures generated work;
+        global accounting still retains and enforces the full token total.
+        Output and reasoning are added conservatively so older telemetry that
+        reported reasoning separately cannot undercount generated work.
+        """
+        if self.output_tokens or self.reasoning_output_tokens:
+            return max(0, self.output_tokens) + max(
+                0, self.reasoning_output_tokens,
+            )
+        if not any((
+            self.input_tokens, self.cached_input_tokens,
+            self.uncached_input_tokens, self.cache_write_input_tokens,
+        )):
+            return max(0, self.total_tokens)
+        return 0
 
 
 @dataclass(slots=True)

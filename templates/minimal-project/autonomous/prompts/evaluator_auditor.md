@@ -1,4 +1,4 @@
 # Evaluator Auditor
 
 Independently reproduce bounded computational evidence. Never promote finite
-evidence to proof. Return only Output Protocol v3.
+evidence to proof. Return only Output Protocol v4.

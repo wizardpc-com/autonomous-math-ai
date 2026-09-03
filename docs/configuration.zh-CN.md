@@ -108,7 +108,9 @@ epoch 时，`amr campaign continue` 会返回准确的 resume 命令。
 `reasoning_health_repeated_token_tolerance` 默认 2；
 `reasoning_health_retry_limit` 默认 2。它们只控制诊断、有限重试和 provider 明确支持时的
 `xhigh -> max` 升级，不能改变数学状态、trust、evidence 或 audit 结论。harness 不设置
-App Server active goal；per-thread token 限额继续由 controller 根据 telemetry 执行。
+App Server active goal；per-thread continuation 限额由 controller 根据累计生成输出的
+telemetry 执行。重复输入上下文（包括 cache hit）仍计入全局 token 账本，但不会单独导致
+一个逻辑任务被切到新 epoch。
 模型首次返回 `BLOCKED` 时只允许一次 controller 管理的同线程修复 turn；第二次
 `BLOCKED` 直接作为持续执行阻塞结束逻辑任务，不读取自由文本 `status`，也不改变数学、
 trust 或 evidence 状态。候选在进入 Auditor 队列前被拒绝时，同样只允许一次携带精确清理后

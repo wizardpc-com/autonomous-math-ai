@@ -97,6 +97,12 @@ before model dispatch. A task outside the Theme, closed by an audited external
 result, dependency-blocked, or covered by an exact method kill gate is rejected
 before a research model starts.
 
+Schema-v2 completion policies may also list `terminal_research_outcomes` from
+`BLOCKED`, `FALSIFIED`, and `OBLIGATION_EXHAUSTED`. These values stop the
+campaign operationally only when explicitly configured. They do not update a
+ClaimGraph status, create a candidate or audit receipt, or authorize a trust,
+evidence, representation, parent-claim, or canonical transition.
+
 ## Assets and progressive disclosure
 
 Every asset card records a stable id, kind, exact capability, scope,
@@ -118,6 +124,8 @@ the campaign/task claim, exact scope, representation, method, or dependency
 boundary. The task packet tells the worker to reuse an equivalent audited asset
 by default. If replacement is necessary, the worker must identify the existing
 asset, the violated applicability condition, and the exact difference.
+`research_context.loaded_asset_ids` is the exact current-turn reporting scope;
+asset rows in an older continuation checkpoint are historical only.
 
 ## Commands
 

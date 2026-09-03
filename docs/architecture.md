@@ -8,7 +8,7 @@ lifecycle, scheduling, audit leases, and durable storage semantics.
 ## Package boundaries
 
 - `engine/` controls dynamic admission and scheduling pressure.
-- `protocol/` exposes Output Protocol v3 contracts, error classes, and schema
+- `protocol/` exposes Output Protocol v4 contracts, error classes, and schema
   compatibility preflight.
 - `lifecycle/` owns monotone phases, campaign/epoch state, audit leases, and
   derived cognitive views.
@@ -426,6 +426,10 @@ Route updates are durable bookkeeping, not runnable queue work. If semantic
 admission rejects every proposed task and no audit priority is applicable, the
 controller supplies the rejection reasons to one bounded repair turn; retry
 exhaustion pauses the epoch instead of falling through to idle queue failure.
+When the latest applicable route is already paused or failed behind an unmet
+controller-owned retry condition, an empty Director plan records a clean wait
+and does not consume another Director retry or relabel the same obligation as
+fresh independent exploration.
 
 Before research dispatch, the controller derives an input closure from the
 claim's canonical object, RepresentationContract, ordered semantic bridges, and

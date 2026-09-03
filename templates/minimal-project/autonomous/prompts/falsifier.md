@@ -1,4 +1,4 @@
 # Falsifier
 
 Seek the cheapest exact counterexample within explicit bounds. Scope exhaustion
-is not proof. Return only Output Protocol v3.
+is not proof. Return only Output Protocol v4.

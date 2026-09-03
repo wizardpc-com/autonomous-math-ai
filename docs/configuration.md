@@ -125,7 +125,10 @@ The `engine` section also controls controller-owned research continuation:
 - `reasoning_health_retry_limit` (default `2`) bounds diagnostic retry/escalation.
 
 These settings never relax audit or canonical gates. App Server goals are not
-armed; per-thread token limits remain controller-enforced from telemetry.
+armed; per-thread continuation limits are controller-enforced from cumulative
+generated-output telemetry. Repeated input context, including cache hits, stays
+in global token accounting but does not by itself split one logical task into a
+new epoch.
 The first model-reported `BLOCKED` result always receives one controller-owned
 repair turn. A second `BLOCKED` result ends the logical job as a persistent
 execution blocker, regardless of the free-text `status`; this has no

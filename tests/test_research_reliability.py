@@ -15,8 +15,8 @@ from autonomous_math_research.app_server import (
     AppServerClient, AppServerError, AppServerRequestError, AppServerRequestTimeout,
     AppServerTransportClosed, AppServerTurnTimeout,
     AppServerTurnTransportLost, TurnOwnershipRegistry,
-    _configured_mcp_server_names, app_server_command, app_server_environment,
-    runtime_python_read_roots,
+    _configured_mcp_server_names, _decode_app_server_json_line,
+    app_server_command, app_server_environment, runtime_python_read_roots,
 )
 from autonomous_math_research.backend import (
     AppServerBackend, TurnDirective, _classify_failure,
@@ -116,7 +116,10 @@ def event(event_type: str, *, evidence: str = EvidenceLevel.E0_SPECULATIVE) -> C
 
 
 class SequenceAppServerClient:
-    def __init__(self, results: list[tuple[dict[str, object], int]]):
+    def __init__(
+        self,
+        results: list[tuple[dict[str, object], int | TokenUsage]],
+    ):
         self.results = list(results)
         self.start_thread_calls = 0
         self.start_thread_kwargs: list[dict[str, object]] = []
@@ -143,7 +146,17 @@ class SequenceAppServerClient:
         callback = kwargs.get("on_started")
         if callback:
             callback(f"turn-{index}")
-        result, reasoning_tokens = self.results.pop(0)
+        result, usage_or_reasoning = self.results.pop(0)
+        usage = (
+            usage_or_reasoning
+            if isinstance(usage_or_reasoning, TokenUsage)
+            else TokenUsage(
+                input_tokens=100,
+                output_tokens=100,
+                reasoning_output_tokens=usage_or_reasoning,
+                total_tokens=200 + usage_or_reasoning,
+            )
+        )
         return (
             {
                 "threadId": kwargs["thread_id"],
@@ -154,12 +167,7 @@ class SequenceAppServerClient:
                 },
             },
             json.dumps(result),
-            TokenUsage(
-                input_tokens=100,
-                output_tokens=100,
-                reasoning_output_tokens=reasoning_tokens,
-                total_tokens=200 + reasoning_tokens,
-            ),
+            usage,
             "observed",
         )
 
@@ -274,6 +282,66 @@ class ThreadLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(outcome.turn_history[-1]["token_usage"]),
             set(TokenUsage().to_dict()),
+        )
+
+    async def test_cached_input_does_not_exhaust_logical_continuation_budget(self) -> None:
+        client = SequenceAppServerClient([
+            (
+                worker_result("NO_PROGRESS"),
+                TokenUsage(
+                    input_tokens=1_773_869,
+                    cached_input_tokens=1_639_168,
+                    uncached_input_tokens=120_943,
+                    output_tokens=13_758,
+                    reasoning_output_tokens=8_000,
+                    total_tokens=1_773_869,
+                ),
+            ),
+            (
+                worker_result("BLOCKED", status="BLOCKED"),
+                TokenUsage(
+                    input_tokens=1_720_000,
+                    cached_input_tokens=1_600_000,
+                    uncached_input_tokens=120_000,
+                    output_tokens=12_000,
+                    reasoning_output_tokens=6_000,
+                    total_tokens=1_732_000,
+                ),
+            ),
+        ])
+        self.backend.client = client  # type: ignore[assignment]
+
+        async def decide(_outcome: JobOutcome, turn_index: int) -> TurnDirective:
+            if turn_index == 1:
+                return TurnDirective.continue_with("continue the same obligation")
+            return TurnDirective.stop("verified blocker")
+
+        outcome = await self.backend.run_job(
+            job_id="job-cached-input",
+            task=research_task(),
+            prompt="start",
+            output_schema=json.loads(
+                (Path(__file__).resolve().parents[1]
+                 / "src/autonomous_math_research/resources/schemas/worker_result.schema.json")
+                .read_text(encoding="utf-8")
+            ),
+            workspace=self.project,
+            writable_roots=[self.project],
+            timeout=1,
+            token_budget=120_000,
+            candidate_sink=lambda _event: None,  # type: ignore[arg-type]
+            turn_controller=decide,
+        )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(len(client.turn_calls), 2)
+        self.assertEqual(
+            outcome.turn_history[0]["continuation_budget_tokens"], 21_758,
+        )
+        self.assertEqual(outcome.turn_history[0]["total_tokens"], 1_773_869)
+        self.assertEqual(
+            outcome.turn_history[0]["continuation_budget_basis"],
+            "cumulative_output_plus_reasoning",
         )
 
     async def test_controller_repairs_first_blocker_before_scheduling_terminal(self) -> None:
@@ -885,6 +953,21 @@ class _RequestTimeoutClient(AppServerClient):
 
 
 class AppServerLaunchIsolationTests(unittest.TestCase):
+    def test_windows_jsonl_fallback_preserves_chinese_free_text(self) -> None:
+        payload = {"method": "item/completed", "text": "结论：等待新证据。"}
+        line = json.dumps(payload, ensure_ascii=False).encode("gbk")
+
+        with (
+            patch("autonomous_math_research.app_server.os.name", "nt"),
+            patch(
+                "autonomous_math_research.app_server.locale.getpreferredencoding",
+                return_value="gbk",
+            ),
+        ):
+            decoded = _decode_app_server_json_line(line)
+
+        self.assertEqual(decoded, payload)
+
     @staticmethod
     def _create_fake_windows_python(base: Path, version: str = "3.14.2") -> Path:
         base.mkdir(parents=True)
@@ -1011,6 +1094,8 @@ class AppServerLaunchIsolationTests(unittest.TestCase):
             os.path.normcase(entries[0]),
             os.path.normcase(str(Path(sys.executable).resolve().parent)),
         )
+        self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(environment["PYTHONUTF8"], "1")
         self.assertEqual(environment["CODEX_HOME"], str(Path("C:/codex-home")))
         self.assertNotIn("UNIT_TEST_API_KEY", environment)
 

@@ -86,7 +86,8 @@ Dispatch-time dependency drift, unavailable input closure, and budget rejection
 are separate decision stages, so a task admitted from an older snapshot is not
 misreported as having started.
 
-Output Protocol v3 adds one `asset_usage` row for every loaded asset. The worker
+Output Protocol v4 adds one `asset_usage` row for every id in the current task
+packet's authoritative `research_context.loaded_asset_ids`. The worker
 must say `USED` or `REJECTED`, give the exact reason, and state whether the asset
 is cited in the result. Controller events distinguish `RETRIEVED`, `LOADED`,
 `USED`, and `CITED_IN_RESULT`. Missing or mismatched rows are recorded as invalid

@@ -116,7 +116,7 @@ entailment. See [semantic alignment](semantic-alignment.md).
 
 ## Structured output boundary
 
-Output Protocol v3 minimizes role-owned fields. Director, worker, auditor, and
+Output Protocol v4 minimizes role-owned fields. Director, worker, auditor, and
 candidate schemas are immutable package resources. Mock and live App Server
 paths use the same compatibility preflight and parser contracts. Controller-
 known identity, timestamps, fingerprints, and report references are injected by
