@@ -57,6 +57,11 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Campaign completion-policy stops now share the finalization lifecycle: a
+  terminal bounded audit reaches `COMPLETED` after in-flight audits drain,
+  while fresh continuation deterministically restores already-satisfied
+  operational completion without model dispatch, duplicate receipts, or a
+  mathematical claim-status change.
 - Empty Director plans now hold controller-owned pending or active research and
   audit work without consuming `director_no_runnable_work`; exactly one replan
   is requested after the held wave becomes idle. Truly idle empty plans retain

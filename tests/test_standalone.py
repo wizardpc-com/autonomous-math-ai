@@ -55,7 +55,7 @@ class StandalonePackageTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
             build_parser().parse_args(["--version"])
         self.assertEqual(stopped.exception.code, 0)
-        self.assertEqual(output.getvalue().strip(), "amr 0.2.17")
+        self.assertEqual(output.getvalue().strip(), "amr 0.2.18")
 
     def test_init_and_validate_arbitrary_external_project(self) -> None:
         self._init()

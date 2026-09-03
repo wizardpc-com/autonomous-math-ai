@@ -29,6 +29,7 @@ from autonomous_math_research.controller import (
     ActiveJob,
     AutonomousController,
     RunResult,
+    build_mock_full_cycle_backend,
 )
 from autonomous_math_research.cli import (
     ResumeContext, _auto_epoch_allowed, _execute_epoch, _latest_run, _run_command,
@@ -138,6 +139,77 @@ class NextArchitectureTests(unittest.TestCase):
         outcome.artifact_paths = [str(artifact)]
         outcome.result["artifact_paths"] = [str(artifact)]
         return {"artifact_hashes": {str(artifact.resolve()): file_digest(artifact)}}
+
+    @staticmethod
+    def _completion_theme(*, max_candidates: int = 1) -> CampaignTheme:
+        return CampaignTheme.from_dict({
+            "schema_version": 2,
+            "theme_id": f"bounded-{max_candidates}-candidate-completion",
+            "title": "Bounded candidate completion",
+            "objective": "Exercise bounded operational completion.",
+            "include_claim_ids": ["C_ROOT"],
+            "include_scope_ids": [],
+            "exclude_claim_ids": [],
+            "exclude_scope_ids": [],
+            "allowed_method_ids": [],
+            "forbidden_method_ids": [],
+            "dependency_boundary": ["C_ROOT"],
+            "combination_scope": "No cross-scope union.",
+            "obligations": [],
+            "completion_policy": {
+                "max_accepted_candidates": max_candidates,
+                "post_candidate_mode": "AUDIT_ONLY",
+                "max_valid_audit_attempts_per_candidate": 1,
+                "terminal_audit_verdicts": ["PASS", "REJECT", "UNRESOLVED"],
+            },
+        })
+
+    @staticmethod
+    def _completion_candidate(
+        controller: AutonomousController, suffix: str,
+    ) -> CandidateEvent:
+        claim = controller.graph.claims["C_ROOT"]
+        return CandidateEvent.from_dict({
+            "event_id": f"completion-event-{suffix}",
+            "producer_task_id": f"completion-producer-{suffix}",
+            "claim_id": "C_ROOT",
+            "type": "THEOREM_CANDIDATE",
+            "impact": "CRITICAL",
+            "concise_summary": "One bounded candidate.",
+            "exact_statement": claim.statement,
+            "artifact_paths": [],
+            "reproduction_commands": [],
+            "dependency_impact": [],
+            "assumptions": list(claim.assumptions),
+            "dependencies": list(claim.dependencies),
+        })
+
+    @staticmethod
+    def _completion_audit(
+        controller: AutonomousController,
+        event: CandidateEvent,
+        verdict: str,
+        suffix: str,
+    ) -> AuditResult:
+        passed = verdict == "PASS"
+        return AuditResult.from_dict({
+            "audit_id": f"completion-audit-{suffix}",
+            "candidate_fingerprint": event.fingerprint,
+            "auditor_thread_id": f"independent-auditor-{suffix}",
+            "verdict": verdict,
+            "audit_kind": controller.audit_gate.next_audit_kind(event),
+            "statement_checked": event.exact_statement,
+            "checks": [{
+                "name": "independent reconstruction",
+                "passed": passed,
+                "detail": "bounded evidence was independently checked",
+            }],
+            "gaps": [] if passed else ["bounded evidence did not close the claim"],
+            "notes": [],
+            "verified_evidence_level": "E0_SPECULATIVE",
+            "report_path": None,
+            "timestamp": "2026-09-03T00:00:00Z",
+        })
 
     def _resume_args(self, run_id: str, *, auto_epochs: bool = False) -> argparse.Namespace:
         return argparse.Namespace(
@@ -639,7 +711,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 14)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.17")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.18")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -2638,6 +2710,346 @@ class NextArchitectureTests(unittest.TestCase):
             "CAMPAIGN_COMPLETION_POLICY_SATISFIED",
             [item["kind"] for item in controller.store.replay()],
         )
+        self.assertTrue(controller._complete_by_campaign_policy(event, result))
+        self.assertEqual(
+            sum(
+                item["kind"] == "CAMPAIGN_COMPLETION_POLICY_SATISFIED"
+                for item in controller.store.replay()
+            ),
+            1,
+        )
+
+    def test_completion_policy_terminal_verdicts_are_operational_only(self) -> None:
+        for verdict in ("PASS", "REJECT", "UNRESOLVED"):
+            with self.subTest(verdict=verdict):
+                controller = AutonomousController(
+                    load_config(self.project), backend=MockCodexBackend(), mock=True,
+                    run_id=f"terminal-policy-{verdict.lower()}",
+                    campaign_id=f"terminal-policy-{verdict.lower()}",
+                )
+                controller.campaign_theme = self._completion_theme()
+                event = self._completion_candidate(controller, verdict.lower())
+                controller.audit_gate.register(event)
+                result = self._completion_audit(
+                    controller, event, verdict, verdict.lower(),
+                )
+                controller.audit_gate.record(result)
+                controller.pending_research = [research_task("suppressed-research")]
+                controller.pending_audits = [research_task("suppressed-audit")]
+                controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+
+                self.assertTrue(controller._complete_by_campaign_policy(event, result))
+                self.assertTrue(controller._complete_by_campaign_policy(event, result))
+
+                events = controller.store.replay()
+                completions = [
+                    item for item in events
+                    if item["kind"] == "CAMPAIGN_COMPLETION_POLICY_SATISFIED"
+                ]
+                self.assertEqual(len(completions), 1)
+                self.assertEqual(completions[0]["payload"]["audit_verdict"], verdict)
+                self.assertEqual(
+                    completions[0]["payload"]["mathematical_status_effect"], "none",
+                )
+                self.assertEqual(controller.lifecycle.phase, LifecyclePhase.FINALIZING)
+                self.assertEqual(controller.pending_research, [])
+                self.assertEqual(controller.pending_audits, [])
+                self.assertFalse(controller.final_claim_resolved)
+                self.assertEqual(controller.graph.claims["C_ROOT"].math_status, "OPEN")
+
+    def test_s2345_completion_policy_pass_reaches_completed_without_sealing(self) -> None:
+        evidence = self.project / "s2345-exact.json"
+        evidence.write_text("{}\n", encoding="utf-8")
+        backend = build_mock_full_cycle_backend()
+        candidate = backend.scripts["prover"][0]["candidate"]
+        candidate["artifact_paths"] = [str(evidence)]
+        candidate["reproduction_commands"] = [
+            f'python -c "import json; json.load(open(r\'{evidence}\'))"',
+        ]
+        candidate["proposed_evidence_level"] = "E2_EXACT_TESTED"
+        audit_result = {
+            "verdict": "PASS",
+            "checks": [{
+                "name": "independent exact reconstruction",
+                "passed": True,
+                "detail": "the bounded exact evidence was independently replayed",
+            }],
+            "gaps": [],
+            "notes": [],
+            "verified_evidence_level": "E2_EXACT_TESTED",
+        }
+        backend.scripts["auditor"] = [
+            {"result": audit_result}, {"result": audit_result},
+        ]
+        controller = AutonomousController(
+            load_config(self.project), backend=backend,
+            mock=True, run_id="scheduler-seed-2345",
+            campaign_id="scheduler-seed-2345",
+        )
+        controller.campaign_theme = self._completion_theme()
+
+        result = asyncio.run(controller.run(0.01))
+
+        events = controller.store.replay()
+        kinds = [item["kind"] for item in events]
+        audit_job_completed = next(
+            index for index, item in enumerate(events)
+            if item["kind"] == "JOB_COMPLETED"
+            and (item.get("payload") or {}).get("role") == "auditor"
+        )
+        audit_recorded = kinds.index("AUDIT_RECORDED")
+        policy_satisfied = kinds.index("CAMPAIGN_COMPLETION_POLICY_SATISFIED")
+        scheduler_stopped = kinds.index("SCHEDULER_STOPPED")
+        run_stopped = kinds.index("RUN_STOPPED")
+
+        self.assertFalse(result.internal_failure)
+        self.assertEqual(result.campaign_status, "COMPLETED")
+        self.assertTrue(result.artifacts_finalized)
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.COMPLETED)
+        self.assertLess(audit_job_completed, audit_recorded)
+        self.assertLess(audit_recorded, policy_satisfied)
+        self.assertLess(policy_satisfied, scheduler_stopped)
+        self.assertLess(scheduler_stopped, run_stopped)
+        self.assertEqual(
+            events[audit_recorded]["payload"]["verified_evidence_level"],
+            "E2_EXACT_TESTED",
+        )
+        self.assertEqual(kinds.count("CAMPAIGN_COMPLETION_POLICY_SATISFIED"), 1)
+        self.assertEqual(kinds.count("SCHEDULER_STOPPED"), 1)
+        self.assertNotIn("ATTEMPT_FAILED", kinds)
+        self.assertNotIn("CONTROLLER_ERROR", kinds)
+        self.assertNotIn("FINALIZING -> SEALED", json.dumps(events))
+        self.assertFalse(controller.final_claim_resolved)
+        self.assertEqual(controller.graph.claims["C_ROOT"].math_status, "OPEN")
+        campaign_events = controller.campaign_store.events()
+        sealed = [
+            item for item in campaign_events
+            if item["kind"] == "EPOCH_SEALED"
+            and item["epoch_id"] == controller.epoch_id
+        ]
+        self.assertEqual(len(sealed), 1)
+        self.assertEqual(sealed[0]["status"], "COMPLETED")
+
+    def test_completion_policy_naturally_drains_active_audits_once(self) -> None:
+        tasks = [research_task("candidate-a"), research_task("candidate-b")]
+        for index, task in enumerate(tasks):
+            task.role = "prover"
+            task.exact_objective = f"Produce bounded candidate {index}."
+        task_payloads = []
+        for task in tasks:
+            payload = task.to_dict()
+            payload.pop("output_contract")
+            task_payloads.append(payload)
+        controller_probe = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="active-audit-probe", campaign_id="active-audit-probe",
+        )
+        candidates = []
+        for index, task in enumerate(tasks):
+            candidate = self._completion_candidate(controller_probe, str(index))
+            candidate.event_id = f"active-audit-event-{index}"
+            candidate.producer_task_id = task.task_id
+            candidate.type = "THEOREM_CANDIDATE" if index == 0 else "KEY_LEMMA"
+            payload = candidate.to_dict()
+            payload.pop("fingerprint")
+            candidates.append(payload)
+        worker_result = {
+            "result_type": "PROOF",
+            "main_finding": "bounded candidate produced",
+            "status": "COMPLETED",
+            "artifact_paths": [],
+            "next_suggested_question": "independent audit",
+            "evidence_level": "E0_SPECULATIVE",
+            "asset_usage": [],
+        }
+        audit_result = {
+            "verdict": "PASS",
+            "checks": [{
+                "name": "independent reconstruction",
+                "passed": True,
+                "detail": "bounded evidence checked",
+            }],
+            "gaps": [],
+            "notes": [],
+            "verified_evidence_level": "E0_SPECULATIVE",
+        }
+        backend = MockCodexBackend({
+            "director": [{"result": {
+                "assessment": "Two bounded candidates are ready.",
+                "spawn": task_payloads,
+                "audit_priorities": [],
+                "route_updates": [],
+                "short_rationale": "Exercise concurrent audit draining.",
+            }}],
+            "prover": [
+                {
+                    "candidate": candidates[0],
+                    "post_candidate_delay": 0.2,
+                    "result": worker_result,
+                },
+                {
+                    "candidate": candidates[1],
+                    "post_candidate_delay": 0.2,
+                    "result": worker_result,
+                },
+            ],
+            "auditor": [
+                {"delay": 0.05, "result": audit_result},
+                {"delay": 0.25, "result": audit_result},
+            ],
+        })
+        controller = AutonomousController(
+            load_config(self.project), backend=backend, mock=True,
+            run_id="active-audit-drain", campaign_id="active-audit-drain",
+        )
+        controller.campaign_theme = self._completion_theme(max_candidates=2)
+
+        result = asyncio.run(controller.run(0.01))
+
+        events = controller.store.replay()
+        kinds = [item["kind"] for item in events]
+        self.assertFalse(result.internal_failure)
+        self.assertEqual(result.campaign_status, "COMPLETED")
+        self.assertEqual(kinds.count("AUDIT_RECORDED"), 2)
+        self.assertEqual(kinds.count("CAMPAIGN_COMPLETION_POLICY_SATISFIED"), 1)
+        self.assertEqual(kinds.count("SCHEDULER_DRAINING_IN_FLIGHT"), 1)
+        self.assertEqual(kinds.count("SCHEDULER_STOPPED"), 1)
+        self.assertLess(
+            kinds.index("CAMPAIGN_COMPLETION_POLICY_SATISFIED"),
+            kinds.index("SCHEDULER_DRAINING_IN_FLIGHT"),
+        )
+        self.assertLess(
+            kinds.index("SCHEDULER_DRAINING_IN_FLIGHT"),
+            max(index for index, kind in enumerate(kinds) if kind == "AUDIT_RECORDED"),
+        )
+        self.assertEqual(controller.graph.claims["C_ROOT"].math_status, "OPEN")
+
+    def test_continuation_restores_operational_completion_without_dispatch(self) -> None:
+        campaign_id = "completion-continuation"
+        first = AutonomousController(
+            load_config(self.project), backend=build_mock_full_cycle_backend(),
+            mock=True, run_id="completion-epoch-one", campaign_id=campaign_id,
+        )
+        first.campaign_theme = self._completion_theme()
+        first_result = asyncio.run(first.run(0.01))
+        self.assertEqual(first_result.campaign_status, "COMPLETED")
+
+        snapshot_path = first.run_dir / "state" / "compact_snapshot.json"
+        compact = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        archive_reference = compact["full_context_archive"]
+        archive_path = snapshot_path.parent / archive_reference["relative_path"]
+        archive = json.loads(archive_path.read_text(encoding="utf-8"))
+        compact["candidate_audit_frontier"] = []
+        archive["candidate_audit_frontier"] = []
+        archive_path.write_text(
+            json.dumps(archive, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        archive_reference["sha256"] = file_digest(archive_path)
+        archive_reference["bytes"] = archive_path.stat().st_size
+        snapshot_path.write_text(
+            json.dumps(compact, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        campaign_manifest = first.campaign_store.manifest_path
+        manifest = json.loads(campaign_manifest.read_text(encoding="utf-8"))
+        manifest["status"] = "PAUSED"
+        campaign_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        campaign_records = first.campaign_store.events()
+        campaign_records[-1]["status"] = "PAUSED"
+        first.campaign_store.epochs_path.write_text(
+            "".join(
+                json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                for item in campaign_records
+            ),
+            encoding="utf-8",
+        )
+
+        candidate_bytes = {
+            path.name: path.read_bytes()
+            for path in (first.run_dir / "candidates").glob("*.json")
+        }
+        candidate_ledger = (first.run_dir / "events" / "CANDIDATES.jsonl").read_bytes()
+        audit_lease_bytes = first.audit_leases.path.read_bytes()
+        first_event_bytes = (first.run_dir / "EVENTS.jsonl").read_bytes()
+        transition_records = first.canonical_transitions.records()
+
+        class CountingBackend(MockCodexBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.start_calls = 0
+
+            async def start(self) -> None:
+                self.start_calls += 1
+                await super().start()
+
+        backend = CountingBackend()
+        second = AutonomousController(
+            load_config(self.project), backend=backend, mock=True,
+            run_id="completion-epoch-two", campaign_id=campaign_id,
+            previous_epoch_id=first.run_id,
+        )
+        second.campaign_theme = self._completion_theme()
+
+        result = asyncio.run(second.run(0.01))
+
+        events = second.store.replay()
+        kinds = [item["kind"] for item in events]
+        self.assertFalse(result.internal_failure)
+        self.assertEqual(result.campaign_status, "COMPLETED")
+        self.assertEqual(result.jobs_started, 0)
+        self.assertEqual(result.jobs_terminal, 0)
+        self.assertEqual(backend.start_calls, 0)
+        self.assertEqual(backend.calls, [])
+        self.assertEqual(kinds.count("CAMPAIGN_OPERATIONAL_COMPLETION_RESTORED"), 1)
+        self.assertEqual(kinds.count("SCHEDULER_STOPPED"), 1)
+        self.assertEqual(kinds.count("ATTEMPT_COMPLETED"), 1)
+        self.assertEqual(kinds.count("RUN_STOPPED"), 1)
+        for forbidden in (
+            "DIRECTOR_PLAN_ACCEPTED", "JOB_STARTED", "CANDIDATE_PROCESSED",
+            "AUDIT_RECORDED", "TRUST_STATE_CHANGED",
+            "CANONICAL_TRANSITION_COMMITTED",
+        ):
+            self.assertNotIn(forbidden, kinds)
+        restored = next(
+            item["payload"] for item in events
+            if item["kind"] == "CAMPAIGN_OPERATIONAL_COMPLETION_RESTORED"
+        )
+        self.assertEqual(restored["source_epoch_id"], first.run_id)
+        self.assertEqual(restored["candidate_receipts_created"], 0)
+        self.assertEqual(restored["audit_results_created"], 0)
+        self.assertEqual(restored["canonical_transitions_created"], 0)
+        self.assertEqual(restored["mathematical_status_effect"], "none")
+        self.assertEqual(restored["parent_claim_status_effect"], "none")
+        self.assertIsNotNone(restored["reused_audit_lease_id"])
+        self.assertFalse(second.final_claim_resolved)
+        self.assertEqual(second.graph.claims["C_ROOT"].math_status, "OPEN")
+        self.assertEqual(
+            candidate_bytes,
+            {
+                path.name: path.read_bytes()
+                for path in (first.run_dir / "candidates").glob("*.json")
+            },
+        )
+        self.assertEqual(
+            candidate_ledger,
+            (first.run_dir / "events" / "CANDIDATES.jsonl").read_bytes(),
+        )
+        self.assertEqual(audit_lease_bytes, first.audit_leases.path.read_bytes())
+        self.assertEqual(first_event_bytes, (first.run_dir / "EVENTS.jsonl").read_bytes())
+        self.assertEqual(transition_records, second.canonical_transitions.records())
+        self.assertEqual(second.campaign_store.load().status, "COMPLETED")
+        second_seals = [
+            item for item in second.campaign_store.events()
+            if item["kind"] == "EPOCH_SEALED"
+            and item["epoch_id"] == second.epoch_id
+        ]
+        self.assertEqual(len(second_seals), 1)
+        self.assertEqual(second_seals[0]["status"], "COMPLETED")
 
     def test_rejected_derived_candidate_commits_canonical_reconciliation(self) -> None:
         controller = AutonomousController(

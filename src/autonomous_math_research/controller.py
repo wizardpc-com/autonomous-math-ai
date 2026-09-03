@@ -1344,31 +1344,49 @@ class AutonomousController:
             >= int(policy["max_valid_audit_attempts_per_candidate"])
         )
 
-    def _complete_by_campaign_policy(
+    def _completion_policy_matches(
         self, event: CandidateEvent, result: AuditResult,
     ) -> bool:
         policy = self._completion_policy()
-        if (
-            policy is None
-            or not self._completion_candidate_limit_reached()
-            or result.verdict not in set(policy["terminal_audit_verdicts"])
-            or not self._completion_policy_audit_limit_reached(event)
-        ):
+        return bool(
+            policy is not None
+            and self._completion_candidate_limit_reached()
+            and result.verdict in set(policy["terminal_audit_verdicts"])
+            and self._completion_policy_audit_limit_reached(event)
+        )
+
+    def _suppress_work_after_completion_policy(self) -> None:
+        self._completion_policy_audit_only = True
+        self.director_needed = False
+        self._replan_after_wave = False
+        self.pending_research.clear()
+        self.deferred_research_continuations.clear()
+        self.pending_audits.clear()
+
+    def _set_completion_policy_satisfied(
+        self,
+        event: CandidateEvent,
+        result: AuditResult,
+        *,
+        source_epoch_id: str | None = None,
+        canonical_transition_id: str | None = None,
+    ) -> bool:
+        if self._completion_policy_satisfied:
+            return True
+        if not self._completion_policy_matches(event, result):
             return False
+        policy = self._completion_policy()
         reason = (
             "campaign completion policy satisfied after a bounded candidate "
             f"audit: {result.verdict}"
         )
         self._completion_policy_satisfied = True
         self._completion_policy_reason = reason
-        self.director_needed = False
-        self._replan_after_wave = False
-        self.pending_research.clear()
-        self.deferred_research_continuations.clear()
+        self._suppress_work_after_completion_policy()
         if self.lifecycle.phase is LifecyclePhase.RUNNING:
             self.lifecycle.transition(LifecyclePhase.FINALIZING, reason=reason)
         self.scheduler_stop_reason = reason
-        self.store.append("CAMPAIGN_COMPLETION_POLICY_SATISFIED", {
+        payload = {
             "candidate_fingerprint": event.fingerprint,
             "claim_id": event.claim_id,
             "audit_id": result.audit_id,
@@ -1377,12 +1395,47 @@ class AutonomousController:
             "valid_audit_attempts": len(
                 self.audit_gate.states[event.fingerprint].results
             ),
-            "completion_policy": dict(policy),
+            "completion_policy": dict(policy or {}),
             "operational_status": "COMPLETED",
             "mathematical_status_effect": "none",
-            "trust_status_effect": "audit verdict only",
-        })
+        }
+        if source_epoch_id is None:
+            self.store.append("CAMPAIGN_COMPLETION_POLICY_SATISFIED", {
+                **payload,
+                "trust_status_effect": "audit verdict only",
+            })
+        else:
+            lease = self.audit_leases.get(event.fingerprint, result.audit_kind)
+            expected_status = {
+                "PASS": AuditLeaseStatus.PASSED,
+                "REJECT": AuditLeaseStatus.REJECTED,
+                "UNRESOLVED": AuditLeaseStatus.UNRESOLVED,
+            }[result.verdict]
+            if lease is None or lease.status != expected_status:
+                raise ValueError(
+                    "completion-policy audit lease is unavailable or nonterminal"
+                )
+            self.store.append("CAMPAIGN_OPERATIONAL_COMPLETION_RESTORED", {
+                **payload,
+                "source_epoch_id": source_epoch_id,
+                "reused_audit_lease_id": lease.lease_id,
+                "reused_canonical_transition_id": canonical_transition_id,
+                "candidate_receipts_created": 0,
+                "audit_results_created": 0,
+                "canonical_transitions_created": 0,
+                "trust_status_effect": "none",
+                "parent_claim_status_effect": "none",
+                "action": (
+                    "finalize the campaign without Director, research, audit, or "
+                    "model dispatch"
+                ),
+            })
         return True
+
+    def _complete_by_campaign_policy(
+        self, event: CandidateEvent, result: AuditResult,
+    ) -> bool:
+        return self._set_completion_policy_satisfied(event, result)
 
     def _begin_internal_failure_drain(self, reason: str, *, source: str) -> None:
         """Stop new dispatch while preserving queues and healthy in-flight work."""
@@ -4492,6 +4545,7 @@ class AutonomousController:
                 "campaign completion policy satisfied after a bounded candidate "
                 f"audit: {payload.get('audit_verdict')}"
             )
+            self.scheduler_stop_reason = self._completion_policy_reason
             self.director_needed = False
             self._replan_after_wave = False
         elif self._completion_candidate_limit_reached():
@@ -4538,19 +4592,20 @@ class AutonomousController:
                 "from": "ACTIVE", "to": "RETRY_WAIT",
                 "action": "stale epoch job will be reconciled before a fresh audit attempt",
             })
-        for state in self.audit_gate.states.values():
-            # A nonterminal audit is durable pending work. Explicit resume may
-            # re-attempt it once even when the preceding run exhausted one
-            # retry class; the preserved class counters still bound any
-            # automatic retry that follows in this resumed process.
-            self._queue_next_audit(state.event)
-        # Retention is stronger than the automatic retry allowance.  A failed
-        # audit remains pending for an explicit resume after repair even when
-        # its transient retry budget was already exhausted.
-        for fingerprint in retained_audit_fingerprints:
-            state = self.audit_gate.states.get(fingerprint)
-            if state is not None:
+        if not self._completion_policy_satisfied:
+            for state in self.audit_gate.states.values():
+                # A nonterminal audit is durable pending work. Explicit resume may
+                # re-attempt it once even when the preceding run exhausted one
+                # retry class; the preserved class counters still bound any
+                # automatic retry that follows in this resumed process.
                 self._queue_next_audit(state.event)
+            # Retention is stronger than the automatic retry allowance.  A failed
+            # audit remains pending for an explicit resume after repair even when
+            # its transient retry budget was already exhausted.
+            for fingerprint in retained_audit_fingerprints:
+                state = self.audit_gate.states.get(fingerprint)
+                if state is not None:
+                    self._queue_next_audit(state.event)
         for job_id in sorted(set(started) - terminal_jobs):
             self.store.append("STALE_JOB_DETECTED", {"job_id": job_id, "reason": "controller restart"})
             binding = bindings.get(job_id)
@@ -5093,11 +5148,14 @@ class AutonomousController:
                 "request_sha256": state.request_sha256,
                 "action": "idempotently requeue nonterminal controller-owned subtask",
             })
-        self._request_director(
-            "resume reconstructed pending lifecycle state",
-            meaningful_change=True,
-            immediate=True,
-        )
+        if self._completion_policy_satisfied:
+            self._suppress_work_after_completion_policy()
+        else:
+            self._request_director(
+                "resume reconstructed pending lifecycle state",
+                meaningful_change=True,
+                immediate=True,
+            )
 
     async def _interrupt_recovered_stale(self) -> None:
         if not self.stale_remote_turns:
@@ -5366,6 +5424,88 @@ class AutonomousController:
             ),
             transition_id,
         )
+
+    def _checkpoint_candidate_frontier(
+        self, snapshot: dict[str, Any], previous_run: Path,
+    ) -> list[dict[str, Any]]:
+        frontier = list(snapshot.get("candidate_audit_frontier") or [])
+        policy = self._completion_policy()
+        if policy is None:
+            return frontier
+        present = {
+            str((item.get("event") or {}).get("fingerprint") or "")
+            for item in frontier if isinstance(item, dict)
+        }
+        records = EventStore(
+            previous_run / "EVENTS.jsonl", str(self.previous_epoch_id),
+        ).replay()
+        watermark = int(
+            (snapshot.get("snapshot_provenance") or {}).get(
+                "event_watermark", len(records),
+            )
+        )
+        records = [
+            item for item in records
+            if int(item.get("sequence", 0)) <= watermark
+        ]
+        processed: dict[str, dict[str, Any]] = {}
+        for item in records:
+            if item.get("kind") != "CANDIDATE_PROCESSED":
+                continue
+            payload = item.get("payload") or {}
+            fingerprint = str(payload.get("fingerprint") or "")
+            if fingerprint:
+                processed[fingerprint] = dict(payload)
+        accepted = present | set(processed)
+        if len(accepted) < int(policy["max_accepted_candidates"]):
+            return frontier
+        candidate_root = (
+            previous_run / "candidates" if self.mock else self.inbox.candidate_root
+        )
+        audit_results: dict[str, list[dict[str, Any]]] = {}
+        for item in records:
+            payload = item.get("payload") or {}
+            if item.get("kind") != "AUDIT_RECORDED":
+                continue
+            result_payload = dict(payload)
+            result_payload.pop("trust_status", None)
+            fingerprint = str(payload.get("candidate_fingerprint") or "")
+            if fingerprint:
+                audit_results.setdefault(fingerprint, []).append(result_payload)
+        max_attempts = int(policy["max_valid_audit_attempts_per_candidate"])
+        terminal_verdicts = set(policy["terminal_audit_verdicts"])
+        for fingerprint, binding in sorted(processed.items()):
+            results = audit_results.get(fingerprint, [])
+            if (
+                fingerprint in present
+                or len(results) < max_attempts
+                or results[-1].get("verdict") not in terminal_verdicts
+            ):
+                continue
+            candidate_path = candidate_root / f"{fingerprint}.json"
+            if not candidate_path.is_file():
+                raise ValueError(
+                    "completion-policy checkpoint cannot reconstruct its accepted candidate"
+                )
+            event = CandidateEvent.from_dict(
+                json.loads(candidate_path.read_text(encoding="utf-8"))
+            )
+            if event.fingerprint != fingerprint:
+                raise ValueError(
+                    "completion-policy checkpoint candidate fingerprint changed"
+                )
+            frontier.append({
+                "event": event.to_dict(),
+                "artifact_hashes": dict(binding.get("artifact_hashes") or {}),
+                "semantic_evidence_hashes": dict(
+                    binding.get("semantic_evidence_hashes") or {}
+                ),
+                "producer_evidence_closure": binding.get(
+                    "producer_evidence_closure"
+                ),
+                "audit_results": results,
+            })
+        return frontier
 
     def _import_previous_epoch_checkpoint(self) -> None:
         """Import only durable, nonterminal frontier state into a new epoch.
@@ -5804,7 +5944,7 @@ class AutonomousController:
             )
 
         imported_candidates = 0
-        for raw in snapshot.get("candidate_audit_frontier") or []:
+        for raw in self._checkpoint_candidate_frontier(snapshot, previous_run):
             if not isinstance(raw, dict) or not isinstance(raw.get("event"), dict):
                 raise ValueError("previous epoch candidate frontier is invalid")
             event_payload = dict(raw["event"])
@@ -5859,11 +5999,31 @@ class AutonomousController:
             self.satisfied_route_conditions.update({
                 event.fingerprint, f"new_evidence:{event.claim_id}",
             })
-            if not state.terminal:
-                self._queue_next_audit(event)
             imported_candidates += 1
 
-        if self._completion_candidate_limit_reached():
+        for fingerprint, state in sorted(self.audit_gate.states.items()):
+            if not state.results:
+                continue
+            if self._set_completion_policy_satisfied(
+                state.event,
+                state.results[-1],
+                source_epoch_id=str(self.previous_epoch_id),
+                canonical_transition_id=(
+                    str(previous_canonical.get("canonical_transition_id") or "")
+                    or None
+                ),
+            ):
+                break
+
+        if not self._completion_policy_satisfied:
+            for state in self.audit_gate.states.values():
+                if not state.terminal:
+                    self._queue_next_audit(state.event)
+
+        if (
+            not self._completion_policy_satisfied
+            and self._completion_candidate_limit_reached()
+        ):
             self._enter_completion_policy_audit_only()
 
         self.store.append("EPOCH_CHECKPOINT_IMPORTED", {
@@ -5872,6 +6032,7 @@ class AutonomousController:
             "research_tasks": imported_research,
             "candidate_frontier": imported_candidates,
             "active_audit_leases_recovered": recovered_active_leases,
+            "operational_completion_restored": self._completion_policy_satisfied,
             "source": f"epoch://{self.previous_epoch_id}/state/compact_snapshot.json",
             "action": "append-only import into a fresh epoch",
         })
@@ -6296,6 +6457,21 @@ class AutonomousController:
             })
             return self._finish("dry-run validation complete")
 
+        if self._completion_policy_satisfied:
+            reason = (
+                self._completion_policy_reason
+                or "campaign completion policy satisfied"
+            )
+            self._suppress_work_after_completion_policy()
+            if self.lifecycle.phase is LifecyclePhase.RUNNING:
+                self.lifecycle.transition(LifecyclePhase.FINALIZING, reason=reason)
+            self.scheduler_stop_reason = reason
+            self._emit_scheduler_event_once(
+                f"scheduler-stop:{reason}", "SCHEDULER_STOPPED",
+                {"reason": reason},
+            )
+            return self._finish(reason)
+
         if self.recover_candidates_from:
             self._register_recovered_candidates(
                 self.recover_candidates_from, recovered_candidates,
@@ -6412,13 +6588,14 @@ class AutonomousController:
                         ))
                         continue
                     stopped_reason = self.scheduler_stop_reason
-                    if self._finalization_started:
-                        self.store.append("FINALIZATION_COMPLETED", {
-                            "claim_id": self.final_conjecture_claim_id,
-                            "pending_research_preserved": len(self.pending_research),
-                            "pending_audits_preserved": len(self.pending_audits),
-                            "reason": stopped_reason,
-                        })
+                    if self._finalization_started or self._completion_policy_satisfied:
+                        if self._finalization_started:
+                            self.store.append("FINALIZATION_COMPLETED", {
+                                "claim_id": self.final_conjecture_claim_id,
+                                "pending_research_preserved": len(self.pending_research),
+                                "pending_audits_preserved": len(self.pending_audits),
+                                "reason": stopped_reason,
+                            })
                         self.lifecycle.transition(
                             LifecyclePhase.COMPLETED, reason=stopped_reason,
                         )
@@ -6751,7 +6928,15 @@ class AutonomousController:
                 "audits_required": state.required,
             }
             for fingerprint, state in sorted(self.audit_gate.states.items())
-            if not state.terminal
+            if (
+                not state.terminal
+                or (
+                    bool(state.results)
+                    and self._completion_policy_matches(
+                        state.event, state.results[-1],
+                    )
+                )
+            )
         ]
         self._defer_nonretryable_pending_routes(source="checkpoint_preflight")
         current_task_ids = [task.task_id for task in self.pending_research]
@@ -11463,6 +11648,8 @@ class AutonomousController:
                 "candidate_trust_status": trust,
                 "verified_evidence_level": self.audit_gate.verified_evidence_level(fingerprint),
             })
+            if self._complete_by_campaign_policy(event, result):
+                return
             self._request_director(
                 "candidate needs another independent audit",
                 meaningful_change=False,
