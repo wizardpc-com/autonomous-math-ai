@@ -156,6 +156,39 @@ class EvidenceIsolationTests(unittest.TestCase):
                 graph.apply_audit_reject(event, verdict)
                 self.assertEqual(graph.claims["C"].to_dict(), before)
 
+    def test_reject_marks_only_candidate_created_evidence_as_rejected(self) -> None:
+        graph = self.graph()
+        event = CandidateEvent.from_dict({
+            "event_id": "candidate-derived",
+            "producer_thread_id": "producer-thread",
+            "producer_task_id": "producer-task",
+            "claim_id": "DERIVED",
+            "parent_claim_id": "C",
+            "type": "KEY_LEMMA",
+            "impact": "HIGH",
+            "concise_summary": "bounded derived candidate",
+            "exact_statement": "A derived statement remains to be proved.",
+            "artifact_paths": ["proofs/candidate.md"],
+            "reproduction_commands": [],
+            "dependency_impact": [],
+            "assumptions": [],
+            "dependencies": ["C"],
+            "proposed_evidence_level": EvidenceLevel.E2_EXACT_TESTED,
+        })
+        graph.mark_candidate(event)
+        before = deepcopy(graph.claims["DERIVED"].to_dict())
+
+        changed = graph.apply_audit_reject(event, "independent audit rejected evidence")
+
+        claim = graph.claims["DERIVED"]
+        self.assertTrue(changed)
+        self.assertEqual(claim.math_status, before["math_status"])
+        self.assertEqual(claim.evidence_level, before["evidence_level"])
+        self.assertEqual(claim.current_gaps, before["current_gaps"])
+        self.assertTrue(claim.proof_obligations)
+        self.assertTrue(all(item.status == "OPEN" for item in claim.proof_obligations))
+        self.assertEqual(claim.trust_status, TrustStatus.REJECTED)
+
     def test_only_passed_counterexample_can_mark_failed(self) -> None:
         graph = self.graph()
         event = candidate(event_type="COUNTEREXAMPLE", impact="HIGH")

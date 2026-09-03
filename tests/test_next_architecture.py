@@ -5,9 +5,11 @@ import asyncio
 import json
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
+import zipfile
 
 from autonomous_math_research.claim_graph import ClaimGraph
 from autonomous_math_research.backend import MockCodexBackend
@@ -53,7 +55,7 @@ from autonomous_math_research.lifecycle.state import (
     MonotoneLifecycle,
 )
 from autonomous_math_research.models import (
-    CandidateEvent, Claim, JobOutcome, ResearchTask, stable_hash,
+    AuditResult, CandidateEvent, Claim, JobOutcome, ResearchTask, stable_hash,
 )
 from autonomous_math_research.project import (
     ProjectManifest,
@@ -64,6 +66,7 @@ from autonomous_math_research.representation import (
     RepresentationContract,
     require_compatible_representations,
 )
+from autonomous_math_research.research_memory import CampaignTheme
 from autonomous_math_research.storage import ProjectLayout, file_digest
 from autonomous_math_research.storage_layer.artifacts import ArtifactStore
 from autonomous_math_research.storage_layer.steering import (
@@ -420,6 +423,20 @@ class NextArchitectureTests(unittest.TestCase):
             artifact_paths=[], reproduction_commands=[], dependency_impact=[],
         )
         first.audit_gate.register(candidate)
+        producer_workspace = first.run_dir / "jobs" / "audited-rebase-producer"
+        producer_workspace.mkdir(parents=True, exist_ok=True)
+        producer_packet = producer_workspace / "task_packet.json"
+        producer_packet.write_text(
+            '{"task_id":"audited-rebase-task"}\n', encoding="utf-8"
+        )
+        first.candidate_producer_evidence_closures[candidate.fingerprint] = (
+            first.artifact_store.seal_producer_evidence_closure(
+                producer_task_id=candidate.producer_task_id,
+                producer_job_id="audited-rebase-producer",
+                task_packet=producer_packet,
+                required_file_access=[],
+            )
+        )
         first.graph.claims["C_ROOT"].priority["score"] = 0.9
         transition_id = first._commit_claim_state_transition(
             transition_kind="CONTROLLER_PRIORITY_UPDATE",
@@ -622,7 +639,7 @@ class NextArchitectureTests(unittest.TestCase):
             (controller.run_dir / "RUN_MANIFEST.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["schema_version"], 14)
-        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.16")
+        self.assertEqual(run_manifest["runtime_provenance"]["amr_version"], "0.2.17")
         self.assertIn("canonical_state", run_manifest)
 
     @patch("autonomous_math_research.canonical_state.subprocess.run")
@@ -2453,6 +2470,267 @@ class NextArchitectureTests(unittest.TestCase):
             [item["kind"] for item in controller.store.replay()],
         )
 
+    def test_empty_director_plan_holds_for_each_active_work_state(self) -> None:
+        empty_plan = {
+            "assessment": "Controller-owned work remains in flight.",
+            "spawn": [],
+            "audit_priorities": [],
+            "route_updates": [],
+            "short_rationale": "Wait for the bounded work to finish.",
+        }
+        for state_name in (
+            "pending_research", "active_research", "pending_audit", "active_audit",
+        ):
+            with self.subTest(state=state_name):
+                controller = AutonomousController(
+                    load_config(self.project), backend=MockCodexBackend(), mock=True,
+                    run_id=f"held-{state_name}", campaign_id=f"held-{state_name}",
+                )
+                controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+                controller.director_needed = False
+                controller.director_retry_count = 1
+                controller.director_retry_counts["model_protocol"] = 1
+                task = research_task(f"task-{state_name}")
+                if state_name == "pending_research":
+                    controller.pending_research = [task]
+                elif state_name == "pending_audit":
+                    lease = controller.audit_leases.ensure(
+                        f"candidate-{state_name}", "independent_auditor",
+                        priority=1.0,
+                    )
+                    task.metadata["audit_lease_id"] = lease.lease_id
+                    controller.pending_audits = [task]
+                else:
+                    controller.active["active"] = SimpleNamespace(
+                        kind=(
+                            "research" if state_name == "active_research" else "audit"
+                        ),
+                        task=task,
+                    )
+
+                controller._accept_director_result(JobOutcome(
+                    job_id=f"director-{state_name}",
+                    task_id=f"director-{state_name}", role="director",
+                    claim_id="FRONTIER", status="completed", result=empty_plan,
+                ))
+
+                events = controller.store.replay()
+                kinds = [item["kind"] for item in events]
+                self.assertIn("DIRECTOR_PLAN_HELD_FOR_ACTIVE_WORK", kinds)
+                self.assertNotIn("DIRECTOR_PLAN_REPAIR_REQUIRED", kinds)
+                self.assertNotIn("DIRECTOR_RETRY_QUEUED", kinds)
+                self.assertEqual(controller.director_retry_count, 1)
+                self.assertEqual(controller.director_retry_counts["model_protocol"], 1)
+                self.assertTrue(controller._replan_after_wave)
+
+                controller.pending_research.clear()
+                controller.pending_audits.clear()
+                controller.active.clear()
+                controller._request_replan_when_cycle_idle()
+                controller._request_replan_when_cycle_idle()
+
+                replans = [
+                    item for item in controller.store.replay()
+                    if item["kind"] == "REPLAN_REQUESTED"
+                ]
+                self.assertEqual(len(replans), 1)
+                self.assertTrue(controller.director_needed)
+
+    def test_truly_idle_empty_director_plan_uses_bounded_fail_closed_retry(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="idle-empty-plan", campaign_id="idle-empty-plan",
+        )
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+        controller.director_needed = False
+        outcome = JobOutcome(
+            job_id="director-idle", task_id="director-idle", role="director",
+            claim_id="FRONTIER", status="completed", result={
+                "assessment": "No work was proposed.",
+                "spawn": [], "audit_priorities": [], "route_updates": [],
+                "short_rationale": "No current route was selected.",
+            },
+        )
+
+        controller._accept_director_result(outcome)
+        self.assertTrue(controller.director_needed)
+        self.assertEqual(controller.director_retry_counts["model_protocol"], 1)
+        controller.director_needed = False
+        controller._accept_director_result(outcome)
+
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.DRAINING_EPOCH)
+        self.assertIn("director failed after bounded retries", controller.scheduler_stop_reason)
+
+    def test_single_candidate_completion_policy_becomes_audit_only_then_complete(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=True,
+            run_id="single-candidate-policy", campaign_id="single-candidate-policy",
+        )
+        controller.campaign_theme = CampaignTheme.from_dict({
+            "schema_version": 2,
+            "theme_id": "single-candidate",
+            "title": "One candidate and one audit",
+            "objective": "Exercise bounded operational completion.",
+            "include_claim_ids": ["C_ROOT"],
+            "include_scope_ids": [],
+            "exclude_claim_ids": [],
+            "exclude_scope_ids": [],
+            "allowed_method_ids": [],
+            "forbidden_method_ids": [],
+            "dependency_boundary": ["C_ROOT"],
+            "combination_scope": "No cross-scope union.",
+            "obligations": [],
+            "completion_policy": {
+                "max_accepted_candidates": 1,
+                "post_candidate_mode": "AUDIT_ONLY",
+                "max_valid_audit_attempts_per_candidate": 1,
+                "terminal_audit_verdicts": ["PASS", "REJECT", "UNRESOLVED"],
+            },
+        })
+        event = CandidateEvent.from_dict({
+            "event_id": "single-candidate-event",
+            "producer_task_id": "single-producer",
+            "claim_id": "C_ROOT",
+            "type": "KEY_LEMMA",
+            "impact": "HIGH",
+            "concise_summary": "One bounded candidate.",
+            "exact_statement": controller.graph.claims["C_ROOT"].statement,
+            "artifact_paths": [],
+            "reproduction_commands": [],
+            "dependency_impact": [],
+            "assumptions": list(controller.graph.claims["C_ROOT"].assumptions),
+            "dependencies": list(controller.graph.claims["C_ROOT"].dependencies),
+        })
+        state = controller.audit_gate.register(event)
+        pending_audit = research_task("single-audit")
+        controller.pending_audits = [pending_audit]
+        controller.pending_research = [research_task("must-be-suppressed")]
+
+        self.assertTrue(controller._enter_completion_policy_audit_only())
+        self.assertEqual(controller.pending_research, [])
+        self.assertEqual(controller.pending_audits, [pending_audit])
+        result = AuditResult.from_dict({
+            "audit_id": "single-reject",
+            "candidate_fingerprint": event.fingerprint,
+            "auditor_thread_id": "independent-auditor",
+            "verdict": "REJECT",
+            "audit_kind": controller.audit_gate.next_audit_kind(event),
+            "statement_checked": event.exact_statement,
+            "checks": [{
+                "name": "independent reconstruction",
+                "passed": False,
+                "detail": "candidate evidence did not establish the claim",
+            }],
+            "gaps": ["candidate evidence rejected"],
+            "notes": [],
+            "verified_evidence_level": "E0_SPECULATIVE",
+            "report_path": None,
+            "timestamp": "2026-09-03T00:00:00Z",
+        })
+        controller.audit_gate.record(result)
+        controller.lifecycle.transition(LifecyclePhase.RUNNING, reason="test")
+
+        self.assertTrue(controller._complete_by_campaign_policy(event, result))
+        self.assertEqual(controller.lifecycle.phase, LifecyclePhase.FINALIZING)
+        self.assertFalse(controller.final_claim_resolved)
+        self.assertIn("campaign completion policy satisfied", controller.scheduler_stop_reason)
+        self.assertIn(
+            "CAMPAIGN_COMPLETION_POLICY_SATISFIED",
+            [item["kind"] for item in controller.store.replay()],
+        )
+
+    def test_rejected_derived_candidate_commits_canonical_reconciliation(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="rejected-derived", campaign_id="rejected-derived",
+        )
+        controller._pin_run_inputs(0.01, False)
+        event = CandidateEvent.from_dict({
+            "event_id": "rejected-derived-event",
+            "producer_task_id": "rejected-derived-producer",
+            "claim_id": "REJECTED_DERIVED",
+            "parent_claim_id": "C_ROOT",
+            "type": "KEY_LEMMA",
+            "impact": "HIGH",
+            "concise_summary": "Derived evidence requires independent audit.",
+            "exact_statement": "A derived statement remains unproved.",
+            "artifact_paths": [],
+            "reproduction_commands": [],
+            "dependency_impact": [],
+            "assumptions": [],
+            "dependencies": ["C_ROOT"],
+            "proposed_evidence_level": "E2_EXACT_TESTED",
+        })
+        producer_workspace = controller.run_dir / "jobs" / "producer"
+        producer_workspace.mkdir(parents=True, exist_ok=True)
+        packet = producer_workspace / "task_packet.json"
+        packet.write_text(
+            '{"task_id":"rejected-derived-producer"}\n', encoding="utf-8"
+        )
+        controller.producer_evidence_closures[event.producer_task_id] = (
+            controller.artifact_store.seal_producer_evidence_closure(
+                producer_task_id=event.producer_task_id,
+                producer_job_id="rejected-derived-producer-job",
+                task_packet=packet,
+                required_file_access=[],
+            )
+        )
+        hashes = controller._bind_candidate_artifacts(event)
+        controller._bind_candidate_semantic_evidence(event, hashes)
+        controller.graph.mark_candidate(event)
+        controller.audit_gate.register(event)
+        controller._commit_claim_state_transition(
+            transition_kind="CANDIDATE_REGISTERED",
+            authorization={
+                "candidate_fingerprint": event.fingerprint,
+                "claim_id": event.claim_id,
+                "parent_claim_id": event.parent_claim_id,
+                "trust_upgrade": False,
+            },
+        )
+        audit_kind = controller.audit_gate.next_audit_kind(event)
+        lease = controller.audit_leases.ensure(
+            event.fingerprint, audit_kind, priority=1.0,
+        )
+        controller.audit_leases.activate(lease.lease_id, "audit-job")
+        controller._accept_audit_result(
+            JobOutcome(
+                job_id="audit-job", task_id=lease.lease_id, role="auditor",
+                claim_id=event.claim_id, status="completed",
+                thread_id="independent-auditor-thread",
+                result={
+                    "verdict": "REJECT",
+                    "checks": [{
+                        "name": "independent reconstruction",
+                        "passed": False,
+                        "detail": "the evidence does not prove the exact statement",
+                    }],
+                    "gaps": ["independent audit rejected the evidence"],
+                    "notes": [],
+                    "verified_evidence_level": "E0_SPECULATIVE",
+                },
+            ),
+            assigned_fingerprint=event.fingerprint,
+            assigned_artifact_hashes=hashes,
+            audit_lease_id=lease.lease_id,
+            assigned_semantic_audit_context=None,
+        )
+
+        claim = controller.graph.claims[event.claim_id]
+        self.assertEqual(claim.math_status, "PLAUSIBLE")
+        self.assertEqual(claim.evidence_level, "E0_SPECULATIVE")
+        self.assertEqual(claim.trust_status, "REJECTED")
+        self.assertTrue(all(item.status == "OPEN" for item in claim.proof_obligations))
+        controller.canonical_transitions.verify_current()
+        reconciliations = [
+            item for item in controller.store.replay()
+            if item["kind"] == "CANDIDATE_AUDIT_REJECTED_RECONCILED"
+        ]
+        self.assertEqual(len(reconciliations), 1)
+        self.assertIsNotNone(
+            reconciliations[0]["payload"]["canonical_transition_id"]
+        )
+
     def test_director_cannot_satisfy_a_paused_route_retry_condition(self) -> None:
         controller = AutonomousController(
             load_config(self.project), backend=MockCodexBackend(), mock=True,
@@ -2860,6 +3138,22 @@ class NextArchitectureTests(unittest.TestCase):
             "role": task.role,
             "claim_id": task.target_claim,
         })
+        producer_workspace = (
+            controller.run_dir / "jobs" / "job-legal-dependency"
+        )
+        producer_workspace.mkdir(parents=True, exist_ok=True)
+        producer_packet = producer_workspace / "task_packet.json"
+        producer_packet.write_text(
+            '{"task_id":"legal-dependency-producer"}\n', encoding="utf-8"
+        )
+        controller.producer_evidence_closures[task.task_id] = (
+            controller.artifact_store.seal_producer_evidence_closure(
+                producer_task_id=task.task_id,
+                producer_job_id="job-legal-dependency",
+                task_packet=producer_packet,
+                required_file_access=[],
+            )
+        )
         event = CandidateEvent.from_dict({
             "event_id": "legal-claim-dependency",
             "producer_task_id": task.task_id,
@@ -3113,6 +3407,105 @@ class NextArchitectureTests(unittest.TestCase):
         source.write_text("producer changed source\n", encoding="utf-8")
         self.assertTrue(store.verify(hashes)[0])
         self.assertTrue(all(path.startswith("epoch://epoch-1/") for path in event.artifact_paths))
+
+    def test_producer_evidence_closure_survives_source_edit_and_materializes(self) -> None:
+        epoch_root = self.runtime / "runs" / "producer-closure"
+        store = ArtifactStore(
+            self.project, "campaign-1", "producer-closure", epoch_root,
+        )
+        source = self.project / "artifacts" / "producer-input.txt"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("original producer bytes\n", encoding="utf-8")
+        materialized = epoch_root / "jobs" / "research" / "inputs" / source.name
+        materialized.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, materialized)
+        packet = epoch_root / "jobs" / "research" / "task_packet.json"
+        packet.write_text('{"task_id":"producer-task"}\n', encoding="utf-8")
+        binding = store.seal_producer_evidence_closure(
+            producer_task_id="producer-task",
+            producer_job_id="producer-job",
+            task_packet=packet,
+            required_file_access=[{
+                "reference": "project://artifacts/producer-input.txt",
+                "path": str(materialized),
+                "sha256": file_digest(materialized),
+            }],
+        )
+        source.write_text("changed source bytes\n", encoding="utf-8")
+
+        copied = store.materialize_producer_evidence_closure(
+            binding, epoch_root / "jobs" / "auditor",
+        )
+
+        self.assertTrue(store.verify_producer_evidence_closure(binding)[0])
+        self.assertEqual(
+            Path(copied["required_file_access"][0]["path"]).read_text(
+                encoding="utf-8"
+            ),
+            "original producer bytes\n",
+        )
+        self.assertIsNone(copied.get("producer_transcript"))
+
+    def test_producer_evidence_closure_rejects_zip_traversal_and_tampering(self) -> None:
+        epoch_root = self.runtime / "runs" / "producer-closure-adversarial"
+        store = ArtifactStore(
+            self.project, "campaign-1", "producer-closure-adversarial", epoch_root,
+        )
+        job = epoch_root / "jobs" / "research"
+        job.mkdir(parents=True, exist_ok=True)
+        packet = job / "task_packet.json"
+        packet.write_text('{"task_id":"producer-task"}\n', encoding="utf-8")
+        hostile = job / "hostile.zip"
+        with zipfile.ZipFile(hostile, "w") as archive:
+            archive.writestr("../escape.txt", "forbidden")
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            store.seal_producer_evidence_closure(
+                producer_task_id="producer-task",
+                producer_job_id="hostile-job",
+                task_packet=packet,
+                required_file_access=[{
+                    "reference": "project://artifacts/hostile.zip",
+                    "path": str(hostile),
+                    "sha256": file_digest(hostile),
+                }],
+            )
+
+        safe = job / "safe.zip"
+        with zipfile.ZipFile(safe, "w") as archive:
+            archive.writestr("proof/data.txt", "exact bytes")
+        binding = store.seal_producer_evidence_closure(
+            producer_task_id="producer-task",
+            producer_job_id="safe-job",
+            task_packet=packet,
+            required_file_access=[{
+                "reference": "project://artifacts/safe.zip",
+                "path": str(safe),
+                "sha256": file_digest(safe),
+            }],
+        )
+        manifest_path = store.resolve_uri(binding["manifest_uri"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sealed_zip = store.resolve_uri(manifest["required_file_access"][0]["uri"])
+        sealed_zip.write_bytes(sealed_zip.read_bytes() + b"tampered")
+
+        valid, observed = store.verify_producer_evidence_closure(binding)
+
+        self.assertFalse(valid)
+        self.assertIn("error", observed)
+
+        manifest_binding = store.seal_producer_evidence_closure(
+            producer_task_id="producer-task",
+            producer_job_id="manifest-job",
+            task_packet=packet,
+            required_file_access=[],
+        )
+        manifest_path = store.resolve_uri(manifest_binding["manifest_uri"])
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        manifest_valid, manifest_observed = (
+            store.verify_producer_evidence_closure(manifest_binding)
+        )
+        self.assertFalse(manifest_valid)
+        self.assertIn("manifest changed", str(manifest_observed.get("error")))
 
     def test_candidate_inbox_keeps_its_startup_schema_when_package_resource_disappears(self) -> None:
         inbox = CandidateInbox(

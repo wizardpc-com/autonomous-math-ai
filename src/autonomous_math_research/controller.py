@@ -1004,6 +1004,9 @@ class AutonomousController:
         self.final_conjecture_proved = False
         self.final_conjecture_refuted = False
         self._finalization_started = False
+        self._completion_policy_audit_only = False
+        self._completion_policy_satisfied = False
+        self._completion_policy_reason: str | None = None
         self._scheduler_event_keys: set[str] = set()
         self.capability_snapshot: dict[str, Any] | None = None
         self.policy_manifest: dict[str, Any] | None = None
@@ -1030,6 +1033,10 @@ class AutonomousController:
         self.conflicted_candidates: set[str] = set()
         self.candidate_artifact_hashes: dict[str, dict[str, str]] = {}
         self.candidate_semantic_evidence_hashes: dict[str, dict[str, str]] = {}
+        self.producer_evidence_closures: dict[str, dict[str, object]] = {}
+        self.candidate_producer_evidence_closures: dict[
+            str, dict[str, object]
+        ] = {}
         self.domain_evidence_receipts: dict[str, list[dict[str, Any]]] = {}
         self._schema_cache: dict[str, dict[str, Any]] = {}
         self._internal_failure = False
@@ -1231,6 +1238,7 @@ class AutonomousController:
             return
         if (
             self._finalization_started
+            or self._completion_policy_audit_only
             or self.scheduler_stop_reason
             or not self.lifecycle.can_dispatch
         ):
@@ -1265,6 +1273,116 @@ class AutonomousController:
         self.recent_changes.append(change)
         if len(self.recent_changes) > 50:
             del self.recent_changes[:-50]
+
+    def _completion_policy(self) -> dict[str, Any] | None:
+        if self.campaign_theme is None:
+            return None
+        return self.campaign_theme.completion_policy
+
+    def _accepted_candidate_count(self) -> int:
+        return len(self.audit_gate.states)
+
+    def _completion_candidate_limit_reached(self) -> bool:
+        policy = self._completion_policy()
+        return bool(
+            policy is not None
+            and self._accepted_candidate_count()
+            >= int(policy["max_accepted_candidates"])
+        )
+
+    def _enter_completion_policy_audit_only(self) -> bool:
+        policy = self._completion_policy()
+        if policy is None or not self._completion_candidate_limit_reached():
+            return False
+        if self._completion_policy_audit_only:
+            return True
+        suppressed = [task.to_dict() for task in self.pending_research]
+        deferred = [task.to_dict() for task in self.deferred_research_continuations]
+        cancelled_active: list[str] = []
+        for job_id, active in list(self.active.items()):
+            if active.kind != "research":
+                continue
+            self._schedule_backend_cancel(
+                job_id, "campaign completion policy entered audit-only mode",
+            )
+            active.future.cancel()
+            self._record_job_cancelled(
+                job_id,
+                active,
+                "campaign completion policy entered audit-only mode",
+                remote_cancel_succeeded=None,
+            )
+            cancelled_active.append(job_id)
+        self.pending_research.clear()
+        self.deferred_research_continuations.clear()
+        self.director_needed = False
+        self._replan_after_wave = False
+        self._completion_policy_audit_only = True
+        self.store.append("COMPLETION_POLICY_AUDIT_ONLY", {
+            "accepted_candidates": self._accepted_candidate_count(),
+            "max_accepted_candidates": policy["max_accepted_candidates"],
+            "post_candidate_mode": policy["post_candidate_mode"],
+            "suppressed_pending_research": suppressed,
+            "suppressed_deferred_continuations": deferred,
+            "active_research": sum(
+                item.kind == "research" for item in self.active.values()
+            ),
+            "cancelled_active_research_job_ids": cancelled_active,
+            "mathematical_status_effect": "none",
+            "trust_status_effect": "none",
+            "action": "allow only the bounded independent candidate audit",
+        })
+        return True
+
+    def _completion_policy_audit_limit_reached(self, event: CandidateEvent) -> bool:
+        policy = self._completion_policy()
+        state = self.audit_gate.states.get(event.fingerprint)
+        return bool(
+            policy is not None
+            and state is not None
+            and len(state.results)
+            >= int(policy["max_valid_audit_attempts_per_candidate"])
+        )
+
+    def _complete_by_campaign_policy(
+        self, event: CandidateEvent, result: AuditResult,
+    ) -> bool:
+        policy = self._completion_policy()
+        if (
+            policy is None
+            or not self._completion_candidate_limit_reached()
+            or result.verdict not in set(policy["terminal_audit_verdicts"])
+            or not self._completion_policy_audit_limit_reached(event)
+        ):
+            return False
+        reason = (
+            "campaign completion policy satisfied after a bounded candidate "
+            f"audit: {result.verdict}"
+        )
+        self._completion_policy_satisfied = True
+        self._completion_policy_reason = reason
+        self.director_needed = False
+        self._replan_after_wave = False
+        self.pending_research.clear()
+        self.deferred_research_continuations.clear()
+        if self.lifecycle.phase is LifecyclePhase.RUNNING:
+            self.lifecycle.transition(LifecyclePhase.FINALIZING, reason=reason)
+        self.scheduler_stop_reason = reason
+        self.store.append("CAMPAIGN_COMPLETION_POLICY_SATISFIED", {
+            "candidate_fingerprint": event.fingerprint,
+            "claim_id": event.claim_id,
+            "audit_id": result.audit_id,
+            "audit_verdict": result.verdict,
+            "accepted_candidates": self._accepted_candidate_count(),
+            "valid_audit_attempts": len(
+                self.audit_gate.states[event.fingerprint].results
+            ),
+            "completion_policy": dict(policy),
+            "operational_status": "COMPLETED",
+            "mathematical_status_effect": "none",
+            "trust_status_effect": "audit verdict only",
+        })
+        return True
 
     def _begin_internal_failure_drain(self, reason: str, *, source: str) -> None:
         """Stop new dispatch while preserving queues and healthy in-flight work."""
@@ -4108,6 +4226,21 @@ class AutonomousController:
                     if bound in {None, fingerprint}:
                         self.task_fingerprints_by_id[task.task_id] = fingerprint
                         accepted[task.task_id] = task
+            elif event["kind"] == "PRODUCER_EVIDENCE_CLOSURE_SEALED":
+                payload = event["payload"]
+                task_id = str(payload.get("task_id") or "")
+                closure = payload.get("closure")
+                if not task_id or not isinstance(closure, dict):
+                    raise ValueError("producer evidence closure replay event is invalid")
+                valid, observed = self.artifact_store.verify_producer_evidence_closure(
+                    closure
+                )
+                if not valid:
+                    raise ValueError(
+                        "producer evidence closure changed during resume: "
+                        f"{task_id}; observed={observed}"
+                    )
+                self.producer_evidence_closures[task_id] = dict(closure)
             elif event["kind"] == "CANDIDATE_PROCESSED":
                 fingerprint = event["payload"]["fingerprint"]
                 self.inbox.processed.add(fingerprint)
@@ -4127,6 +4260,26 @@ class AutonomousController:
                         self.candidate_artifact_hashes[fingerprint] = dict(recorded_hashes)
                     else:
                         self._bind_candidate_artifacts(candidate)
+                    closure = event["payload"].get("producer_evidence_closure")
+                    if closure is not None:
+                        if not isinstance(closure, dict):
+                            raise ValueError(
+                                "candidate producer evidence closure binding is invalid"
+                            )
+                        expected_closure = self.producer_evidence_closures.get(
+                            candidate.producer_task_id
+                        )
+                        if expected_closure is not None and closure != expected_closure:
+                            raise ValueError(
+                                "candidate producer evidence closure identity changed during resume"
+                            )
+                        self.candidate_producer_evidence_closures[fingerprint] = dict(
+                            closure
+                        )
+                    elif not self.mock:
+                        raise ValueError(
+                            "candidate producer evidence closure is missing during resume"
+                        )
                     semantic_hashes = self._bind_candidate_semantic_evidence(
                         candidate, self.candidate_artifact_hashes[fingerprint],
                     )
@@ -4327,6 +4480,26 @@ class AutonomousController:
             if result.candidate_fingerprint in self.audit_gate.states:
                 state = self.audit_gate.states[result.candidate_fingerprint]
                 self._restore_audit_result(state.event, result)
+        completion_events = [
+            event for event in records
+            if event["kind"] == "CAMPAIGN_COMPLETION_POLICY_SATISFIED"
+        ]
+        if completion_events:
+            payload = completion_events[-1]["payload"]
+            self._completion_policy_audit_only = True
+            self._completion_policy_satisfied = True
+            self._completion_policy_reason = (
+                "campaign completion policy satisfied after a bounded candidate "
+                f"audit: {payload.get('audit_verdict')}"
+            )
+            self.director_needed = False
+            self._replan_after_wave = False
+        elif self._completion_candidate_limit_reached():
+            self._completion_policy_audit_only = True
+            self.director_needed = False
+            self._replan_after_wave = False
+            self.pending_research.clear()
+            self.deferred_research_continuations.clear()
         latest_usage_by_thread: dict[str, dict[str, Any]] = {}
         for event in records:
             if event["kind"] != "APP_SERVER_NOTIFICATION":
@@ -5640,6 +5813,27 @@ class AutonomousController:
             if expected_fingerprint and event.fingerprint != expected_fingerprint:
                 raise ValueError("previous epoch candidate fingerprint changed")
             hashes = dict(raw.get("artifact_hashes") or {})
+            closure = raw.get("producer_evidence_closure")
+            if closure:
+                if not isinstance(closure, dict):
+                    raise ValueError(
+                        "previous epoch candidate producer evidence closure is invalid"
+                    )
+                closure_ok, closure_observed = (
+                    self.artifact_store.verify_producer_evidence_closure(closure)
+                )
+                if not closure_ok:
+                    raise ValueError(
+                        "previous epoch producer evidence closure is unavailable or changed: "
+                        f"{event.fingerprint}; observed={closure_observed}"
+                    )
+                self.candidate_producer_evidence_closures[event.fingerprint] = dict(
+                    closure
+                )
+            elif not self.mock:
+                raise ValueError(
+                    "previous epoch candidate producer evidence closure is missing"
+                )
             self._verify_domain_evidence_receipts(
                 event, extend_artifacts=False,
             )
@@ -5668,6 +5862,9 @@ class AutonomousController:
             if not state.terminal:
                 self._queue_next_audit(event)
             imported_candidates += 1
+
+        if self._completion_candidate_limit_reached():
+            self._enter_completion_policy_audit_only()
 
         self.store.append("EPOCH_CHECKPOINT_IMPORTED", {
             "campaign_id": self.campaign_id,
@@ -6546,6 +6743,9 @@ class AutonomousController:
                 "semantic_evidence_hashes": dict(
                     self.candidate_semantic_evidence_hashes.get(fingerprint) or {}
                 ),
+                "producer_evidence_closure": dict(
+                    self.candidate_producer_evidence_closures.get(fingerprint) or {}
+                ),
                 "audit_status": state.trust_status,
                 "audit_results": [item.to_dict() for item in state.results],
                 "audits_required": state.required,
@@ -7156,6 +7356,10 @@ class AutonomousController:
             ),
             "mechanical_broker_client_sha256": broker_client_sha256,
             "mechanical_broker_config_sha256": broker_config_sha256,
+            "producer_evidence_closure": (
+                self.producer_evidence_closures.get(task.task_id)
+                if kind == "research" else None
+            ),
         })
         self.live_store.append("AGENT_JOB_STARTED", {
             "job_id": job_id, "role": task.role, "task_id": task.task_id,
@@ -8335,8 +8539,17 @@ class AutonomousController:
         return receipts
 
     def _bind_candidate_artifacts(self, event: CandidateEvent) -> dict[str, str]:
-        hashes = self.artifact_store.seal_candidate(event)
+        closure = self.producer_evidence_closures.get(event.producer_task_id)
+        if closure is None and not self.mock and event.fingerprint not in self._reconciliation_candidates:
+            raise ValueError("candidate producer evidence closure is missing")
+        hashes = self.artifact_store.seal_candidate(
+            event, producer_evidence_closure=closure,
+        )
         self.candidate_artifact_hashes[event.fingerprint] = hashes
+        if closure is not None:
+            self.candidate_producer_evidence_closures[event.fingerprint] = dict(
+                closure
+            )
         return dict(hashes)
 
     def _bind_candidate_semantic_evidence(
@@ -8378,7 +8591,20 @@ class AutonomousController:
         if event.artifact_paths and not expected:
             return False, expected, {}
         _, current = self.artifact_store.verify(expected)
-        return current == expected, expected, current
+        if current != expected:
+            return False, expected, current
+        closure = self.candidate_producer_evidence_closures.get(event.fingerprint)
+        if closure is None:
+            return self.mock, expected, current
+        closure_ok, closure_observed = (
+            self.artifact_store.verify_producer_evidence_closure(closure)
+        )
+        if not closure_ok:
+            current = {
+                **current,
+                "producer_evidence_closure": str(closure_observed),
+            }
+        return closure_ok, expected, current
 
     def _record_candidate_artifact_drift(
         self,
@@ -8460,6 +8686,26 @@ class AutonomousController:
                     "candidate_fingerprint": event.fingerprint,
                     "action": "reuse canonical registration and request fresh audit",
                 })
+            if (
+                reconciliation_stage is None
+                and event.fingerprint not in self.audit_gate.states
+                and self._completion_candidate_limit_reached()
+            ):
+                reason = "campaign completion policy already accepted its candidate quota"
+                self.store.append("CANDIDATE_REJECTED", {
+                    "event_id": event.event_id,
+                    "fingerprint": event.fingerprint,
+                    "candidate_fingerprint": event.fingerprint,
+                    "producer_task_id": event.producer_task_id,
+                    "claim_id": event.claim_id,
+                    "reason": reason,
+                    "auditor_queue_entered": False,
+                })
+                self._record_candidate_disposition(
+                    event, status="REJECTED", reason=reason,
+                )
+                self.inbox.mark_processed(event, self.run_id)
+                continue
             try:
                 self.graph.validate_candidate_dependencies(event)
                 self._validate_candidate_provenance(event)
@@ -8476,6 +8722,9 @@ class AutonomousController:
             except ValueError as exc:
                 self.candidate_artifact_hashes.pop(event.fingerprint, None)
                 self.candidate_semantic_evidence_hashes.pop(event.fingerprint, None)
+                self.candidate_producer_evidence_closures.pop(
+                    event.fingerprint, None,
+                )
                 self.domain_evidence_receipts.pop(event.fingerprint, None)
                 reason = _sanitize_live_text(exc)
                 self.store.append("CANDIDATE_REJECTED", {
@@ -8524,12 +8773,17 @@ class AutonomousController:
                 "domain_evidence_receipt_fingerprints": [
                     item["receipt_fingerprint"] for item in verified_receipts
                 ],
+                "producer_evidence_closure": self.candidate_producer_evidence_closures.get(
+                    event.fingerprint
+                ),
             })
             self._record_candidate_disposition(event, status="ACCEPTED")
-            self._request_director(
-                f"candidate {event.fingerprint} entered the audit frontier",
-                meaningful_change=True,
-            )
+            audit_only = self._enter_completion_policy_audit_only()
+            if not audit_only:
+                self._request_director(
+                    f"candidate {event.fingerprint} entered the audit frontier",
+                    meaningful_change=True,
+                )
             self.inbox.mark_processed(event, self.run_id, accepted=True)
             if audit_state.required == 0:
                 self.batched_observations.append(event)
@@ -8563,6 +8817,19 @@ class AutonomousController:
         self._discard_stale_semantic_audit_passes(
             event, source="audit_queue",
         )
+        if self._completion_policy_audit_limit_reached(event):
+            self.store.append("AUDIT_ATTEMPT_LIMIT_REACHED", {
+                "candidate_fingerprint": event.fingerprint,
+                "claim_id": event.claim_id,
+                "valid_audit_attempts": len(
+                    self.audit_gate.states[event.fingerprint].results
+                ),
+                "max_valid_audit_attempts_per_candidate": self._completion_policy()[
+                    "max_valid_audit_attempts_per_candidate"
+                ],
+                "action": "do not queue another audit",
+            })
+            return
         audit_kind = self.audit_gate.next_audit_kind(event)
         if audit_kind is None:
             return
@@ -8618,6 +8885,11 @@ class AutonomousController:
                 "artifact_hashes": dict(
                     self.candidate_artifact_hashes.get(event.fingerprint) or {}
                 ),
+                "producer_evidence_closure": dict(
+                    self.candidate_producer_evidence_closures.get(
+                        event.fingerprint
+                    ) or {}
+                ),
                 "semantic_audit_context": semantic_audit_context,
             },
             representation=event.representation,
@@ -8654,7 +8926,7 @@ class AutonomousController:
             "dependency_shape_sha256": dependency_shape_sha256,
             "validation_authority_head": validation_authority_head,
         })
-        pass_scope_sha256 = stable_hash({
+        pass_scope = {
             "candidate_fingerprint": event.fingerprint,
             "claim_id": event.claim_id,
             "exact_statement": " ".join(event.exact_statement.split()),
@@ -8665,7 +8937,13 @@ class AutonomousController:
             )),
             "semantic_bridge_ids": list(event.semantic_bridge_ids),
             "candidate_scope_sha256": candidate_scope_sha256,
-        })
+        }
+        producer_closure = self.candidate_producer_evidence_closures.get(
+            event.fingerprint
+        )
+        if producer_closure is not None:
+            pass_scope["producer_evidence_closure"] = dict(producer_closure)
+        pass_scope_sha256 = stable_hash(pass_scope)
         config_sha256 = stable_hash({
             "audit_kind": audit_kind,
             "audit_required": state.required,
@@ -8816,6 +9094,23 @@ class AutonomousController:
             workspace, writable, metadata = self.workspace.create_job_workspace(
                 task.task_id, job_id=job_id,
             )
+            closure = self.candidate_producer_evidence_closures.get(
+                event.fingerprint
+            )
+            if closure is None and not self.mock:
+                self._record_candidate_artifact_drift(
+                    event,
+                    phase="audit_dispatch_producer_closure",
+                    expected={"producer_evidence_closure": "present"},
+                    observed={},
+                )
+                continue
+            producer_evidence_closure = (
+                self.artifact_store.materialize_producer_evidence_closure(
+                    closure, workspace,
+                )
+                if closure is not None else None
+            )
             sealed_bundle_files = self.artifact_store.materialize(
                 event.artifact_paths, workspace,
             )
@@ -8861,6 +9156,7 @@ class AutonomousController:
                 "semantic_audit_context": task.metadata.get(
                     "semantic_audit_context"
                 ),
+                "producer_evidence_closure": producer_evidence_closure,
                 "producer_transcript": None,
                 "research_policy": self._policy_view(task.role),
                 "workspace": metadata,
@@ -8883,7 +9179,7 @@ class AutonomousController:
             self.scheduler_stop_reason = "pending audit cannot start within remaining token budget"
 
     async def _launch_research(self, capacity: int, allow_exploration: bool) -> None:
-        if not self.lifecycle.can_dispatch:
+        if not self.lifecycle.can_dispatch or self._completion_policy_audit_only:
             return
         self._defer_nonretryable_pending_routes(source="dispatch_preflight")
         active_audits = sum(item.kind == "audit" for item in self.active.values())
@@ -9243,6 +9539,32 @@ class AutonomousController:
                     },
                 },
                 "research_policy": self._policy_view(task.role),
+            })
+            try:
+                producer_evidence_closure = (
+                    self.artifact_store.seal_producer_evidence_closure(
+                        producer_task_id=task.task_id,
+                        producer_job_id=job_id,
+                        task_packet=packet,
+                        required_file_access=required_file_access,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                self.store.append("PRODUCER_EVIDENCE_CLOSURE_FAILED", {
+                    "task_id": task.task_id,
+                    "job_id": job_id,
+                    "error": _sanitize_live_text(exc),
+                    "action": "fail closed before research model dispatch",
+                })
+                raise
+            self.producer_evidence_closures[task.task_id] = dict(
+                producer_evidence_closure
+            )
+            self.store.append("PRODUCER_EVIDENCE_CLOSURE_SEALED", {
+                "task_id": task.task_id,
+                "job_id": job_id,
+                "closure": producer_evidence_closure,
+                "producer_transcript_included": False,
             })
             event_command = _render_shell_command([
                 str(Path(sys.executable).resolve()),
@@ -9964,6 +10286,16 @@ class AutonomousController:
             or self.pending_audits
             or any(item.kind in {"research", "audit"} for item in self.active.values())
         )
+        empty_plan = bool(
+            not plan.spawn
+            and not plan.audit_priorities
+            and not plan.route_updates
+        )
+        held_for_active_work = bool(
+            not runnable
+            and healthy_work
+            and empty_plan
+        )
         controller_owned_next_epoch_handoff = bool(
             self.deferred_research_continuations
             and not healthy_work
@@ -9973,7 +10305,22 @@ class AutonomousController:
                 or len(deferred_proposals) == len(plan.spawn)
             )
         )
-        if not runnable and not controller_owned_next_epoch_handoff:
+        if held_for_active_work:
+            self._replan_after_wave = True
+            self.store.append("DIRECTOR_PLAN_HELD_FOR_ACTIVE_WORK", {
+                "job_id": outcome.job_id,
+                "pending_research": len(self.pending_research),
+                "pending_audits": len(self.pending_audits),
+                "active_research": sum(
+                    item.kind == "research" for item in self.active.values()
+                ),
+                "active_audits": sum(
+                    item.kind == "audit" for item in self.active.values()
+                ),
+                "director_retry_count": self.director_retry_count,
+                "action": "hold current work and request exactly one replan when it finishes",
+            })
+        elif not runnable and not controller_owned_next_epoch_handoff:
             repair_constraint: dict[str, Any] = {
                 "action": "REPAIR_PLAN",
                 "claim_id": self.final_conjecture_claim_id or "FRONTIER",
@@ -9999,6 +10346,8 @@ class AutonomousController:
             )
         elif controller_owned_next_epoch_handoff:
             self._pause_for_next_epoch_frontier()
+        elif held_for_active_work:
+            return
         elif not runnable:
             self._queue_director_retry(
                 "director_no_runnable_work",
@@ -10718,12 +11067,52 @@ class AutonomousController:
         event = state.event
         if trust == TrustStatus.REJECTED:
             reason = _sanitize_live_text("; ".join(result.gaps) or result.verdict)
+            rejection_transition_id: str | None = None
+            if self.graph.apply_audit_reject(event, reason):
+                rejected_claim = self.graph.claims[event.claim_id]
+                rejection_transition_id = self._commit_claim_state_transition(
+                    transition_kind="CANDIDATE_AUDIT_REJECTED",
+                    authorization={
+                        "candidate_fingerprint": fingerprint,
+                        "claim_id": event.claim_id,
+                        "parent_claim_id": event.parent_claim_id,
+                        "audit_id": result.audit_id,
+                        "audit_verdict": result.verdict,
+                        "math_status": rejected_claim.math_status,
+                        "evidence_level": rejected_claim.evidence_level,
+                        "trust_status": rejected_claim.trust_status,
+                        "proof_obligations": [
+                            {
+                                "obligation_id": item.obligation_id,
+                                "status": item.status,
+                            }
+                            for item in rejected_claim.proof_obligations
+                        ],
+                        "current_gaps": list(rejected_claim.current_gaps),
+                        "mathematical_status_effect": "none",
+                        "proof_obligation_effect": "none",
+                    },
+                )
+                self.store.append("CANDIDATE_AUDIT_REJECTED_RECONCILED", {
+                    "candidate_fingerprint": fingerprint,
+                    "claim_id": event.claim_id,
+                    "audit_id": result.audit_id,
+                    "canonical_transition_id": rejection_transition_id,
+                    "math_status": rejected_claim.math_status,
+                    "evidence_level": rejected_claim.evidence_level,
+                    "trust_status": rejected_claim.trust_status,
+                    "proof_obligations_open": all(
+                        item.status == "OPEN"
+                        for item in rejected_claim.proof_obligations
+                    ),
+                })
             self.store.append("CANDIDATE_REJECTED", {
                 "event_id": event.event_id, "fingerprint": fingerprint,
                 "candidate_fingerprint": fingerprint,
                 "producer_task_id": event.producer_task_id,
                 "claim_id": event.claim_id, "reason": reason,
                 "auditor_queue_entered": True,
+                "canonical_transition_id": rejection_transition_id,
             })
             self._record_candidate_disposition(
                 event, status="REJECTED", reason=reason,
@@ -10735,6 +11124,8 @@ class AutonomousController:
                 "producer_task_id": event.producer_task_id,
                 "reason": reason,
             })
+            if self._complete_by_campaign_policy(event, result):
+                return
             self._request_director(
                 "candidate audit rejected the candidate",
                 meaningful_change=False,
@@ -10756,6 +11147,8 @@ class AutonomousController:
                 "kind": "CANDIDATE_AUDIT_UNRESOLVED", "claim_id": event.claim_id,
                 "fingerprint": fingerprint,
             })
+            if self._complete_by_campaign_policy(event, result):
+                return
             self._request_director(
                 "candidate audit remained unresolved",
                 meaningful_change=False,
@@ -10811,6 +11204,9 @@ class AutonomousController:
                         ),
                         evidence_hashes=dict(
                             self.candidate_semantic_evidence_hashes.get(fingerprint) or {}
+                        ),
+                        producer_evidence_closure=(
+                            self.candidate_producer_evidence_closures.get(fingerprint)
                         ),
                         domain_evidence_receipt_fingerprints=[
                             item["receipt_fingerprint"]
@@ -11054,6 +11450,8 @@ class AutonomousController:
                     "trust_status": trust, "evidence_level": verified_level,
                 })
             self._apply_dependency_pruning()
+            if self._complete_by_campaign_policy(event, result):
+                return
             if not self._begin_finalization_if_resolved("independent audit gate"):
                 self._request_director(
                     "audit changed trusted state",
@@ -11896,7 +12294,7 @@ class AutonomousController:
                 )
             if self.lifecycle.phase is LifecyclePhase.DRAINING_FAILURE:
                 self.lifecycle.transition(LifecyclePhase.SEALED, reason=reason)
-        elif self._finalization_started:
+        elif self._finalization_started or self._completion_policy_satisfied:
             if self.lifecycle.phase is LifecyclePhase.FINALIZING:
                 self.lifecycle.transition(LifecyclePhase.COMPLETED, reason=reason)
         elif self.lifecycle.phase in {LifecyclePhase.BOOTSTRAP, LifecyclePhase.RUNNING}:
@@ -11913,7 +12311,7 @@ class AutonomousController:
         preliminary_completed = bool(
             not self._internal_failure
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
-            and self.final_claim_resolved
+            and (self.final_claim_resolved or self._completion_policy_satisfied)
         )
         execution = self._run_manifest.get("execution") or {}
         limits = execution.get("limits") or {}
@@ -12026,7 +12424,7 @@ class AutonomousController:
         campaign_completed = bool(
             not self._internal_failure
             and self.lifecycle.phase is LifecyclePhase.COMPLETED
-            and self.final_claim_resolved
+            and (self.final_claim_resolved or self._completion_policy_satisfied)
         )
         outcome_dir = self.layout.outcomes_root / self.run_id
         outcome_path = outcome_dir / "OUTCOME.md"
@@ -12077,6 +12475,12 @@ class AutonomousController:
                 "epoch_id": self.epoch_id,
                 "previous_epoch_id": self.previous_epoch_id,
                 "campaign_status": campaign_status,
+                "operational_completion_policy_satisfied": (
+                    self._completion_policy_satisfied
+                ),
+                "operational_completion_policy_reason": (
+                    self._completion_policy_reason
+                ),
                 "domain": self.domain_semantics.domain,
                 "final_claim_resolved": self.final_claim_resolved,
                 "final_claim_outcome": self.final_claim_outcome,

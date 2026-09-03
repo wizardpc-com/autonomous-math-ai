@@ -9,7 +9,7 @@
     "combination_scope", "obligations"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "theme_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$"},
     "title": {"type": "string", "minLength": 1},
     "objective": {"type": "string", "minLength": 1},
@@ -37,8 +37,34 @@
           "forbidden_method_ids": {"$ref": "#/$defs/strings"}
         }
       }
+    },
+    "completion_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_accepted_candidates", "post_candidate_mode",
+        "max_valid_audit_attempts_per_candidate", "terminal_audit_verdicts"
+      ],
+      "properties": {
+        "max_accepted_candidates": {"type": "integer", "minimum": 1},
+        "post_candidate_mode": {"const": "AUDIT_ONLY"},
+        "max_valid_audit_attempts_per_candidate": {"type": "integer", "minimum": 1},
+        "terminal_audit_verdicts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["PASS", "REJECT", "UNRESOLVED"]}
+        }
+      }
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": 2}}},
+      "then": {"required": ["completion_policy"]},
+      "else": {"not": {"required": ["completion_policy"]}}
+    }
+  ],
   "$defs": {
     "strings": {"type": "array", "items": {"type": "string", "minLength": 1}}
   }

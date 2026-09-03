@@ -18,7 +18,8 @@ from .storage import (
 FRONTIER_SCHEMA_VERSION = 1
 EXTERNAL_RESULT_SCHEMA_VERSION = 1
 ASSET_CARD_SCHEMA_VERSION = 1
-THEME_SCHEMA_VERSION = 1
+THEME_SCHEMA_VERSION = 2
+LEGACY_THEME_SCHEMA_VERSION = 1
 ROUTING_AUDIT_RECEIPT_SCHEMA_VERSION = 1
 
 ROUTE_STATUSES = frozenset({
@@ -65,12 +66,18 @@ _ASSET_KEYS = frozenset({
     "dependencies", "method_id", "do_not_repeat", "reopen_if",
     "representation_edge", "provenance", "supersedes",
 })
-_THEME_KEYS = frozenset({
+_THEME_V1_KEYS = frozenset({
     "schema_version", "theme_id", "title", "objective", "include_claim_ids",
     "include_scope_ids", "exclude_claim_ids", "exclude_scope_ids",
     "allowed_method_ids", "forbidden_method_ids", "dependency_boundary",
     "combination_scope", "obligations",
 })
+_THEME_KEYS = _THEME_V1_KEYS | {"completion_policy"}
+_COMPLETION_POLICY_KEYS = frozenset({
+    "max_accepted_candidates", "post_candidate_mode",
+    "max_valid_audit_attempts_per_candidate", "terminal_audit_verdicts",
+})
+_TERMINAL_AUDIT_VERDICTS = frozenset({"PASS", "REJECT", "UNRESOLVED"})
 _EVIDENCE_REF_KEYS = frozenset({"kind", "path", "sha256"})
 _AUDIT_KEYS = frozenset({
     "verdict", "independent", "auditor", "audit_level", "policy_version",
@@ -721,12 +728,58 @@ class CampaignTheme:
     dependency_boundary: tuple[str, ...]
     combination_scope: str
     obligations: tuple[dict[str, Any], ...]
+    completion_policy: dict[str, Any] | None = None
     source_path: str | None = None
 
     @classmethod
     def from_dict(cls, raw: Any, *, source_path: str | None = None) -> "CampaignTheme":
-        value = _require_exact_keys(raw, _THEME_KEYS, "campaign theme")
-        if value["schema_version"] != THEME_SCHEMA_VERSION:
+        if not isinstance(raw, dict):
+            raise ValueError("campaign theme must be an object")
+        schema_version = raw.get("schema_version")
+        if schema_version == LEGACY_THEME_SCHEMA_VERSION:
+            value = _require_exact_keys(raw, _THEME_V1_KEYS, "campaign theme")
+            completion_policy = None
+        elif schema_version == THEME_SCHEMA_VERSION:
+            value = _require_exact_keys(raw, _THEME_KEYS, "campaign theme")
+            policy = _require_exact_keys(
+                value["completion_policy"],
+                _COMPLETION_POLICY_KEYS,
+                "campaign theme completion_policy",
+            )
+            max_candidates = policy["max_accepted_candidates"]
+            max_audits = policy["max_valid_audit_attempts_per_candidate"]
+            if (
+                not isinstance(max_candidates, int) or isinstance(max_candidates, bool)
+                or max_candidates < 1
+            ):
+                raise ValueError("max_accepted_candidates must be a positive integer")
+            if (
+                not isinstance(max_audits, int) or isinstance(max_audits, bool)
+                or max_audits < 1
+            ):
+                raise ValueError(
+                    "max_valid_audit_attempts_per_candidate must be a positive integer"
+                )
+            if policy["post_candidate_mode"] != "AUDIT_ONLY":
+                raise ValueError("post_candidate_mode must be AUDIT_ONLY")
+            terminal_verdicts = _string_list(
+                policy["terminal_audit_verdicts"],
+                "terminal_audit_verdicts",
+            )
+            if not terminal_verdicts:
+                raise ValueError("terminal_audit_verdicts must not be empty")
+            unknown_verdicts = set(terminal_verdicts) - _TERMINAL_AUDIT_VERDICTS
+            if unknown_verdicts:
+                raise ValueError(
+                    f"unsupported terminal audit verdicts: {sorted(unknown_verdicts)}"
+                )
+            completion_policy = {
+                "max_accepted_candidates": max_candidates,
+                "post_candidate_mode": "AUDIT_ONLY",
+                "max_valid_audit_attempts_per_candidate": max_audits,
+                "terminal_audit_verdicts": list(terminal_verdicts),
+            }
+        else:
             raise ValueError("unsupported campaign theme schema")
         include_claims = _string_list(value["include_claim_ids"], "include_claim_ids")
         include_scopes = _string_list(value["include_scope_ids"], "include_scope_ids")
@@ -807,6 +860,7 @@ class CampaignTheme:
                 value["combination_scope"], "combination_scope"
             ),
             obligations=tuple(obligations),
+            completion_policy=completion_policy,
             source_path=source_path,
         )
 
@@ -816,7 +870,11 @@ class CampaignTheme:
 
     def to_dict(self, *, include_source: bool = True) -> dict[str, Any]:
         result = {
-            "schema_version": THEME_SCHEMA_VERSION,
+            "schema_version": (
+                THEME_SCHEMA_VERSION
+                if self.completion_policy is not None
+                else LEGACY_THEME_SCHEMA_VERSION
+            ),
             "theme_id": self.theme_id,
             "title": self.title,
             "objective": self.objective,
@@ -830,6 +888,13 @@ class CampaignTheme:
             "combination_scope": self.combination_scope,
             "obligations": [dict(item) for item in self.obligations],
         }
+        if self.completion_policy is not None:
+            result["completion_policy"] = {
+                **self.completion_policy,
+                "terminal_audit_verdicts": list(
+                    self.completion_policy["terminal_audit_verdicts"]
+                ),
+            }
         if include_source:
             result["source_path"] = self.source_path
             result["theme_sha256"] = self.theme_sha256

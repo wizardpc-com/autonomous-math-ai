@@ -134,6 +134,37 @@ class ResearchMemoryTests(unittest.TestCase):
             "obligations": obligations,
         })
 
+    def test_campaign_theme_v2_completion_policy_round_trips(self) -> None:
+        payload = self._theme(scopes=["scope-a"], obligations=[]).to_dict(
+            include_source=False
+        )
+        payload["schema_version"] = 2
+        payload["completion_policy"] = {
+            "max_accepted_candidates": 1,
+            "post_candidate_mode": "AUDIT_ONLY",
+            "max_valid_audit_attempts_per_candidate": 1,
+            "terminal_audit_verdicts": ["PASS", "REJECT", "UNRESOLVED"],
+        }
+
+        theme = CampaignTheme.from_dict(payload)
+
+        self.assertEqual(theme.to_dict(include_source=False), payload)
+
+    def test_campaign_theme_v2_rejects_invalid_completion_policy(self) -> None:
+        payload = self._theme(scopes=["scope-a"], obligations=[]).to_dict(
+            include_source=False
+        )
+        payload["schema_version"] = 2
+        payload["completion_policy"] = {
+            "max_accepted_candidates": 1,
+            "post_candidate_mode": "RESEARCH",
+            "max_valid_audit_attempts_per_candidate": 1,
+            "terminal_audit_verdicts": ["PASS"],
+        }
+
+        with self.assertRaisesRegex(ValueError, "AUDIT_ONLY"):
+            CampaignTheme.from_dict(payload)
+
     def _obligation(
         self,
         scope_id: str,

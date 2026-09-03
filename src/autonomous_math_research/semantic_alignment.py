@@ -1636,6 +1636,7 @@ class SemanticAlignment(_SemanticTransitionAuthorization):
         candidate: Any,
         artifact_hashes: dict[str, str],
         evidence_hashes: dict[str, str],
+        producer_evidence_closure: dict[str, Any] | None = None,
         domain_evidence_receipt_fingerprints: Iterable[str],
         audit_receipts: Iterable[dict[str, Any]],
         producer_identity: dict[str, Any],
@@ -1708,7 +1709,7 @@ class SemanticAlignment(_SemanticTransitionAuthorization):
         if len(auditor_threads) != len(set(auditor_threads)):
             issues.append("semantic auditor identities must be pairwise distinct")
         statement_digest = text_sha256(candidate.exact_statement)
-        expected_pass_scope = _payload_sha256({
+        pass_scope = {
             "candidate_fingerprint": candidate.fingerprint,
             "claim_id": candidate.claim_id,
             "exact_statement": " ".join(candidate.exact_statement.split()),
@@ -1717,7 +1718,12 @@ class SemanticAlignment(_SemanticTransitionAuthorization):
             "semantic_evidence_hashes": dict(sorted(evidence_hashes.items())),
             "semantic_bridge_ids": list(candidate.semantic_bridge_ids),
             "candidate_scope_sha256": candidate_scope_sha256,
-        })
+        }
+        if producer_evidence_closure is not None:
+            pass_scope["producer_evidence_closure"] = dict(
+                producer_evidence_closure
+            )
+        expected_pass_scope = _payload_sha256(pass_scope)
         if any(
             item["statement_checked_sha256"] != statement_digest
             for item in normalized_audits

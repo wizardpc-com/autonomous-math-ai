@@ -619,12 +619,23 @@ class ClaimGraph:
             claim.current_gaps = []
         claim.last_meaningful_progress = utc_now()
 
-    def apply_audit_reject(self, event: CandidateEvent, reason: str) -> None:
-        # A rejected or inconclusive proof artifact is not a refutation of the
-        # mathematical statement.  Candidate disposition is owned by
-        # AuditGate/controller event state, so rejection deliberately leaves
-        # the claim graph unchanged.
-        del event, reason
+    def apply_audit_reject(self, event: CandidateEvent, reason: str) -> bool:
+        # Rejecting evidence never refutes the mathematical statement.  A
+        # derived claim created solely for this candidate still needs a durable
+        # evidence disposition so it cannot remain falsely audit-pending.
+        del reason
+        claim = self.claims.get(event.claim_id)
+        if (
+            claim is None
+            or event.parent_claim_id is None
+            or claim.parent_claim_id != event.parent_claim_id
+            or claim.trust_status != TrustStatus.UNTRUSTED_CANDIDATE
+            or claim.math_status != self.semantics.candidate_status
+        ):
+            return False
+        claim.trust_status = TrustStatus.REJECTED
+        claim.last_meaningful_progress = utc_now()
+        return True
 
     def prune_failed_dependencies(self) -> dict[str, list[str]]:
         blocked: dict[str, list[str]] = {}

@@ -57,6 +57,20 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Empty Director plans now hold controller-owned pending or active research and
+  audit work without consuming `director_no_runnable_work`; exactly one replan
+  is requested after the held wave becomes idle. Truly idle empty plans retain
+  their bounded fail-closed retry.
+- Campaign Theme schema v2 can stop research after a bounded candidate quota,
+  run only the configured independent audit attempts, and mark the campaign
+  operationally complete on a terminal verdict without changing theorem status.
+- Research dispatch now seals the producer task packet and every declared input
+  as a hash-bound evidence closure. Auditors receive those original bytes plus
+  validated ZIP member inventories, while traversal, credential-like inputs,
+  missing files, and tampering fail closed without exposing producer transcripts.
+- Rejected evidence for a newly derived candidate is now reconciled through a
+  canonical `CANDIDATE_AUDIT_REJECTED` transition: mathematical status and proof
+  obligations remain open while evidence trust becomes `REJECTED`.
 - A controller-verified next-epoch continuation frontier now seals cleanly when
   a conforming Director returns no current-epoch work. The transition no longer
   depends on the Director resubmitting a task that its prompt forbids, and
