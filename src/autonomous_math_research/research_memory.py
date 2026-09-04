@@ -1104,7 +1104,14 @@ class ResearchMemoryStore:
             if path.is_relative_to(self.project_root)
         ]
 
-    def _write_object(self, kind: str, object_id: str, payload: dict[str, Any]) -> str:
+    def _write_object(
+        self,
+        kind: str,
+        object_id: str,
+        payload: dict[str, Any],
+        *,
+        persist: bool = True,
+    ) -> str:
         digest = stable_hash(payload)
         path = self.objects_root / f"{digest}.json"
         wrapper = {
@@ -1117,7 +1124,7 @@ class ResearchMemoryStore:
         if path.is_file():
             if _load_json(path) != wrapper:
                 raise ValueError(f"content-addressed object collision: {digest}")
-        else:
+        elif persist:
             atomic_write_json(path, wrapper)
         return digest
 
@@ -1196,6 +1203,7 @@ class ResearchMemoryStore:
         audit: AuditMetadata,
         source_object_id: str,
         source_object_sha256: str,
+        persist: bool = True,
     ) -> dict[str, Any]:
         payload = {
             "schema_version": ROUTING_AUDIT_RECEIPT_SCHEMA_VERSION,
@@ -1219,7 +1227,8 @@ class ResearchMemoryStore:
                     f"conflicting existing PASS receipt for AuditKey {audit_key}"
                 )
             return existing
-        atomic_write_json(path, receipt)
+        if persist:
+            atomic_write_json(path, receipt)
         return receipt
 
     @staticmethod
@@ -1237,6 +1246,8 @@ class ResearchMemoryStore:
     def _load_results(
         self,
         receipts: dict[str, dict[str, Any]],
+        *,
+        persist: bool = True,
     ) -> tuple[list[ExternalResult], dict[str, list[str]], dict[str, bool]]:
         results: list[ExternalResult] = []
         errors: dict[str, list[str]] = {}
@@ -1255,7 +1266,8 @@ class ResearchMemoryStore:
             )
             errors[result.result_id] = result_errors
             stored_sha256 = self._write_object(
-                "EXTERNAL_RESULT", result.result_id, result.to_object()
+                "EXTERNAL_RESULT", result.result_id, result.to_object(),
+                persist=persist,
             )
             if stored_sha256 != result.object_sha256:
                 raise ValueError(
@@ -1268,6 +1280,7 @@ class ResearchMemoryStore:
                     audit=result.audit,
                     source_object_id=result.result_id,
                     source_object_sha256=result.object_sha256,
+                    persist=persist,
                 )
             reused = self._audit_reused(result.audit, result.audit_key, receipts)
             audit_passed[result.result_id] = direct or reused
@@ -1277,6 +1290,8 @@ class ResearchMemoryStore:
     def _load_assets(
         self,
         receipts: dict[str, dict[str, Any]],
+        *,
+        persist: bool = True,
     ) -> tuple[list[AssetCard], dict[str, list[str]], dict[str, bool]]:
         assets: list[AssetCard] = []
         errors: dict[str, list[str]] = {}
@@ -1293,7 +1308,8 @@ class ResearchMemoryStore:
             )
             errors[asset.asset_id] = asset_errors
             stored_sha256 = self._write_object(
-                "RESEARCH_ASSET", asset.asset_id, asset.to_object()
+                "RESEARCH_ASSET", asset.asset_id, asset.to_object(),
+                persist=persist,
             )
             if stored_sha256 != asset.object_sha256:
                 raise ValueError(f"asset object digest mismatch: {asset.asset_id}")
@@ -1304,6 +1320,7 @@ class ResearchMemoryStore:
                     audit=asset.audit,
                     source_object_id=asset.asset_id,
                     source_object_sha256=asset.object_sha256,
+                    persist=persist,
                 )
             reused = self._audit_reused(asset.audit, asset.audit_key, receipts)
             audit_passed[asset.asset_id] = bool(
@@ -1342,14 +1359,20 @@ class ResearchMemoryStore:
         phase: str,
         campaign_id: str,
         epoch_id: str,
+        persist: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if phase not in {"CAMPAIGN_START", "CAMPAIGN_END", "MANUAL"}:
             raise ValueError(f"invalid frontier reconciliation phase: {phase}")
-        self.ensure()
+        if persist:
+            self.ensure()
         prior = _load_json(self.current_path) if self.current_path.is_file() else None
         receipts = self._valid_receipts()
-        results, result_errors, result_audited = self._load_results(receipts)
-        assets, asset_errors, asset_audited = self._load_assets(receipts)
+        results, result_errors, result_audited = self._load_results(
+            receipts, persist=persist,
+        )
+        assets, asset_errors, asset_audited = self._load_assets(
+            receipts, persist=persist,
+        )
 
         superseded_results = {
             item for result in results for item in result.supersedes
@@ -1640,29 +1663,115 @@ class ResearchMemoryStore:
             "receipts": [receipts[key] for key in sorted(receipts)],
             "index_sha256": stable_hash(receipts),
         }
-        atomic_write_json(self.registry_path, registry_payload)
-        atomic_write_json(self.representation_graph_path, representation_payload)
-        atomic_write_json(self.method_ledger_path, method_payload)
-        atomic_write_json(self.audit_index_path, audit_payload)
-
         previous_sha = prior.get("frontier_sha256") if prior else None
-        if previous_sha != frontier_sha256:
-            atomic_write_json(self.frontier_root / f"{frontier_sha256}.json", state)
-            atomic_write_json(self.current_path, state)
-            append_jsonl(self.history_path, {
-                "schema_version": 1,
-                "frontier_sha256": frontier_sha256,
-                "previous_frontier_sha256": previous_sha,
-                "generated_at": state["generated_at"],
-                "phase": phase,
-                "campaign_id": campaign_id,
-                "epoch_id": epoch_id,
-            })
         delta = self._delta(prior, state)
-        delta_path = self.frontier_root / "deltas" / f"{epoch_id}-{phase.lower()}.json"
-        atomic_write_json(delta_path, delta)
-        self._last_state = state
+        if persist:
+            atomic_write_json(self.registry_path, registry_payload)
+            atomic_write_json(self.representation_graph_path, representation_payload)
+            atomic_write_json(self.method_ledger_path, method_payload)
+            atomic_write_json(self.audit_index_path, audit_payload)
+            if previous_sha != frontier_sha256:
+                atomic_write_json(self.frontier_root / f"{frontier_sha256}.json", state)
+                atomic_write_json(self.current_path, state)
+                append_jsonl(self.history_path, {
+                    "schema_version": 1,
+                    "frontier_sha256": frontier_sha256,
+                    "previous_frontier_sha256": previous_sha,
+                    "generated_at": state["generated_at"],
+                    "phase": phase,
+                    "campaign_id": campaign_id,
+                    "epoch_id": epoch_id,
+                })
+            delta_path = (
+                self.frontier_root / "deltas" / f"{epoch_id}-{phase.lower()}.json"
+            )
+            atomic_write_json(delta_path, delta)
+            self._last_state = state
         return state, delta
+
+    def validate_current_freshness(
+        self,
+        *,
+        graph: Any,
+        claim_graph_path: Path,
+        trusted_state_path: Path,
+        final_claim_id: str | None,
+    ) -> dict[str, Any]:
+        source_manifests = [
+            *self.external_results_root.rglob("*.json"),
+            *self.assets_root.rglob("*.json"),
+        ]
+        if not self.current_path.is_file():
+            if source_manifests:
+                raise ValueError(
+                    "Audited Frontier CURRENT.json is missing while research-memory "
+                    "source manifests exist; run `amr frontier rebuild`"
+                )
+            return {
+                "status": "NOT_BUILT",
+                "source_manifests": 0,
+                "canonical_authority_changed": False,
+            }
+
+        current = _load_json(self.current_path)
+        metadata_keys = {
+            "frontier_sha256", "generated_at", "phase", "campaign_id", "epoch_id",
+        }
+        if not metadata_keys <= set(current):
+            raise ValueError("Audited Frontier CURRENT.json metadata is incomplete")
+        state_body = {
+            key: value for key, value in current.items() if key not in metadata_keys
+        }
+        if current["frontier_sha256"] != stable_hash(state_body):
+            raise ValueError("Audited Frontier CURRENT.json digest is invalid")
+
+        raw_theme = current.get("campaign_theme")
+        theme = None
+        if raw_theme is not None:
+            if not isinstance(raw_theme, dict) or not {
+                "source_path", "theme_sha256",
+            } <= set(raw_theme):
+                raise ValueError("Audited Frontier campaign theme identity is invalid")
+            theme_payload = {
+                key: value for key, value in raw_theme.items()
+                if key not in {"source_path", "theme_sha256"}
+            }
+            theme = CampaignTheme.from_dict(
+                theme_payload, source_path=raw_theme["source_path"],
+            )
+            if theme.theme_sha256 != raw_theme["theme_sha256"]:
+                raise ValueError("Audited Frontier campaign theme digest is invalid")
+
+        fresh, _ = self.reconcile(
+            graph=graph,
+            claim_graph_path=claim_graph_path,
+            trusted_state_path=trusted_state_path,
+            final_claim_id=final_claim_id,
+            theme=theme,
+            phase="MANUAL",
+            campaign_id="strict-validation",
+            epoch_id="strict-validation",
+            persist=False,
+        )
+        if fresh["frontier_sha256"] != current["frontier_sha256"]:
+            evidence_errors = sorted({
+                str(error)
+                for entry in fresh["frontier_entries"]
+                for error in entry.get("evidence_errors", [])
+            })
+            detail = (
+                f"; live evidence errors={evidence_errors}" if evidence_errors else ""
+            )
+            raise ValueError(
+                "Audited Frontier CURRENT.json is stale; run "
+                f"`amr frontier rebuild`{detail}"
+            )
+        return {
+            "status": "FRESH",
+            "source_manifests": len(source_manifests),
+            "frontier_sha256": current["frontier_sha256"],
+            "canonical_authority_changed": False,
+        }
 
     @staticmethod
     def _theme_entries(

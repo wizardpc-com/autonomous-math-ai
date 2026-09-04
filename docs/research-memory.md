@@ -147,6 +147,13 @@ artifact sealing. The end delta records new entries, newly closed obligations,
 new exact falsified routes, superseded objects, authority drift, and items still
 pending audit, dependency, human, or theme integration.
 
+`amr validate --strict` recomputes the Audited Frontier in memory and rejects a
+missing, malformed, or stale `CURRENT.json` when research-memory manifests are
+present. The check is read-only. Missing or changed active evidence therefore
+cannot retain an older routing closure; rebuilding records the corresponding
+`BLOCKED / EVIDENCE_IDENTITY_MISMATCH` route without changing ClaimGraph or
+mathematical authority.
+
 ## Audit hierarchy
 
 The shared memory supports the intended three stages without flattening them:

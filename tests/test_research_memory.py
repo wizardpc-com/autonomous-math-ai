@@ -19,6 +19,7 @@ from autonomous_math_research.research_memory import (
     ResearchMemoryStore,
 )
 from autonomous_math_research.storage import atomic_write_json, file_digest
+from autonomous_math_research.validation import validate_project
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -228,6 +229,25 @@ class ResearchMemoryTests(unittest.TestCase):
             campaign_id="campaign-test",
             epoch_id=epoch_id,
         )
+
+    def _make_strict_ready(self) -> None:
+        (self.runtime / "semantics.json").unlink()
+        manifest_path = self.runtime / "project.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for paths in manifest["canonical_inputs"].values():
+            paths.remove("autonomous/semantics.json")
+        atomic_write_json(manifest_path, manifest)
+        graph = json.loads(self.graph_path.read_text(encoding="utf-8"))
+        graph["claims"][0]["statement"] = "The exact neutral test claim holds."
+        graph["claims"][0]["current_gaps"] = [
+            "A proof or counterexample remains required."
+        ]
+        atomic_write_json(self.graph_path, graph)
+        self.source.write_text(
+            "# Claims\n\n- `C_ROOT`: The exact neutral test claim holds.\n",
+            encoding="utf-8",
+        )
+        self.graph = ClaimGraph.load(self.graph_path)
 
     @staticmethod
     def _task(scope_id: str, method_id: str = "method-open") -> ResearchTask:
@@ -494,6 +514,95 @@ class ResearchMemoryTests(unittest.TestCase):
             ("BLOCKED", "EVIDENCE_IDENTITY_MISMATCH"),
         )
         self.assertEqual(self.graph.claims["C_ROOT"].research_status, "OPEN")
+
+    def test_strict_validation_accepts_fresh_current_without_writes(self) -> None:
+        self._make_strict_ready()
+        self._save_result("scope-a.json", self._result())
+        self._reconcile(None)
+        coordination = self.runtime / "coordination"
+        before = {
+            path.relative_to(coordination): path.read_bytes()
+            for path in coordination.rglob("*")
+            if path.is_file()
+        }
+
+        result = validate_project(self.project, strict=True)
+
+        after = {
+            path.relative_to(coordination): path.read_bytes()
+            for path in coordination.rglob("*")
+            if path.is_file()
+        }
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["audited_frontier"]["status"], "FRESH")
+        self.assertEqual(after, before)
+
+    def test_strict_validation_requires_current_when_manifests_exist(self) -> None:
+        self._make_strict_ready()
+        self._save_result("scope-a.json", self._result())
+
+        with self.assertRaisesRegex(
+            ValueError, "CURRENT.json is missing.*frontier rebuild",
+        ):
+            validate_project(self.project, strict=True)
+
+    def test_strict_validation_rejects_stale_current_after_manifest_change(self) -> None:
+        self._make_strict_ready()
+        path = self._save_result("scope-a.json", self._result())
+        self._reconcile(None)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["exact_statement"] = "The revised exact scope-a obligation holds."
+        atomic_write_json(path, payload)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = cli_main([
+                "validate", "--project", str(self.project), "--strict",
+            ])
+        validation = json.loads(output.getvalue())
+        self.assertEqual(status, 2)
+        self.assertFalse(validation["valid"])
+        self.assertIn("CURRENT.json is stale", validation["error"])
+
+    def test_strict_validation_rejects_current_with_newly_missing_evidence(self) -> None:
+        self._make_strict_ready()
+        self._save_result("scope-a.json", self._result())
+        self._reconcile(None)
+        authority_before = (
+            file_digest(self.graph_path), file_digest(self.trusted_path),
+        )
+        self.proof.unlink()
+
+        with self.assertRaisesRegex(
+            ValueError, "evidence file is missing: proofs/informal/result.md",
+        ):
+            validate_project(self.project, strict=True)
+
+        state, _ = self._reconcile(None, epoch_id="missing-evidence-rebuild")
+        external = next(
+            item for item in state["frontier_entries"]
+            if item["entry_id"] == "external:result-scope-a"
+        )
+        self.assertEqual(
+            (external["route_status"], external["route_reason"]),
+            ("BLOCKED", "EVIDENCE_IDENTITY_MISMATCH"),
+        )
+        self.assertTrue(validate_project(self.project, strict=True)["valid"])
+        self.assertEqual(
+            (file_digest(self.graph_path), file_digest(self.trusted_path)),
+            authority_before,
+        )
+
+    def test_strict_validation_rejects_current_with_new_digest_mismatch(self) -> None:
+        self._make_strict_ready()
+        self._save_result("scope-a.json", self._result())
+        self._reconcile(None)
+        self.proof.write_text("changed proof bytes\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ValueError, "evidence digest changed: proofs/informal/result.md",
+        ):
+            validate_project(self.project, strict=True)
 
     def test_theme_dependency_wait_and_campaign_pin_are_fail_closed(self) -> None:
         theme = self._theme(

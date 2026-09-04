@@ -14,6 +14,7 @@ from .mechanical import attest_mechanical_host_capability
 from .policy import build_policy_manifest
 from .project import ProjectManifest
 from .reconciliation import ReconciliationStore
+from .research_memory import ResearchMemoryStore
 from .resources import schema_resource
 from .schema import preflight_output_schema_files
 from .semantic_alignment import (
@@ -94,10 +95,19 @@ def _strict_project_checks(
         raise ValueError(
             f"strict validation found placeholder {label}: {placeholder_files}"
         )
+    frontier = ResearchMemoryStore(
+        root, manifest.resolve(manifest.runtime_root),
+    ).validate_current_freshness(
+        graph=graph,
+        claim_graph_path=manifest.resolve(manifest.claim_graph),
+        trusted_state_path=manifest.resolve(manifest.trusted_state),
+        final_claim_id=manifest.final_claim_id,
+    )
     return {
         "strict": True,
         "initialization_checklist": str(checklist),
         "required_directories": list(STRICT_PROJECT_DIRECTORIES),
+        "audited_frontier": frontier,
     }
 
 
