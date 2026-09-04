@@ -149,10 +149,13 @@ pending audit, dependency, human, or theme integration.
 
 `amr validate --strict` recomputes the Audited Frontier in memory and rejects a
 missing, malformed, or stale `CURRENT.json` when research-memory manifests are
-present. The check is read-only. Missing or changed active evidence therefore
-cannot retain an older routing closure; rebuilding records the corresponding
-`BLOCKED / EVIDENCE_IDENTITY_MISMATCH` route without changing ClaimGraph or
-mathematical authority.
+present. For a Frontier with a Campaign Theme, validation reloads the
+project-local `campaign_theme.source_path` and verifies its normalized digest;
+a missing, changed, or out-of-project source fails closed. The check is
+read-only and does not update the campaign's pinned `THEME.json`. Missing or
+changed active evidence therefore cannot retain an older routing closure;
+rebuilding records the corresponding `BLOCKED / EVIDENCE_IDENTITY_MISMATCH`
+route without changing ClaimGraph or mathematical authority.
 
 ## Audit hierarchy
 

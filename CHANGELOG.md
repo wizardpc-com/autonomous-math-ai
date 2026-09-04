@@ -10,7 +10,8 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Strict project validation now recomputes the Audited Frontier read-only and
   rejects stale `CURRENT.json` routing when source manifests or hash-bound
-  evidence have changed or disappeared.
+  evidence have changed or disappeared, including a Frontier's project-local
+  Campaign Theme source.
 - Completion policies can stop operationally on explicit `BLOCKED`,
   `FALSIFIED`, or `OBLIGATION_EXHAUSTED` research outcomes without changing
   mathematical, trust, evidence, or canonical status.

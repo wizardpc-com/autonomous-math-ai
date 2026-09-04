@@ -1700,6 +1700,7 @@ class ResearchMemoryStore:
         source_manifests = [
             *self.external_results_root.rglob("*.json"),
             *self.assets_root.rglob("*.json"),
+            *self.themes_root.rglob("*.json"),
         ]
         if not self.current_path.is_file():
             if source_manifests:
@@ -1741,6 +1742,17 @@ class ResearchMemoryStore:
             )
             if theme.theme_sha256 != raw_theme["theme_sha256"]:
                 raise ValueError("Audited Frontier campaign theme digest is invalid")
+            if not isinstance(theme.source_path, str) or not theme.source_path:
+                raise ValueError(
+                    "Audited Frontier campaign theme source_path is missing"
+                )
+            live_theme = self._load_theme_path(Path(theme.source_path))
+            if live_theme.theme_sha256 != theme.theme_sha256:
+                raise ValueError(
+                    "Audited Frontier campaign theme source digest changed; run "
+                    "`amr frontier rebuild`"
+                )
+            theme = live_theme
 
         fresh, _ = self.reconcile(
             graph=graph,

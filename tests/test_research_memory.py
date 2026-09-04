@@ -546,6 +546,99 @@ class ResearchMemoryTests(unittest.TestCase):
         ):
             validate_project(self.project, strict=True)
 
+    def test_strict_validation_requires_current_when_only_theme_exists(self) -> None:
+        self._make_strict_ready()
+        theme_path = self.runtime / "research_memory" / "themes" / "scope-a.json"
+        atomic_write_json(
+            theme_path,
+            self._theme(
+                scopes=["scope-a"],
+                obligations=[self._obligation("scope-a")],
+            ).to_dict(include_source=False),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "CURRENT.json is missing.*frontier rebuild",
+        ):
+            validate_project(self.project, strict=True)
+
+    def test_strict_validation_rejects_changed_live_theme_source(self) -> None:
+        self._make_strict_ready()
+        theme_path = self.runtime / "research_memory" / "themes" / "scope-a.json"
+        theme_payload = self._theme(
+            scopes=["scope-a"],
+            obligations=[self._obligation("scope-a")],
+        ).to_dict(include_source=False)
+        atomic_write_json(theme_path, theme_payload)
+        campaign_root = self.runtime / "campaigns" / "campaign-pin"
+        theme = self.store.load_or_pin_theme(campaign_root, theme_path)
+        pin_path = campaign_root / "THEME.json"
+        pin_before = pin_path.read_bytes()
+        self._reconcile(theme)
+        theme_payload["objective"] = "A changed source-authored objective."
+        atomic_write_json(theme_path, theme_payload)
+
+        with self.assertRaisesRegex(
+            ValueError, "campaign theme source digest changed",
+        ):
+            validate_project(self.project, strict=True)
+        self.assertEqual(pin_path.read_bytes(), pin_before)
+
+    def test_strict_validation_rejects_missing_live_theme_source(self) -> None:
+        self._make_strict_ready()
+        theme_path = self.runtime / "research_memory" / "themes" / "scope-a.json"
+        atomic_write_json(
+            theme_path,
+            self._theme(
+                scopes=["scope-a"],
+                obligations=[self._obligation("scope-a")],
+            ).to_dict(include_source=False),
+        )
+        self._reconcile(self.store.load_theme(theme_path))
+        theme_path.unlink()
+
+        with self.assertRaisesRegex(ValueError, "campaign theme does not exist"):
+            validate_project(self.project, strict=True)
+
+    def test_strict_validation_rejects_theme_without_source_path(self) -> None:
+        self._make_strict_ready()
+        self._reconcile(self._theme(
+            scopes=["scope-a"],
+            obligations=[self._obligation("scope-a")],
+        ))
+
+        with self.assertRaisesRegex(ValueError, "theme source_path is missing"):
+            validate_project(self.project, strict=True)
+
+    def test_strict_validation_accepts_fresh_live_theme_without_writes(self) -> None:
+        self._make_strict_ready()
+        theme_path = self.runtime / "research_memory" / "themes" / "scope-a.json"
+        atomic_write_json(
+            theme_path,
+            self._theme(
+                scopes=["scope-a"],
+                obligations=[self._obligation("scope-a")],
+            ).to_dict(include_source=False),
+        )
+        self._reconcile(self.store.load_theme(theme_path))
+        coordination = self.runtime / "coordination"
+        before = {
+            path.relative_to(coordination): path.read_bytes()
+            for path in coordination.rglob("*")
+            if path.is_file()
+        }
+
+        result = validate_project(self.project, strict=True)
+
+        after = {
+            path.relative_to(coordination): path.read_bytes()
+            for path in coordination.rglob("*")
+            if path.is_file()
+        }
+        self.assertTrue(result["valid"])
+        self.assertGreaterEqual(result["audited_frontier"]["source_manifests"], 1)
+        self.assertEqual(after, before)
+
     def test_strict_validation_rejects_stale_current_after_manifest_change(self) -> None:
         self._make_strict_ready()
         path = self._save_result("scope-a.json", self._result())
