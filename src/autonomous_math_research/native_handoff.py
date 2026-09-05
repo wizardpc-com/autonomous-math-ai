@@ -15,7 +15,7 @@ from .domain_semantics import domain_semantics_from_contract
 from .models import ResearchTask, stable_hash, utc_now
 from .policy import build_policy_manifest, domain_contract_from_manifest, pin_policy_manifest
 from .project import ProjectManifest
-from .research_memory import AssetCard, ExternalResult, ResearchMemoryStore
+from .research_memory import AssetCard, EvidenceRef, ExternalResult, ResearchMemoryStore
 from .research_record import _git_state
 from .resources import schema_resource
 from .schema import load_schema, validate
@@ -222,6 +222,8 @@ def seal_result(workspace: Path, result_path: Path, output: Path, *, input_sha25
     if file_digest(workspace / "INPUT_MANIFEST.json") != input_sha256:
         raise ValueError("input manifest differs from the retained export receipt")
     packet = _read(workspace / "INPUT_MANIFEST.json")
+    frozen_hashes = {row["path"]: row["sha256"] for row in packet["files"]}
+    frozen_hashes["INPUT_MANIFEST.json"] = input_sha256
     for row in packet["files"]:
         if file_digest(_inside(workspace, row["path"])) != row["sha256"]:
             raise ValueError(f"frozen native input changed: {row['path']}")
@@ -242,6 +244,8 @@ def seal_result(workspace: Path, result_path: Path, output: Path, *, input_sha25
             for row in raw[field]:
                 source = _inside(workspace, row["path"])
                 digest = file_digest(source)
+                if row["path"] in frozen_hashes and digest != frozen_hashes[row["path"]]:
+                    raise ValueError("frozen input or input manifest changed during sealing")
                 relative = f"evidence/{digest}/{source.name}"
                 target = stage / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +260,8 @@ def seal_result(workspace: Path, result_path: Path, output: Path, *, input_sha25
         for row in packet["files"]:
             if file_digest(_inside(workspace, row["path"])) != row["sha256"]:
                 raise ValueError("frozen input changed during sealing")
+        if file_digest(workspace / "INPUT_MANIFEST.json") != input_sha256:
+            raise ValueError("input manifest changed during sealing")
         stage.rename(output)
     return {"sealed": True, "bundle": str(output), "result_sha256": file_digest(output / "external_result.json"),
             "classification": result.classification, "audit_receipt_created": False}
@@ -276,6 +282,25 @@ def import_result(project: Path, bundle: Path) -> dict[str, Any]:
     bindings = [ref for ref in result.source_refs if Path(ref.path).name == "binding.json" and ref.kind == "frozen_input"]
     if len(bindings) != 1:
         raise ValueError("native import requires one frozen input binding")
+    packets = [ref for ref in result.source_refs if ref.kind == "input_manifest"]
+    if len(packets) != 1:
+        raise ValueError("native import requires one frozen input manifest")
+    packet = _read(_inside(bundle, packets[0].path))
+    if packet.get("schema_version") != 1 or not isinstance(packet.get("files"), list):
+        raise ValueError("invalid frozen input manifest")
+    if any(not isinstance(row, dict) or set(row) != {"path", "sha256"} for row in packet["files"]):
+        raise ValueError("invalid frozen input file entry")
+    files = [EvidenceRef.from_dict({**row, "kind": "frozen_input"}, "frozen input") for row in packet["files"]]
+    file_hashes = {ref.path: ref.sha256 for ref in files}
+    if len(file_hashes) != len(files) or not {"binding.json", "task.json", "context.json", "policy/POLICY_MANIFEST.json"} <= file_hashes.keys():
+        raise ValueError("frozen input manifest is incomplete or duplicated")
+    if packet.get("binding_sha256") != bindings[0].sha256 or file_hashes["binding.json"] != bindings[0].sha256:
+        raise ValueError("frozen input binding digest disagrees with manifest")
+    frozen_refs = {(ref.path, ref.sha256) for ref in result.source_refs if ref.kind == "frozen_input"}
+    for ref in files:
+        sealed_path = f"evidence/{ref.sha256}/{Path(ref.path).name}"
+        if (sealed_path, ref.sha256) not in frozen_refs:
+            raise ValueError(f"missing frozen input evidence: {ref.path}")
     binding = _read(_inside(bundle, bindings[0].path))
     if binding["project_id"] != manifest.project_id:
         raise ValueError("native input belongs to another project")
@@ -286,6 +311,8 @@ def import_result(project: Path, bundle: Path) -> dict[str, Any]:
     if result.claim_ids != (task.target_claim,) or result.scope_ids != (expected_scope,):
         raise ValueError("native result must retain the frozen target and exact scope")
     for row in binding["source_bindings"]:
+        if file_hashes.get(f"input/{row['path']}") != row["sha256"]:
+            raise ValueError("source binding disagrees with frozen input manifest")
         if file_digest(_inside(project, row["path"])) != row["sha256"]:
             raise ValueError(f"native source binding is stale: {row['path']}")
     store = ResearchMemoryStore(project, manifest.resolve(manifest.runtime_root))

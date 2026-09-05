@@ -3341,7 +3341,21 @@ class NextArchitectureTests(unittest.TestCase):
             load_config(self.project), backend=MockCodexBackend(), mock=False,
             run_id="rejected-derived", campaign_id="rejected-derived",
         )
-        controller._pin_run_inputs(0.01, False)
+        # Keep real canonical reconciliation while injecting the external CLI boundary.
+        capability = {
+            "codex_version": "unit-test-codex", "schema_sha256": "1" * 64,
+            "methods": {}, "notifications": {}, "thread_token_usage_fields": [],
+            "thread_goal_fields": [], "thread_start_fields": [], "turn_start_fields": [],
+            "service_tier": {}, "sandbox_policy_variants": [],
+        }
+        with patch(
+            "autonomous_math_research.provenance.inspect_generated_schema",
+            return_value=capability,
+        ) as probe:
+            controller._pin_run_inputs(0.01, False)
+        probe.assert_called_once()
+        self.assertFalse(controller.mock)
+        self.assertEqual(controller._runtime_provenance["codex_cli_version"], "unit-test-codex")
         event = CandidateEvent.from_dict({
             "event_id": "rejected-derived-event",
             "producer_task_id": "rejected-derived-producer",
@@ -3427,6 +3441,18 @@ class NextArchitectureTests(unittest.TestCase):
         self.assertIsNotNone(
             reconciliations[0]["payload"]["canonical_transition_id"]
         )
+
+    def test_non_mock_input_pinning_fails_closed_without_codex(self) -> None:
+        controller = AutonomousController(
+            load_config(self.project), backend=MockCodexBackend(), mock=False,
+            run_id="missing-codex", campaign_id="missing-codex",
+        )
+        with patch(
+            "autonomous_math_research.capabilities._resolve_codex",
+            return_value=str(self.root / "no-codex-installed"),
+        ), self.assertRaises(FileNotFoundError):
+            controller._pin_run_inputs(0.01, False)
+        self.assertFalse((controller.run_dir / "RUN_MANIFEST.json").exists())
 
     def test_director_cannot_satisfy_a_paused_route_retry_condition(self) -> None:
         controller = AutonomousController(

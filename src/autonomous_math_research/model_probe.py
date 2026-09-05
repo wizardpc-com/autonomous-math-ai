@@ -46,9 +46,11 @@ async def probe_model(config: HarnessConfig, *, live: bool = False, timeout: int
     tool_events: list[dict[str, Any]] = []
 
     def observe(message: dict[str, Any]) -> None:
-        item = (message.get("params") or {}).get("item") or {}
+        params = message.get("params") or {}
+        item = params.get("item") or {}
         if message.get("method") == "item/completed" and item.get("type") == "commandExecution":
-            tool_events.append({"exit_code": item.get("exitCode"), "status": item.get("status")})
+            tool_events.append({"thread_id": params.get("threadId"), "turn_id": params.get("turnId"),
+                                "exit_code": item.get("exitCode"), "status": item.get("status")})
 
     # Retained under the selected project's runtime, outside its canonical state.
     from .project import ProjectManifest
@@ -67,6 +69,7 @@ async def probe_model(config: HarnessConfig, *, live: bool = False, timeout: int
                 if selected["provider"] == route["provider"]:
                     await client.validate_model_effort(selected["model"], selected["mapped_effort"])
             observed_total = 0
+            thread_ids: set[str] = set()
             for index in range(2):
                 workspace = work / f"turn-{index + 1}"
                 workspace.mkdir()
@@ -80,6 +83,10 @@ async def probe_model(config: HarnessConfig, *, live: bool = False, timeout: int
                 )
                 thread_model = attest_model_route(started, "thread/start", route["model"])
                 tier = attest_service_tier(started, "thread/start", route.get("service_tier"))
+                thread_id = started["thread"]["id"]
+                if not isinstance(thread_id, str) or not thread_id or thread_id in thread_ids:
+                    raise ValueError("probe requires a fresh thread for each turn")
+                thread_ids.add(thread_id)
                 report["model_turns_requested"] += 1
                 turn_observed = False
 
@@ -91,7 +98,7 @@ async def probe_model(config: HarnessConfig, *, live: bool = False, timeout: int
 
                 before = len(tool_events)
                 completed, text, usage, telemetry = await client.start_turn(
-                    thread_id=started["thread"]["id"], cwd=workspace,
+                    thread_id=thread_id, cwd=workspace,
                     prompt="Run a local shell command to compute the SHA-256 of input.bin and write only its hexadecimal digest to output.txt. Return JSON with status OK and that sha256. Do not infer or invent the digest.",
                     model=route["model"], effort=route["mapped_effort"], output_schema=PROBE_SCHEMA,
                     writable_roots=[workspace], timeout=timeout, service_tier=route.get("service_tier"),
@@ -100,17 +107,21 @@ async def probe_model(config: HarnessConfig, *, live: bool = False, timeout: int
                 turn = completed.get("turn") or {}
                 actual = attest_model_route(turn, "turn/completed", route["model"])
                 effort = attest_reasoning_effort(turn, route["mapped_effort"])
+                turn_tier = attest_service_tier(turn, "turn/completed", route.get("service_tier"))
                 parsed = parse_structured_message(text)
                 validate(parsed, PROBE_SCHEMA)
                 if turn.get("status") != "completed" or parsed["sha256"] != expected:
                     raise ValueError("probe structured output or deterministic result failed")
                 if not (workspace / "output.txt").is_file() or (workspace / "output.txt").read_text(encoding="utf-8-sig").strip() != expected:
                     raise ValueError("probe tool output missing or incorrect")
-                executed = any(item["exit_code"] == 0 for item in tool_events[before:])
-                row = {"thread_id": started["thread"]["id"], "turn_id": turn.get("id"),
+                executed = any(item["exit_code"] == 0 and item["status"] == "completed"
+                               and item["thread_id"] == thread_id and item["turn_id"] == turn.get("id")
+                               for item in tool_events[before:])
+                row = {"thread_id": thread_id, "turn_id": turn.get("id"),
                        "thread_configured_model": None if thread_model == "unobservable" else thread_model,
                        "observed_model": None if actual == "unobservable" else actual,
-                       "observed_effort": effort, "observed_service_tier": tier,
+                       "observed_effort": effort, "observed_service_tier": turn_tier,
+                       "thread_configured_service_tier": tier,
                        "tool_execution_observed": executed, "token_usage": usage.to_dict(),
                        "token_telemetry": telemetry}
                 report["turns"].append(row)
@@ -129,6 +140,9 @@ async def probe_model(config: HarnessConfig, *, live: bool = False, timeout: int
     finally:
         try:
             await client.close()
+        except Exception as exc:
+            report["status"] = "FAILED"
+            report["cleanup_error"] = str(redact_auth_material(str(exc)))
         finally:
             atomic_write_json(work / "PROBE.json", report)
     return report

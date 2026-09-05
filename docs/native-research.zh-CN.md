@@ -43,7 +43,7 @@ amr frontier rebuild --project ./target
 amr frontier context --project ./target --claim C_ROOT
 ```
 
-封存目录必须是新目录。原生结果只能为 `UNAUDITED_EXTERNAL_RESULT` 或 `COMPUTATION_ONLY`；后者的 conclusion 必须是 `COMPUTATION`。导入拒绝生产者提供的审计权限、来源变化、表示/范围变化、路径逃逸和同 ID 的不同内容。原始证据按内容哈希保留，不覆盖旧成果。
+封存目录必须是新目录。原生结果只能为 `UNAUDITED_EXTERNAL_RESULT` 或 `COMPUTATION_ONLY`；后者的 conclusion 必须是 `COMPUTATION`。导入拒绝生产者提供的审计权限、来源变化、表示/范围变化、路径逃逸和同 ID 的不同内容。冻结输入清单及其所有文件引用必须齐全，binding 与来源哈希必须一致；封存期间清单改写也会被拒绝。原始证据按内容哈希保留，不覆盖旧成果。
 
 导入只建立外部结果清单；返回 `candidate_queue_entered=false`、`audit_receipt_created=false`、`canonical_authority_changed=false`。Frontier rebuild 才更新路由视图，仍不会产生可信 PASS。记录为待审计、进入候选队列、取得 canonical 晋升是三个独立步骤。
 

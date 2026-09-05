@@ -115,6 +115,10 @@ class AstraProfileTests(TempProjectMixin, unittest.TestCase):
             calls = 0
             missing_model = False
             fail_turn = False
+            turn_tier = None
+            foreign_event = False
+            reused_thread = False
+            close_failure = False
 
             def __init__(self, **kwargs):
                 self.observe = kwargs["notification_handler"]
@@ -123,6 +127,8 @@ class AstraProfileTests(TempProjectMixin, unittest.TestCase):
                 return None
 
             async def close(self):
+                if self.close_failure:
+                    raise OSError("probe transport cleanup failed")
                 return None
 
             async def validate_model_effort(self, model, effort):
@@ -130,7 +136,7 @@ class AstraProfileTests(TempProjectMixin, unittest.TestCase):
                     raise ModelCapabilityError("missing model")
 
             async def start_thread(self, **kwargs):
-                return {"thread": {"id": str(self.calls)}, "model": kwargs["model"], "serviceTier": None}
+                return {"thread": {"id": "reused" if self.reused_thread else str(self.calls)}, "model": kwargs["model"], "serviceTier": None}
 
             async def start_turn(self, **kwargs):
                 type(self).calls += 1
@@ -140,8 +146,11 @@ class AstraProfileTests(TempProjectMixin, unittest.TestCase):
                 workspace = kwargs["cwd"]
                 digest = sha256((workspace / "input.bin").read_bytes()).hexdigest()
                 (workspace / "output.txt").write_text(digest)
-                self.observe({"method": "item/completed", "params": {"item": {"type": "commandExecution", "exitCode": 0}}})
-                turn = {"id": str(self.calls), "status": "completed"}
+                self.observe({"method": "item/completed", "params": {
+                    "threadId": "unrelated" if self.foreign_event else kwargs["thread_id"],
+                    "turnId": str(self.calls),
+                    "item": {"type": "commandExecution", "exitCode": 0, "status": "completed"}}})
+                turn = {"id": str(self.calls), "status": "completed", "serviceTier": self.turn_tier}
                 if self.observations:
                     turn.update(model=kwargs["model"], effort=kwargs["effort"])
                 return {"turn": turn}, json.dumps({"status": "OK", "sha256": digest}), TokenUsage(total_tokens=self.tokens), "observed"
@@ -165,11 +174,31 @@ class AstraProfileTests(TempProjectMixin, unittest.TestCase):
                     self.assertEqual(report["route_status"], "UNKNOWN")
                     self.assertIsNone(report["observed_model"])
 
+        for field, value, expected, count in (
+            ("turn_tier", "fast", "FAILED", 1),
+            ("foreign_event", True, "INCOMPLETE_TELEMETRY_OR_BUDGET", 1),
+            ("reused_thread", True, "FAILED", 1),
+            ("close_failure", True, "FAILED", 2),
+        ):
+            FakeClient.observations, FakeClient.tokens = True, 50
+            FakeClient.missing_model, FakeClient.fail_turn, FakeClient.calls = False, False, 0
+            setattr(FakeClient, field, value)
+            with self.subTest(field=field), patch("autonomous_math_research.model_probe.AppServerClient", FakeClient):
+                report = asyncio.run(probe_model(config, live=True))
+                self.assertEqual(report["status"], expected)
+                self.assertEqual(FakeClient.calls, count)
+                saved = json.loads((Path(report["evidence_directory"]) / "PROBE.json").read_text())
+                self.assertEqual(saved["status"], expected)
+            setattr(FakeClient, field, None if field == "turn_tier" else False)
+
     def test_explicit_profile_preserves_legacy_and_mechanical_routes(self):
         legacy = load_config(self.project)
         astra = load_config(self.project, profile_path=PROFILE)
         for role in astra.raw["models"]:
             self.assertEqual(astra.route_for(role)["model"], "gpt-6-astra")
+            expected_effort = "xhigh" if role in {"prover", "auditor", "evaluator_auditor"} else "high"
+            self.assertEqual(astra.route_for(role)["mapped_effort"], expected_effort)
+            self.assertIsNone(astra.route_for(role).get("service_tier"))
         self.assertEqual(legacy.route_for("smoke")["model"], "gpt-5.6-terra")
         self.assertEqual(astra.raw["policy"]["one_shot_compute_worker"], legacy.raw["policy"]["one_shot_compute_worker"])
         self.assertEqual(astra.raw["budgets"], legacy.raw["budgets"])
@@ -352,3 +381,45 @@ class NativeHandoffTests(TempProjectMixin, unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "changed during validation"):
                 import_result(self.project, self.bundle)
         self.assertFalse((self.store.external_results_root / "native-test.json").exists())
+
+    def test_input_manifest_rewrite_during_sealing_is_rejected(self):
+        import shutil
+        self.export()
+        copy = shutil.copyfile
+
+        def rewrite_receipt(source, destination):
+            result = copy(source, destination)
+            (self.native / "INPUT_MANIFEST.json").write_text("{}", encoding="utf-8")
+            return result
+
+        with patch("autonomous_math_research.native_handoff.shutil.copyfile", side_effect=rewrite_receipt):
+            with self.assertRaisesRegex(ValueError, "input manifest changed"):
+                self.seal()
+        self.assertFalse(self.bundle.exists())
+
+    def test_import_requires_complete_frozen_input_manifest(self):
+        self.export()
+        self.seal()
+        path = self.bundle / "external_result.json"
+        original = json.loads(path.read_text())
+        for missing in ("INPUT_MANIFEST.json", "CLAIMS.md", "task.json"):
+            raw = {**original, "source_refs": [ref for ref in original["source_refs"] if Path(ref["path"]).name != missing]}
+            atomic_write_json(path, raw)
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "frozen input"):
+                import_result(self.project, self.bundle)
+            self.assertFalse((self.store.external_results_root / "native-test.json").exists())
+
+    def test_import_rejects_binding_digest_mismatch_in_input_manifest(self):
+        self.export()
+        self.seal()
+        path = self.bundle / "external_result.json"
+        raw = json.loads(path.read_text())
+        ref = next(ref for ref in raw["source_refs"] if ref["kind"] == "input_manifest")
+        packet_path = self.bundle / ref["path"]
+        packet = json.loads(packet_path.read_text())
+        packet["binding_sha256"] = "0" * 64
+        atomic_write_json(packet_path, packet)
+        ref["sha256"] = file_digest(packet_path)
+        atomic_write_json(path, raw)
+        with self.assertRaisesRegex(ValueError, "frozen input binding"):
+            import_result(self.project, self.bundle)

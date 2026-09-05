@@ -18,6 +18,14 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Canonical reconciliation unit coverage injects Codex capabilities, allowing
+  the suite to run without the CLI while retaining fail-closed live preflight.
+- Compatibility probes bind successful command events to their own thread and
+  turn, reject reused sessions and disallowed turn tiers, and report cleanup
+  failures without leaving a successful probe receipt.
+- Native sealing rechecks the retained input-manifest digest. Import requires
+  all frozen input references and checks their binding and source digests.
+
 - Codex model capability checks now follow catalog pagination and reject
   unsupported model-level efforts before model turns. Job records distinguish
   requested routes, thread configuration observations, and turn observations.
