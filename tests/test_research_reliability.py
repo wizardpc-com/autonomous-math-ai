@@ -689,6 +689,9 @@ class TurnOwnershipTests(unittest.TestCase):
 
 
 class _CorrelatedTurnClient(AppServerClient):
+    async def list_models(self):
+        return {"data": [{"model": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
+
     def __init__(self, completion_orders: list[str], *, mismatched_response_ids: bool = False):
         super().__init__(codex_executable="unused")
         self.completion_orders = list(completion_orders)
@@ -804,6 +807,9 @@ class _CorrelatedTurnClient(AppServerClient):
 
 
 class _FailedStartClient(AppServerClient):
+    async def list_models(self):
+        return {"data": [{"model": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
+
     def __init__(self):
         super().__init__(codex_executable="unused")
         self.interrupt_calls: list[tuple[str, str]] = []
@@ -834,6 +840,9 @@ class _FailedStartClient(AppServerClient):
 
 
 class _HangingTurnClient(AppServerClient):
+    async def list_models(self):
+        return {"data": [{"model": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
+
     def __init__(self):
         super().__init__(codex_executable="unused")
         self.started = asyncio.Event()
@@ -882,6 +891,9 @@ class _DelegationContainmentClient(AppServerClient):
 
 
 class _TransportLostStartClient(AppServerClient):
+    async def list_models(self):
+        return {"data": [{"model": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
+
     def __init__(self):
         super().__init__(codex_executable="unused")
         self._transport_alive = True

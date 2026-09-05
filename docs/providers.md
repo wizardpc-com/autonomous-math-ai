@@ -1,5 +1,14 @@
 # Provider adapters
 
+Before each Codex model turn, AMR validates the requested model and mapped
+effort against the full paginated `model/list` catalog. The catalog is cached
+only for the current App Server process. Missing models, ambiguous entries,
+unknown effort capabilities and unsupported efforts fail without substitution.
+Observed model and effort fields remain null when unavailable; a thread-start
+model configuration observation is explicitly distinguished from turn delivery.
+`amr model-probe` is offline by default; `--live` opts into at most two short
+turns with a local deadline and observed-budget dispatch checks.
+
 Codex App Server is the default provider. It uses the operator's existing Codex
 login and requires no API key in project configuration. The bundled
 `openai_compatible` adapter is optional and supports Responses-style and Chat

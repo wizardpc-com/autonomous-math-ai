@@ -129,6 +129,12 @@ asset rows in an older continuation checkpoint are historical only.
 
 ## Commands
 
+`amr handoff export|seal|import` provides a native Codex companion over these
+existing task and external-result contracts. It freezes selected inputs and
+packaged policy, computes evidence hashes, and imports only unaudited results.
+It does not create an audit receipt, enter the candidate queue, or write
+canonical authority. See the [operator guide](native-research.zh-CN.md).
+
 Rebuild after adding or auditing external manifests:
 
 ```powershell

@@ -6,13 +6,17 @@ Keep the problem, notation, known results, failed routes, artifacts, and strateg
 
 | Role | Requested configuration | Use and boundary |
 | --- | --- | --- |
-| Main | `gpt-5.6-sol` / `xhigh` | Stable long-term state, strategy, synthesis, proof |
-| Explorer | `gpt-5.6-sol` / `high` | One differentiated route, reformulation, special case, or counterexample direction |
-| Breakthrough | `gpt-5.6-sol` / `max` | One gated, narrow bottleneck; one attempt before re-evaluation |
-| Auditor | fresh `gpt-5.6-sol` / `xhigh`; separately gated `max` only for an audit gap | Adversarial reconstruction without confidence priming |
+| Main | Validated configured prover route | Stable long-term state, strategy, synthesis, proof |
+| Explorer | Validated configured explorer/falsifier route | One differentiated route, reformulation, special case, or counterexample direction |
+| Breakthrough | Configured research model / capability-checked `max` | One gated, narrow bottleneck; one attempt before re-evaluation |
+| Auditor | Fresh session on the validated auditor route | Adversarial reconstruction without confidence priming |
 | Local compute | installed CAS/compiler/solver on the user's machine | First route for a known deterministic command; batch or shard, verify, persist |
 | Compute agent | primary `gpt-5.3-codex-spark` / `high` / null; permanent-unavailable fallback `gpt-5.6-luna` / `medium` / null | Prepare/adapt one bounded mechanical packet through the controller broker; verify, return, stop; never recurse |
 
+The pinned effective configuration is the model/effort authority; this policy
+does not select a competing model. Native research uses the explicitly selected
+and verified session route. Native research subagents may return narrow unaudited
+candidates; controller-owned roles may delegate only through the mechanical broker.
 All settings are requested and capability-preflighted. Main roles use Fast only
 when the run pins `execution.fast_mode=true`; `priority` is observation-only
 and `auto` is forbidden. Every bundled mechanical route explicitly uses

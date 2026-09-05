@@ -1,0 +1,18 @@
+{
+  "profile_schema_version": 1,
+  "name": "astra-research",
+  "extends": "codex-app-server-default",
+  "overrides": {
+    "execution": {"fast_mode": false},
+    "engine": {"reasoning_health_retry_limit": 0},
+    "models": {
+      "director": {"provider": "codex", "model": "gpt-6-astra", "effort": "high", "unsupported_effort": "error"},
+      "prover": {"provider": "codex", "model": "gpt-6-astra", "effort": "xhigh", "unsupported_effort": "error"},
+      "falsifier": {"provider": "codex", "model": "gpt-6-astra", "effort": "high", "unsupported_effort": "error"},
+      "explorer": {"provider": "codex", "model": "gpt-6-astra", "effort": "high", "unsupported_effort": "error"},
+      "auditor": {"provider": "codex", "model": "gpt-6-astra", "effort": "xhigh", "unsupported_effort": "error"},
+      "evaluator_auditor": {"provider": "codex", "model": "gpt-6-astra", "effort": "xhigh", "unsupported_effort": "error"},
+      "smoke": {"provider": "codex", "model": "gpt-6-astra", "effort": "high", "unsupported_effort": "error", "timeout_seconds": 90, "token_limit": 4000, "retries": {"transport": 0, "model_protocol": 0}}
+    }
+  }
+}

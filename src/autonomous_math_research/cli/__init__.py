@@ -151,6 +151,30 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--profile", type=Path)
     check.add_argument("--strict", action="store_true")
 
+    probe = sub.add_parser("model-probe", help="offline compatibility check; --live permits at most two model turns")
+    probe.add_argument("--project", type=Path, required=True)
+    probe.add_argument("--profile", type=Path)
+    probe.add_argument("--live", action="store_true")
+    probe.add_argument("--timeout", type=int, default=90)
+    probe.add_argument("--budget", type=int, default=4000)
+
+    handoff = sub.add_parser("handoff", help="freeze native inputs and import unaudited external results")
+    handoff_sub = handoff.add_subparsers(dest="handoff_command", required=True)
+    export = handoff_sub.add_parser("export")
+    export.add_argument("--project", type=Path, required=True)
+    export.add_argument("--profile", type=Path)
+    export.add_argument("--task", type=Path, required=True)
+    export.add_argument("--output", type=Path, required=True)
+    export.add_argument("--budget", type=int, required=True)
+    seal = handoff_sub.add_parser("seal")
+    seal.add_argument("--workspace", type=Path, required=True)
+    seal.add_argument("--result", type=Path, required=True)
+    seal.add_argument("--output", type=Path, required=True)
+    seal.add_argument("--input-sha256", required=True)
+    ingest = handoff_sub.add_parser("import")
+    ingest.add_argument("--project", type=Path, required=True)
+    ingest.add_argument("--bundle", type=Path, required=True)
+
     config = sub.add_parser("config", help="validate or explain effective configuration")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     for name in ("validate", "explain", "summary", "migrate"):
@@ -1292,6 +1316,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(json.dumps({"ingested": True, **record}, ensure_ascii=False, indent=2))
         return 0
+    if args.command in {"model-probe", "handoff"}:
+        try:
+            if args.command == "model-probe":
+                from ..model_probe import probe_model
+                config = load_config(args.project.resolve(), require_manifest=True, profile_path=args.profile)
+                payload = asyncio.run(probe_model(config, live=args.live, timeout=args.timeout, budget=args.budget))
+            else:
+                from ..native_handoff import export_inputs, import_result, seal_result
+                if args.handoff_command == "export":
+                    payload = export_inputs(args.project, args.task, args.output, budget=args.budget, profile=args.profile)
+                elif args.handoff_command == "seal":
+                    payload = seal_result(args.workspace, args.result, args.output, input_sha256=args.input_sha256)
+                else:
+                    payload = import_result(args.project, args.bundle)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0 if payload.get("status") in {None, "PASS", "LIVE_NOT_RUN"} else 2
+        except (ValueError, OSError, KeyError) as exc:
+            print(json.dumps({"error": str(exc), "canonical_authority_changed": False}, ensure_ascii=False, indent=2))
+            return 2
     if args.command == "frontier":
         try:
             return _frontier_command(args)

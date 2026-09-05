@@ -6,7 +6,21 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- An explicit Astra research/audit/smoke profile with diagnostic-only short
+  reasoning signals, preserving legacy profiles and mechanical routes.
+- An offline-by-default model compatibility probe with a separate two-turn live
+  opt-in, local deadline, tool-output checks, and explicit missing telemetry.
+- Native research input export, evidence sealing and unaudited import using the
+  existing task, policy, Frontier and external-result contracts. Imports preserve
+  source evidence and cannot create audit receipts or canonical transitions.
+
 ### Fixed
+
+- Codex model capability checks now follow catalog pagination and reject
+  unsupported model-level efforts before model turns. Job records distinguish
+  requested routes, thread configuration observations, and turn observations.
 
 - Strict project validation now recomputes the Audited Frontier read-only and
   rejects stale `CURRENT.json` routing when source manifests or hash-bound

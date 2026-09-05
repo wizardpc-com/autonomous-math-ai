@@ -12,9 +12,9 @@ from uuid import uuid4
 from .app_server import (
     AppServerClient, AppServerError, AppServerRequestError,
     AppServerTransportClosed, AppServerTurnFailed,
-    AppServerTurnTimeout, ModelRoutePolicyError, ServiceTierPolicyError,
+    AppServerTurnTimeout, ModelCapabilityError, ModelRoutePolicyError, ServiceTierPolicyError,
     StructuredOutputProtocolError, UnmanagedContinuationError,
-    attest_model_route, attest_service_tier,
+    attest_model_route, attest_reasoning_effort, attest_service_tier,
     parse_structured_message, redact_auth_material,
 )
 from .config import HarnessConfig
@@ -170,6 +170,8 @@ def _turn_error_details(exc: AppServerTurnFailed) -> dict[str, Any]:
 
 
 def _classify_failure(exc: Exception) -> tuple[str, bool, dict[str, Any] | None]:
+    if isinstance(exc, ModelCapabilityError):
+        return "model_capability", False, None
     if isinstance(exc, DirectorPromptTooLarge):
         return "director_prompt_too_large", False, {
             "prompt_bytes": exc.size_bytes,
@@ -352,6 +354,9 @@ class AppServerBackend:
         thread_id: str | None = None
         turn_id: str | None = None
         observed_tier = "unobservable"
+        observed_model = None
+        model_observation_source = None
+        observed_effort = None
         usage = TokenUsage()
         token_telemetry = "unknown"
         raw_output = ""
@@ -374,7 +379,10 @@ class AppServerBackend:
             observed_tier = attest_service_tier(
                 started, "thread/start", requested_tier,
             )
-            attest_model_route(started, "thread/start", model)
+            thread_model = attest_model_route(started, "thread/start", model)
+            if thread_model != "unobservable":
+                observed_model = thread_model
+                model_observation_source = "thread/start configuration"
             # Never arm an App Server goal for autonomous work.  An active
             # server goal may create native continuations outside controller
             # ownership.  Per-thread budgets are enforced from observed token
@@ -402,6 +410,11 @@ class AppServerBackend:
                 )
                 turn = completed.get("turn") or {}
                 turn_id = str(turn.get("id") or "") or None
+                # Usage is cumulative and remains evidence even if route/schema checks fail.
+                for field_name in TokenUsage.__dataclass_fields__:
+                    setattr(usage, field_name, max(getattr(usage, field_name), getattr(turn_usage, field_name)))
+                if turn_telemetry == "observed":
+                    token_telemetry = "observed"
                 # Codex 0.149 does not expose tier telemetry on Turn. Retain a
                 # fail-closed check if a future server starts reporting it.
                 turn_tier = (
@@ -410,7 +423,11 @@ class AppServerBackend:
                 )
                 if turn_tier != "unobservable":
                     observed_tier = turn_tier
-                attest_model_route(turn, "turn/completed", model)
+                turn_model = attest_model_route(turn, "turn/completed", model)
+                if turn_model != "unobservable":
+                    observed_model = turn_model
+                    model_observation_source = "turn/completed"
+                observed_effort = attest_reasoning_effort(turn, current_effort)
                 if str(turn.get("status") or "").lower() != "completed":
                     raise AppServerTurnFailed(
                         turn,
@@ -421,16 +438,6 @@ class AppServerBackend:
                 parsed = parse_structured_message(raw_output)
                 validate(parsed, output_schema)
                 last_completed_result = dict(parsed)
-                # App Server thread usage is cumulative. Keep the largest
-                # observed component rather than double-counting later turns.
-                for field_name in TokenUsage.__dataclass_fields__:
-                    setattr(
-                        usage,
-                        field_name,
-                        max(getattr(usage, field_name), getattr(turn_usage, field_name)),
-                    )
-                if turn_telemetry == "observed":
-                    token_telemetry = "observed"
                 partial = JobOutcome(
                     job_id=job_id, task_id=task.task_id, role=task.role,
                     claim_id=task.target_claim, status="completed", result=parsed,
@@ -439,6 +446,9 @@ class AppServerBackend:
                     provider_profile=route_config.get("profile"),
                     requested_service_tier=requested_tier,
                     observed_service_tier=observed_tier,
+                    observed_model=observed_model,
+                    observed_reasoning_effort=observed_effort,
+                    model_observation_source=model_observation_source,
                     token_usage=turn_usage, token_telemetry=turn_telemetry,
                     cost_usd=None, cost_telemetry="unknown",
                     artifact_paths=list(parsed.get("artifact_paths", [])),
@@ -457,6 +467,8 @@ class AppServerBackend:
                     "thread_id": thread_id,
                     "turn_id": turn_id,
                     "effort": current_effort,
+                    "observed_model": None if turn_model == "unobservable" else turn_model,
+                    "observed_reasoning_effort": observed_effort,
                     "result_type": parsed.get("result_type"),
                     "role_reported_status": parsed.get("status"),
                     "reasoning_output_tokens": turn_usage.reasoning_output_tokens,
@@ -505,6 +517,9 @@ class AppServerBackend:
         except Exception as exc:
             if isinstance(exc, ServiceTierPolicyError):
                 observed_tier = exc.observed_service_tier
+            if isinstance(exc, ModelRoutePolicyError):
+                observed_model = exc.observed_model
+                model_observation_source = exc.phase
             evidence_usage = getattr(exc, "token_usage", None)
             if isinstance(evidence_usage, TokenUsage):
                 usage = evidence_usage
@@ -534,6 +549,9 @@ class AppServerBackend:
                 provider_profile=route_config.get("profile"),
                 requested_service_tier=requested_tier,
                 observed_service_tier=observed_tier,
+                observed_model=observed_model,
+                observed_reasoning_effort=observed_effort,
+                model_observation_source=model_observation_source,
                 token_usage=usage, token_telemetry=token_telemetry,
                 cost_usd=None, cost_telemetry="unknown",
                 error=str(redact_auth_material(str(exc))),

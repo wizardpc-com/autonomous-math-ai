@@ -1,5 +1,12 @@
 # Configuration and profiles
 
+For explicit Astra opt-in on new runs, use
+[`examples/astra-research-profile.json`](examples/astra-research-profile.json).
+It selects Astra for research, audit and smoke, disables Fast, and sets
+`reasoning_health_retry_limit=0`. Existing defaults and sealed run snapshots
+remain unchanged. See the [native research operator guide](native-research.zh-CN.md)
+for offline checks, a separately opted-in bounded probe, and result handoff.
+
 Configuration schema v12 is merged as: built-in `codex-app-server-default`, the
 project's manifest-selected `autonomous/config.yaml`, an explicit `--profile`,
 then an optional launcher one-shot override. Core

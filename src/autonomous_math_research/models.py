@@ -845,6 +845,9 @@ class JobOutcome:
     provider_profile: str | None = None
     requested_service_tier: str | None = None
     observed_service_tier: str | None = None
+    observed_model: str | None = None
+    observed_reasoning_effort: str | None = None
+    model_observation_source: str | None = None
     token_usage: TokenUsage = field(default_factory=TokenUsage)
     token_telemetry: str = "unknown"
     cost_usd: float | None = None

@@ -859,6 +859,26 @@ def attest_no_service_tier(payload: Any, phase: str) -> str:
     return attest_service_tier(payload, phase, None)
 
 
+class ModelCapabilityError(AppServerError):
+    """A model route cannot be established from the server's capability catalog."""
+
+
+def attest_reasoning_effort(payload: Any, requested_effort: str) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    observed = None
+    for key in ("effort", "reasoningEffort"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if value != requested_effort:
+            raise ModelCapabilityError(
+                f"requested effort {requested_effort!r} but observed {value!r}"
+            )
+        observed = value
+    return observed
+
+
 def attest_model_route(payload: Any, phase: str, requested_model: str) -> str:
     """Return the observed model or fail closed on an explicit mismatch."""
     if not isinstance(payload, dict):
@@ -867,11 +887,10 @@ def attest_model_route(payload: Any, phase: str, requested_model: str) -> str:
     for key in ("model", "modelId", "resolvedModel", "actualModel"):
         if isinstance(payload.get(key), str) and str(payload[key]).strip():
             raw = str(payload[key]).strip()
-            break
+            if raw != requested_model:
+                raise ModelRoutePolicyError(phase, requested_model, raw)
     if raw is None:
         return "unobservable"
-    if raw != requested_model:
-        raise ModelRoutePolicyError(phase, requested_model, raw)
     return raw
 
 
@@ -899,6 +918,7 @@ class AppServerClient:
         self._transport_alive = False
         self._write_lock = threading.Lock()
         self._next_id = 1
+        self._model_catalog: dict[str, Any] | None = None
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._turn_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._thread_turn_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -1109,6 +1129,7 @@ class AppServerClient:
                 return
             await self.close()
         self._loop = asyncio.get_running_loop()
+        self._model_catalog = None
         self._transport_generation += 1
         generation = self._transport_generation
         if self.project_root is None or not self.project_root.is_dir():
@@ -1612,6 +1633,7 @@ class AppServerClient:
         validate_output_schema_compatibility(
             output_schema, schema_path="turn/start.outputSchema",
         )
+        await self.validate_model_effort(model, effort)
         inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if skill_path is not None:
             inputs.append({
@@ -1874,6 +1896,44 @@ class AppServerClient:
         turn_id = self._notification_turn_by_thread.get(thread_id, turn_id)
         return await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
+    async def list_models(self) -> dict[str, Any]:
+        cached = self._model_catalog
+        if cached is not None:
+            return cached
+        models: list[dict[str, Any]] = []
+        cursors: set[str] = set()
+        params: dict[str, Any] = {"limit": 100, "includeHidden": True}
+        for _ in range(100):
+            page = await self.request("model/list", params, timeout=30)
+            if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                raise ModelCapabilityError("model/list returned an invalid catalog")
+            if any(not isinstance(item, dict) for item in page["data"]):
+                raise ModelCapabilityError("model/list returned an invalid model entry")
+            models.extend(page["data"])
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                self._model_catalog = {"data": models, "nextCursor": None}
+                return self._model_catalog
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise ModelCapabilityError("model/list returned an invalid pagination cursor")
+            cursors.add(cursor)
+            params = {**params, "cursor": cursor}
+        raise ModelCapabilityError("model/list exceeded the bounded page limit")
+
+    async def validate_model_effort(self, model: str, effort: str) -> None:
+        catalog = await self.list_models()
+        matches = [item for item in catalog["data"] if item.get("model", item.get("id")) == model]
+        if len(matches) != 1:
+            raise ModelCapabilityError(f"model {model!r} is absent or ambiguous in model/list")
+        supported = matches[0].get("supportedReasoningEfforts")
+        if not isinstance(supported, list) or not supported or any(
+            not isinstance(item, dict) or not isinstance(item.get("reasoningEffort"), str)
+            for item in supported
+        ):
+            raise ModelCapabilityError(f"effort capabilities for {model!r} are UNKNOWN")
+        if effort not in {item["reasoningEffort"] for item in supported}:
+            raise ModelCapabilityError(f"model {model!r} does not support effort {effort!r}")
+
     async def probe_capabilities(self, cwd: Path) -> dict[str, Any]:
         calls = {
             "account": ("account/read", {"refreshToken": False}),
@@ -1881,12 +1941,12 @@ class AppServerClient:
             "usage": ("account/usage/read", None),
             "permission_profiles": ("permissionProfile/list", {"cwd": str(cwd.resolve())}),
             "requirements": ("configRequirements/read", {}),
-            "models": ("model/list", {"limit": 100}),
+            "models": ("model/list", None),
         }
         result: dict[str, Any] = {}
         for key, (method, params) in calls.items():
             try:
-                value = await self.request(method, params, timeout=30)
+                value = await self.list_models() if key == "models" else await self.request(method, params, timeout=30)
                 if key == "account":
                     value = _redact_account(value)
                 result[key] = {

@@ -401,6 +401,9 @@ class ServiceTierHardeningTests(unittest.IsolatedAsyncioTestCase):
                 super().__init__(codex_executable="unused")
                 self.calls: list[tuple[str, dict[str, object]]] = []
 
+            async def list_models(self):
+                return {"data": [{"model": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}]}
+
             async def request(  # type: ignore[override]
                 self,
                 method: str,
